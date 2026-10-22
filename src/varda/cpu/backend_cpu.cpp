@@ -14,6 +14,7 @@
 // chunk holds all incoming edges of its destinations, so softmax groups are whole). The
 // lin_edge projections are recomputed per destination inside the attention kernel and
 // never stored for the whole graph.
+#include <cmath>
 #include <omp.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -113,7 +114,8 @@ void apply_bounding(const Bounding& b, float* y, int64_t G, int64_t Vo) {
         for (int64_t g = 0; g < G; ++g) {
             float* yr = y + g * Vo;
             if (relu) {
-                for (int i : b.index) yr[i] = yr[i] > 0.0f ? yr[i] : 0.0f;
+                // NaN propagates (as torch relu); every other value as before, -0 -> +0.
+                for (int i : b.index) yr[i] = (yr[i] > 0.0f || std::isnan(yr[i])) ? yr[i] : 0.0f;
                 continue;
             }
             // hardtanh and fraction: clamp to [min, max].

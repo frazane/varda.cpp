@@ -19,6 +19,8 @@
 #include "nlohmann/json.hpp"
 #include "varda/config.h"
 #include "varda/format.h"
+#include "varda/varda.h"
+#include <algorithm>
 
 #ifndef VARDA_SOURCE_DIR
 #define VARDA_SOURCE_DIR "."
@@ -78,6 +80,8 @@ inline json load_tolerances(const std::string& explicit_path, const std::string&
             closedir(d);
         }
     }
+    if (uuid.empty()) throw std::runtime_error("model has no checkpoint uuid: cannot pair it with tolerances");
+    std::sort(candidates.begin(), candidates.end());
     for (const auto& c : candidates) {
         std::ifstream f(c);
         if (!f) throw std::runtime_error("cannot read tolerances " + c);
@@ -95,16 +99,20 @@ inline json load_tolerances(const std::string& explicit_path, const std::string&
 
 struct Metric {
     double max_abs = 0, absmax = 0, rel_absmax = 0;
-    int64_t n_nan = 0;
+    int64_t n_nan = 0;      // NaN in the engine output
+    int64_t n_ref_bad = 0;  // NaN or Inf in the golden tensor
 };
 
-// docs/format.md §2: float64, rel_absmax = max|a - r| / max|r|; NaN in `a` counted.
+// docs/format.md §2: float64, rel_absmax = max|a - r| / max|r|. NaN in `a` (where `r` is
+// finite) and any non-finite `r` are counted; either makes the key fail. Inf in `a` gives an
+// infinite max_abs.
 inline Metric compare(const float* a, const float* r, int64_t n) {
     double max_abs = 0, absmax = 0;
-    int64_t nan = 0;
-#pragma omp parallel for reduction(max : max_abs, absmax) reduction(+ : nan) schedule(static)
+    int64_t nan = 0, ref_bad = 0;
+#pragma omp parallel for reduction(max : max_abs, absmax) reduction(+ : nan, ref_bad) schedule(static)
     for (int64_t i = 0; i < n; ++i) {
         const double av = a[i], rv = r[i];
+        if (!std::isfinite(rv)) { ++ref_bad; continue; }
         if (std::isnan(av)) { ++nan; continue; }
         max_abs = std::max(max_abs, std::fabs(av - rv));
         absmax = std::max(absmax, std::fabs(rv));
@@ -113,8 +121,21 @@ inline Metric compare(const float* a, const float* r, int64_t n) {
     m.max_abs = max_abs;
     m.absmax = absmax;
     m.n_nan = nan;
+    m.n_ref_bad = ref_bad;
     m.rel_absmax = absmax > 0 ? max_abs / absmax : (max_abs > 0 ? std::numeric_limits<double>::infinity() : 0.0);
     return m;
+}
+
+inline varda::Device parse_device(const std::string& s) {
+    if (s == "cpu") return varda::Device::CPU;
+    if (s == "cuda") return varda::Device::CUDA;
+    throw std::runtime_error("unknown --device '" + s + "' (cpu | cuda)");
+}
+
+inline varda::Precision parse_precision(const std::string& s) {
+    if (s == "fp32") return varda::Precision::FP32;
+    if (s == "fp16") return varda::Precision::FP16;
+    throw std::runtime_error("unknown --precision '" + s + "' (fp32 | fp16)");
 }
 
 }  // namespace app

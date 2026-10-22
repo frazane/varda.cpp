@@ -55,6 +55,7 @@ public:
     void require_all_consumed() const;
 
 private:
+    void open_and_parse();
     std::string path_;
     int fd_ = -1;
     void* map_ = nullptr;

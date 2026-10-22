@@ -78,6 +78,12 @@ Config parse_config(const std::string& json_text) {
     c.latent_skip = d.at("latent_skip");
 
     require(c.num_heads * c.head_dim == c.num_channels, "num_heads * head_dim != num_channels");
+    require(c.num_channels > 0 && c.num_heads > 0 && c.mlp_hidden > 0, "non-positive width");
+    require(c.num_processor_layers >= 0 && c.n_input_steps >= 1, "layer/step counts");
+    require(c.n_data_vars > 0 && c.n_input_vars > 0 && c.n_output_vars > 0, "variable counts");
+    require(c.n_data_nodes > 0 && c.n_hidden_nodes > 0, "node counts");
+    require(c.node_attr_dim >= 1 && c.edge_attr_dim >= 1, "node_attr_dim and edge_attr_dim must be >= 1");
+    require(c.layer_norm_eps > 0.0f, "layer_norm_eps");
     if (c.n_output_steps != 1) unsupported("n_output_steps != 1");
 
     const json& v = j.at("variables");

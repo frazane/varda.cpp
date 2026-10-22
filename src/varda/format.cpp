@@ -57,6 +57,19 @@ std::string TensorView::shape_str() const {
 }
 
 SafeTensorsFile::SafeTensorsFile(const std::string& path) : path_(path) {
+    try {
+        open_and_parse();
+    } catch (...) {
+        if (map_) ::munmap(map_, map_size_);
+        if (fd_ >= 0) ::close(fd_);
+        map_ = nullptr;
+        fd_ = -1;
+        throw;
+    }
+}
+
+void SafeTensorsFile::open_and_parse() {
+    const std::string& path = path_;
     fd_ = ::open(path.c_str(), O_RDONLY);
     if (fd_ < 0) fail(path, std::string("cannot open: ") + std::strerror(errno));
     struct stat st {};
@@ -88,9 +101,17 @@ SafeTensorsFile::SafeTensorsFile(const std::string& path) : path_(path) {
         if (off.size() != 2 || off[0] > off[1] || off[1] > data_size)
             fail(path, "bad data_offsets for " + v.name);
         v.nbytes = off[1] - off[0];
-        if (static_cast<size_t>(v.numel()) * dtype_size(v.dtype) != v.nbytes)
+        uint64_t n_elem = 1;
+        for (int64_t d : v.shape) {
+            if (d < 0) fail(path, "negative dimension in " + v.name);
+            if (d != 0 && n_elem > UINT64_MAX / static_cast<uint64_t>(d)) fail(path, "shape overflow in " + v.name);
+            n_elem *= static_cast<uint64_t>(d);
+        }
+        if (n_elem > v.nbytes || n_elem * dtype_size(v.dtype) != v.nbytes)
             fail(path, "size mismatch for " + v.name);
         v.data = base + data_begin + off[0];
+        if (reinterpret_cast<uintptr_t>(v.data) % dtype_size(v.dtype) != 0)
+            fail(path, "tensor " + v.name + " is not aligned to its element size");
         tensors_.emplace(v.name, std::move(v));
     }
 }

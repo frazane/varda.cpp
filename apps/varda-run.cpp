@@ -50,8 +50,8 @@ int main(int argc, char** argv) {
         else if (a == "--input") input_path = next();
         else if (a == "--key") key = next();
         else if (a == "--steps") steps = std::stoi(next());
-        else if (a == "--device") { std::string d = next(); opts.device = d == "cuda" ? varda::Device::CUDA : varda::Device::CPU; }
-        else if (a == "--precision") { std::string p = next(); opts.precision = p == "fp16" ? varda::Precision::FP16 : varda::Precision::FP32; }
+        else if (a == "--device") opts.device = app::parse_device(next());
+        else if (a == "--precision") opts.precision = app::parse_precision(next());
         else if (a == "--threads") opts.num_threads = std::stoi(next());
         else if (a == "--no-cuda-graph") opts.cuda_graph = false;
         else if (a == "--out") out_path = next();

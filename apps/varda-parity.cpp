@@ -1,12 +1,13 @@
 // Parity check of the engine against golden activations (docs/format.md §2-4).
 //
-//   varda-parity --model M.safetensors --check GOLDEN.safetensors[=TABLE] [--check ...]
-//                [--device cpu|cuda] [--precision fp32|fp16] [--threads N] [--no-cuda-graph]
-//                [--tolerances FILE] [--report OUT.json]
+//   varda-parity --model M.safetensors --check GOLDEN.safetensors=TABLE [--check ...]
+//                [--report-only GOLDEN.safetensors] [--device cpu|cuda] [--precision fp32|fp16]
+//                [--threads N] [--no-cuda-graph] [--tolerances FILE] [--report OUT.json]
 //
 // The input `in.x` comes from the first golden file (all must hold the same bytes). One
 // predict_step runs with the activation hook; every contract key is compared, as it is
-// produced, against each golden file, and against TABLE of the tolerance file when given.
+// produced, against each golden file: against TABLE of the tolerance file for --check, for
+// information only (NaN still fails) for --report-only.
 // A second predict_step runs without the hook; its output must be bitwise equal to the
 // hooked run's. Exit 0 only if every key is present, NaN-free and within tolerance.
 #include <cstdio>
@@ -22,6 +23,7 @@ namespace {
 
 struct Check {
     std::string golden_path, table;
+    bool report_only = false;
     std::unique_ptr<app::Golden> golden;
     json tol;  // the table, or null
     std::map<std::string, app::Metric> metrics;
@@ -31,8 +33,8 @@ struct Check {
 
 [[noreturn]] void usage() {
     std::fprintf(stderr,
-                 "usage: varda-parity --model M --check GOLDEN[=TABLE] [--check ...] [--device cpu|cuda]\n"
-                 "                    [--precision fp32|fp16] [--threads N] [--no-cuda-graph]\n"
+                 "usage: varda-parity --model M --check GOLDEN=TABLE [--check ...] [--report-only GOLDEN]\n"
+                 "                    [--device cpu|cuda] [--precision fp32|fp16] [--threads N] [--no-cuda-graph]\n"
                  "                    [--tolerances FILE] [--report OUT.json]\n");
     std::exit(2);
 }
@@ -51,11 +53,25 @@ int main(int argc, char** argv) {
             Check c;
             std::string s = next();
             auto eq = s.rfind('=');
-            c.golden_path = eq == std::string::npos ? s : s.substr(0, eq);
-            if (eq != std::string::npos) c.table = s.substr(eq + 1);
+            if (eq == std::string::npos || eq + 1 == s.size()) {
+                std::fprintf(stderr, "--check needs GOLDEN=TABLE (use --report-only GOLDEN for an unchecked comparison)\n");
+                return 2;
+            }
+            c.golden_path = s.substr(0, eq);
+            c.table = s.substr(eq + 1);
             checks.push_back(std::move(c));
-        } else if (a == "--device") { std::string d = next(); opts.device = d == "cuda" ? varda::Device::CUDA : varda::Device::CPU; }
-        else if (a == "--precision") { std::string p = next(); opts.precision = p == "fp16" ? varda::Precision::FP16 : varda::Precision::FP32; }
+        } else if (a == "--report-only") {
+            Check c;
+            c.golden_path = next();
+            c.report_only = true;
+            checks.push_back(std::move(c));
+        } else if (a == "--device" || a == "--precision") {
+            std::string v = next();
+            try {
+                if (a == "--device") opts.device = app::parse_device(v);
+                else opts.precision = app::parse_precision(v);
+            } catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 2; }
+        }
         else if (a == "--threads") opts.num_threads = std::stoi(next());
         else if (a == "--no-cuda-graph") opts.cuda_graph = false;
         else if (a == "--tolerances") tol_path = next();
@@ -111,6 +127,7 @@ int main(int argc, char** argv) {
                 c.shapes[key] = shape;
                 if (!c.golden->file->has(key)) { c.errors.push_back(key + ": not in golden file"); continue; }
                 const varda::TensorView& r = c.golden->file->peek(key);
+                if (r.dtype != varda::DType::F32) { c.errors.push_back(key + ": golden dtype is not F32"); continue; }
                 if (r.shape != shape) {
                     c.errors.push_back(key + ": engine shape " + app::shape_str(shape) + " != golden " + r.shape_str());
                     continue;
@@ -153,20 +170,21 @@ int main(int argc, char** argv) {
 
         for (auto& c : checks) {
             std::printf("\nvs %s (tag %s)%s%s\n", c.golden_path.c_str(), c.golden->tag.c_str(),
-                        c.table.empty() ? "" : ", table ", c.table.c_str());
+                        c.report_only ? ", report only (unchecked)" : ", table ", c.table.c_str());
             std::printf("  %-14s %-22s %12s %12s %12s %10s %7s %s\n", "key", "shape", "absmax", "max_abs", "rel_absmax",
                         "tol", "ratio", "");
             json jc;
             jc["golden"] = c.golden_path;
             jc["tag"] = c.golden->tag;
             jc["table"] = c.table;
+            jc["report_only"] = c.report_only;
             double worst_ratio = 0;
             std::string worst_key;
             for (const auto& k : keys) {
                 if (!c.metrics.count(k)) continue;
                 const auto& m = c.metrics[k];
                 double tol = -1, ratio = 0;
-                bool ok = m.n_nan == 0;
+                bool ok = m.n_nan == 0 && m.n_ref_bad == 0;
                 if (!c.tol.is_null()) {
                     if (!c.tol.contains(k)) { c.errors.push_back(k + ": no tolerance in table"); ok = false; }
                     else {
@@ -177,12 +195,14 @@ int main(int argc, char** argv) {
                     }
                 }
                 if (!ok) c.errors.push_back(k + ": rel_absmax " + std::to_string(m.rel_absmax) +
-                                            (m.n_nan ? " with NaN" : "") + " exceeds tolerance");
+                                            (m.n_nan ? " with NaN in the engine output" : "") +
+                                            (m.n_ref_bad ? " with NaN/Inf in the golden tensor" : "") +
+                                            (c.report_only ? "" : " exceeds tolerance or is non-finite"));
                 std::printf("  %-14s %-22s %12.4e %12.4e %12.4e %10.2e %7.3f %s\n", k.c_str(),
                             app::shape_str(c.shapes[k]).c_str(), m.absmax, m.max_abs, m.rel_absmax, tol, ratio,
-                            m.max_abs == 0 ? "bitwise" : (ok ? "ok" : "FAIL"));
+                            !ok ? "FAIL" : (m.max_abs == 0 ? "bitwise" : "ok"));
                 jc["keys"][k] = {{"shape", c.shapes[k]}, {"absmax", m.absmax}, {"max_abs", m.max_abs},
-                                 {"rel_absmax", m.rel_absmax}, {"n_nan", m.n_nan}, {"tol", tol}, {"ok", ok}};
+                                 {"rel_absmax", m.rel_absmax}, {"n_nan", m.n_nan}, {"n_ref_bad", m.n_ref_bad}, {"tol", tol}, {"ok", ok}};
             }
             jc["worst_ratio"] = worst_ratio;
             jc["worst_key"] = worst_key;
