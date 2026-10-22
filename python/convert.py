@@ -21,8 +21,10 @@ import json
 import os
 import re
 import sys
+import zipfile
 from pathlib import Path
 
+import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # python -I does not add the script dir
@@ -604,6 +606,106 @@ def build_config(root, acc, weights, absent, blocks, n_layers, graph_nodes, ckpt
     }
 
 
+# --------------------------------------------------------------------------------------------
+# Grid coordinates for the dynamic forcings (docs/forcings.md)
+# --------------------------------------------------------------------------------------------
+
+GRID_DATASET = "data"  # key of `supporting_arrays_paths` that anemoi-inference loads for the model's dataset
+
+
+def read_grid_coordinates(ckpt_path, node_attr):
+    """The latitudes / longitudes anemoi-inference feeds to its computed forcings: F64 [G], degrees, as stored.
+
+    anemoi-inference (`metadata.latitudes`, `tensors.py:121-125`) reads the supporting arrays `latitudes` and
+    `longitudes` of the dataset from the checkpoint zip: the members named in
+    `anemoi-metadata/anemoi.json["supporting_arrays_paths"]["data"]` (raw `np.frombuffer` buffers, no header).
+    Read here with zipfile + numpy only, no unpickling. Asserted to agree (float32 precision) with the stored
+    node attributes `nodes.data.attr` = [sin lat, sin lon, cos lat, cos lon], so a coordinate / node mismatch
+    cannot go unnoticed.
+    """
+    with zipfile.ZipFile(ckpt_path) as z:
+        names = [n for n in z.namelist() if n.endswith("anemoi-metadata/anemoi.json")]
+        check(len(names) == 1, f"expected one anemoi-metadata/anemoi.json, found {names}")
+        paths = json.loads(z.read(names[0]))["supporting_arrays_paths"]
+        check(GRID_DATASET in paths and isinstance(paths[GRID_DATASET], dict)
+              and {"latitudes", "longitudes"} <= set(paths[GRID_DATASET]),
+              "supporting_arrays_paths has no dataset-level latitudes / longitudes")
+        out = {}
+        for key in ("latitudes", "longitudes"):
+            e = paths[GRID_DATASET][key]
+            check(set(e) == {"path", "shape", "dtype"} and e["dtype"] == "float64" and len(e["shape"]) == 1,
+                  f"{key}: unexpected supporting array entry {e}")
+            raw = z.read(e["path"])
+            a = np.frombuffer(raw, dtype=np.dtype("<f8")).reshape(e["shape"])
+            check(a.nbytes == len(raw), f"{key}: size mismatch")
+            out[key] = torch.from_numpy(a.copy())  # F64 [G], bytes exactly as stored
+    lat, lon = out["latitudes"], out["longitudes"]
+    check(lat.shape == lon.shape and lat.shape[0] == node_attr.shape[0],
+          f"coordinate length {tuple(lat.shape)} / {tuple(lon.shape)} != nodes.data.attr {tuple(node_attr.shape)}")
+    check(bool(torch.isfinite(lat).all() and torch.isfinite(lon).all()), "non-finite coordinates")
+    check(float(lat.abs().max()) <= 90.0, "latitudes outside [-90, 90]")
+    # [sin lat, sin lon, cos lat, cos lon] of the radian coordinates, stored as float32
+    rad = torch.deg2rad
+    ref = torch.stack([torch.sin(rad(lat)), torch.sin(rad(lon)), torch.cos(rad(lat)), torch.cos(rad(lon))], 1)
+    err = float((ref - node_attr.to(torch.float64)).abs().max())
+    check(err <= 1e-6, f"coordinates disagree with nodes.data.attr: max abs difference {err:.3g} (> 1e-6)")
+    print(f"grid coordinates: G={lat.shape[0]}, lat [{float(lat.min()):.4f}, {float(lat.max()):.4f}], "
+          f"lon [{float(lon.min()):.4f}, {float(lon.max()):.4f}]; max |trig(coords) - nodes.data.attr| = {err:.3g}")
+    return {"grid.latitudes": lat, "grid.longitudes": lon}
+
+
+def build_forcings(meta, in_names, residual_input_names):
+    """Config section "forcings": which model inputs the rollout refreshes, from the checkpoint's metadata.
+
+    Mirrors anemoi-inference 9505dd0 (docs/forcings.md section 1):
+      dynamic  = computed_forcing and not constant_in_time  (`create_dynamic_forcings_providers`, tensors.py:331-352,
+                 category "computed" excluding "constant")  -> recomputed for the new valid date every step;
+      constant = constant_in_time                           (runner.py:463-466 `reset`; the roll carries them);
+      prognostic = the rest, taken from the model output (already `indices.residual_*`).
+    Input indices come from metadata_inference.<dataset>.data_indices.input (metadata.py:1583-1584). The timestep is
+    metadata_inference.<dataset>.timesteps.timestep (metadata.py:1509-1511).
+    """
+    vm = meta["dataset"][DATASET]["variables_metadata"]
+    inf = meta["metadata_inference"][DATASET]
+    vtypes = inf["variable_types"]
+    idx = {k: int(v) for k, v in inf["data_indices"]["input"].items()}
+    check(idx == {n: i for i, n in enumerate(in_names)}, "metadata_inference data_indices.input != converted input names")
+    check(len(inf["timesteps"]["output_relative_date_indices"]) == 1, "multi-step output is not supported")
+    check(len(inf["timesteps"]["input_relative_date_indices"]) == 2, "unexpected number of input steps")
+    ts = str(inf["timesteps"]["timestep"])
+    m = re.fullmatch(r"(\d+)h", ts)
+    check(m is not None and int(m.group(1)) > 0, f"timestep {ts!r}: only whole hours ('<N>h') are supported")
+    cfg_ts = meta["config"]["data"].get("timestep")
+    check(cfg_ts is None or cfg_ts == ts, f"config.data.timestep {cfg_ts!r} != metadata_inference timestep {ts!r}")
+
+    dynamic, constant = [], []
+    for n in in_names:
+        v = vm[n]
+        is_const, is_comp = bool(v.get("constant_in_time", False)), bool(v.get("computed_forcing", False))
+        in_forcing, in_prog = n in vtypes["forcing"], n in vtypes["prognostic"]
+        if is_const:
+            check(in_forcing, f"{n}: constant in time but not a forcing")
+            constant.append(n)
+        elif is_comp:
+            dynamic.append(n)
+        else:
+            # not recomputed, not constant: must be a prognostic input (fed back from the output)
+            check(in_prog and not in_forcing,
+                  f"{n}: a non-computed dynamic forcing (read from an input source) is not supported")
+    check(sorted(set(in_names) - set(dynamic) - set(constant)) == sorted(residual_input_names),
+          "inputs not refreshed by forcings != residual (prognostic) inputs")
+    check(dynamic and set(dynamic) <= set(vtypes["forcing"]), "dynamic forcings must be forcing variables")
+    return {
+        "dynamic": dynamic,
+        "dynamic_input_index": [idx[n] for n in dynamic],
+        "constant": constant,
+        "constant_input_index": [idx[n] for n in constant],
+        "timestep_hours": int(m.group(1)),
+        "source": "anemoi.json: dataset.data.variables_metadata[*].{computed_forcing,constant_in_time}, "
+                  "metadata_inference.data.{variable_types,data_indices.input,timesteps.timestep}",
+    }
+
+
 def convert(ckpt_path, out_path):
     ckpt_path = Path(ckpt_path)
     out_path = Path(out_path)
@@ -612,6 +714,9 @@ def convert(ckpt_path, out_path):
     acc = Accounting(root)
     weights, absent, blocks, n_layers, graph_nodes = convert_tensors(root, acc)
     config = build_config(root, acc, weights, absent, blocks, n_layers, graph_nodes, ckpt_path, arch)
+    config["forcings"] = build_forcings(
+        ck.anemoi_metadata(ckpt_path), config["variables"]["input"],
+        [config["variables"]["input"][i] for i in config["indices"]["residual_input"]])
     stats_err = check_statistics(root, config["variables"]["data"])
     rules = UNUSED_RULES if stats_err <= 1e-6 else [
         (pat, STATS_STALE_REASON.format(err=stats_err) if r == STATS_FOLDED_REASON else r) for pat, r in UNUSED_RULES]
@@ -621,6 +726,9 @@ def convert(ckpt_path, out_path):
     n_conv = len(acc.converted)
     check(n_conv + len(config["unused"]) == n_ck, "accounting mismatch")
     check(len(set(weights)) == len(weights), "duplicate contract names")
+
+    weights.update(read_grid_coordinates(ckpt_path, weights["nodes.data.attr"]))
+    check(len(set(weights)) == len(weights), "duplicate contract names (grid.*)")
 
     meta = {"varda_format": "1", "config": json.dumps(config)}
     nbytes = st_io.write_safetensors(out_path, weights, meta)  # temporary name, then rename

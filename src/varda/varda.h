@@ -48,10 +48,16 @@ public:
 
     Backend& backend() { return *backend_; }
 
+    // Data-grid coordinates in degrees (`grid.latitudes` / `grid.longitudes`, F64 [G]),
+    // used for the rollout's computed forcings. Empty if the file predates them.
+    const std::vector<double>& latitudes() const { return lat_; }
+    const std::vector<double>& longitudes() const { return lon_; }
+
 private:
     Model() = default;
     Config cfg_;
     Options opts_;
+    std::vector<double> lat_, lon_;
     std::unique_ptr<SafeTensorsFile> file_;  // outlives backend_ (declared first)
     std::unique_ptr<Backend> backend_;
 };

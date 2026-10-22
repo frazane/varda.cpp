@@ -5,7 +5,7 @@
 
 VARDA_CONVERTED may list several files separated by ':'. VARDA_WEIGHTS_PT (same count, same order, or
 unset) enables the bitwise comparison with the Python engine's weights.pt, and config.json next to it
-is compared too. Without VARDA_CONVERTED the tests are skipped. The restricted-unpickler tests need no files.
+is compared too. VARDA_CKPTS (same count/order) enables the check of grid.* against the zip members. Without VARDA_CONVERTED the tests are skipped. The restricted-unpickler tests need no files.
 """
 
 import io
@@ -40,6 +40,9 @@ def expected_names(cfg):
     for m in mods:
         names |= {f"{m}.weight", f"{m}.bias"}
     return names - set(cfg["absent"])
+
+
+GRID_NAMES = {"grid.latitudes", "grid.longitudes"}  # F64 [G]: coordinates anemoi-inference uses (docs/forcings.md)
 
 
 @unittest.skipUnless(FILES, "VARDA_CONVERTED not set")
@@ -114,13 +117,33 @@ class ConvertedFile(unittest.TestCase):
             self.assertIsInstance(c["absent"], list)
             self.assertTrue(all(isinstance(u["path"], str) and u["reason"] for u in c["unused"]))
 
+    def test_forcings_section(self):
+        for _, p in self.each():
+            header, _ = sio.read_header(p)
+            c = json.loads(header["__metadata__"]["config"])
+            f = c["forcings"]
+            self.assertEqual(sorted(f), ["constant", "constant_input_index", "dynamic", "dynamic_input_index",
+                                         "source", "timestep_hours"])
+            inp = c["variables"]["input"]
+            self.assertEqual([inp[i] for i in f["dynamic_input_index"]], f["dynamic"])
+            self.assertEqual([inp[i] for i in f["constant_input_index"]], f["constant"])
+            self.assertEqual(f["dynamic_input_index"], sorted(f["dynamic_input_index"]))
+            self.assertEqual(f["constant_input_index"], sorted(f["constant_input_index"]))
+            self.assertEqual(f["dynamic"], ["cos_julian_day", "cos_local_time", "insolation", "sin_julian_day",
+                                            "sin_local_time"])
+            prog = {inp[i] for i in c["indices"]["residual_input"]}
+            self.assertEqual(prog | set(f["dynamic"]) | set(f["constant"]), set(inp))  # a partition
+            self.assertEqual(len(prog) + len(f["dynamic"]) + len(f["constant"]), len(inp))
+            self.assertIsInstance(f["timestep_hours"], int)
+            self.assertGreater(f["timestep_hours"], 0)
+
     def test_names_shapes(self):
         for _, p in self.each():
             header, _ = sio.read_header(p)
             c = json.loads(header["__metadata__"]["config"])
             d = c["dims"]
             names = {k for k in header if k != "__metadata__"}
-            self.assertEqual(names, expected_names(c))
+            self.assertEqual(names, expected_names(c) | GRID_NAMES)
             C = d["num_channels"]
             for g in ("enc", "proc", "dec"):
                 ei, ea = header[f"graph.{g}.edge_index"], header[f"graph.{g}.edge_attr"]
@@ -131,12 +154,25 @@ class ConvertedFile(unittest.TestCase):
             self.assertEqual(header["nodes.data.attr"]["shape"], [d["n_data_nodes"], d["node_attr_dim"]])
             self.assertEqual(header["nodes.hidden.attr"]["shape"], [d["n_hidden_nodes"], d["node_attr_dim"]])
             self.assertEqual(header["norm.mul"]["shape"], [d["n_data_vars"]])
+            for n in sorted(GRID_NAMES):
+                self.assertEqual(header[n]["dtype"], "F64", n)
+                self.assertEqual(header[n]["shape"], [d["n_data_nodes"]], n)
             self.assertEqual(header["dec.out_proj.weight"]["shape"], [d["n_output_vars"], C])
             self.assertEqual(header["proc.0.q.weight"]["shape"], [C, C])
             self.assertEqual(header["proc.0.mlp1.weight"]["shape"], [d["mlp_hidden"], C])
             for n, h in header.items():
-                if n != "__metadata__":
+                if n != "__metadata__" and n not in GRID_NAMES:
                     self.assertEqual(h["dtype"], "I64" if n.endswith("edge_index") else "F32", n)
+
+    def test_grid_coordinates_agree_with_node_attr(self):
+        for _, p in self.each():
+            _, t = sio.read_safetensors(p)
+            lat, lon = np.asarray(t["grid.latitudes"]), np.asarray(t["grid.longitudes"])
+            self.assertTrue(np.isfinite(lat).all() and np.isfinite(lon).all())
+            self.assertLessEqual(np.abs(lat).max(), 90.0)
+            ref = np.stack([np.sin(np.deg2rad(lat)), np.sin(np.deg2rad(lon)),
+                            np.cos(np.deg2rad(lat)), np.cos(np.deg2rad(lon))], 1)
+            self.assertLess(np.abs(ref - np.asarray(t["nodes.data.attr"], np.float64)).max(), 1e-6)
 
     @unittest.skipUnless(WEIGHTS, "VARDA_WEIGHTS_PT not set")
     def test_bitwise_vs_weights_pt(self):
@@ -144,7 +180,8 @@ class ConvertedFile(unittest.TestCase):
             wp = WEIGHTS[i]
             meta, t = sio.read_safetensors(p)
             w = torch.load(wp, mmap=True, weights_only=True)
-            self.assertEqual(set(t), set(w))
+            self.assertEqual(set(t) - GRID_NAMES, set(w))  # all old tensors, plus exactly the grid.* ones
+            self.assertEqual(set(t) & GRID_NAMES, GRID_NAMES)
             for k, r in w.items():
                 a = torch.from_numpy(np.array(t[k]))
                 self.assertEqual(a.dtype, r.dtype, k)
@@ -153,9 +190,23 @@ class ConvertedFile(unittest.TestCase):
             with open(os.path.join(os.path.dirname(wp), "config.json")) as f:
                 ref = json.load(f)
             cfg = json.loads(meta["config"])
+            cfg.pop("forcings")  # added by the converter; checked in test_forcings_section
             for s in (cfg["source"], ref["source"]):
                 s.pop("checkpoint"), s.pop("mtime", None)
             self.assertEqual(cfg, ref)
+
+    @unittest.skipUnless(os.environ.get("VARDA_CKPTS"), "VARDA_CKPTS not set")
+    def test_grid_coordinates_are_the_zip_members_bitwise(self):
+        """grid.* equals the checkpoint's data/latitudes|longitudes members (read independently, via numpy)."""
+        import zipfile
+        for i, p in self.each():
+            ck_path = os.environ["VARDA_CKPTS"].split(":")[i]
+            _, t = sio.read_safetensors(p)
+            with zipfile.ZipFile(ck_path) as z:
+                for key in ("latitudes", "longitudes"):
+                    m = [n for n in z.namelist() if n.endswith(f"anemoi-metadata/data/{key}.numpy")]
+                    self.assertEqual(len(m), 1)
+                    self.assertEqual(np.frombuffer(z.read(m[0]), "<f8").tobytes(), np.asarray(t[f"grid.{key}"]).tobytes())
 
 
 class RestrictedUnpickler(unittest.TestCase):

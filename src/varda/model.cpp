@@ -18,6 +18,13 @@ std::unique_ptr<Model> Model::load(const std::string& path, const Options& opts)
     if (m->file_->metadata("varda_format") != "1")
         throw std::runtime_error(path + ": unsupported varda_format " + m->file_->metadata("varda_format"));
     m->cfg_ = parse_config(m->file_->metadata("config"));
+    if (m->file_->has("grid.latitudes") || m->file_->has("grid.longitudes")) {
+        const std::vector<int64_t> shape{m->cfg_.n_data_nodes};
+        const TensorView& la = m->file_->take("grid.latitudes", DType::F64, shape);
+        const TensorView& lo = m->file_->take("grid.longitudes", DType::F64, shape);
+        m->lat_.assign(la.as<double>(), la.as<double>() + la.numel());
+        m->lon_.assign(lo.as<double>(), lo.as<double>() + lo.numel());
+    }
 
     if (opts.device == Device::CPU) {
         if (opts.precision != Precision::FP32)

@@ -1,0 +1,3252 @@
+{
+ "method": "Per rollout step s (0-based; step s is the s-th model call), contract metric rel_absmax = max|a-r|/max|r| (float64) of: y (the step's physical output (1,1,1,G,72)), y_norm (y*mul_out+add_out in float64: every variable O(1)), window (the physical (1,2,G,84) window step s sees) and window_norm. The references are anemoi-inference rollouts of the original model (reference/run_rollout.py, identical input and forcings): cpu-fp32-pyg (ground truth), cuda-fp32-triton (runner precision '32'), cuda-fp16-triton (runner precision from the checkpoint: fp16 autocast, production). Error grows with the step, so tolerances are per step, with the one-step method of bench/calibrate_tolerances.py: fast-fp32-vs-cpu = max(1e-5, 3 x ref cuda-fp32 vs cpu) (window at step 0 = the input: 1e-6); fast-fp16-vs-cpu = 1.75 x ref cuda-fp16 vs cpu; fast-fp16-vs-ref-fp16 = 2 x ref cuda-fp16 vs ref cuda-fp32 (two independent roundings add); floors 1e-6; rounded up to 2 significant digits. v2 (fp16 keys; v1 kept under 'v1'): one fp16 reference trajectory is not a noise floor for a chaotic rollout (its error vs CPU fluctuates by ~2x from step to step and between equally valid runs). The fp16 tolerances are calibrated on an ensemble of mathematically neutral perturbations of the reference fp16 rollout (listed under 'fp16_ensemble': ANEMOI_INFERENCE_NUM_CHUNKS_* summation grouping, the pyg attention backend, 1-ulp random-sign perturbations of the input): fast-fp16-vs-cpu = 1.75 x max over {reference fp16} + ensemble of rel vs cpu (per step, per key); fast-fp16-vs-ref-fp16 = max(v1 value, 1.75 x max over the ensemble of rel vs the reference fp16 rollout), step 0 kept at the v1 one-step value. A per-step max over a handful of chaotic trajectories is heavy-tailed: valid reference runs exceed the 1.75x envelope of the OTHER runs by up to fp16_leave_one_out's worst ratio, so steps >= 1 allow that factor (fp16_allowance), and the mean over steps (a stable statistic) must stay within 1.75 x the members' largest mean (fp16_mean_tolerance). See fp16_criterion and docs/rollout.md \u00a75.",
+ "model": "dev",
+ "checkpoint": {
+  "uuid": "66575e03-027c-4cca-9921-ddb22e81573b",
+  "run_id": "1f5927f73c2b4d5fa62805066c4b10ac",
+  "size_bytes": 999213208,
+  "sha256": "48e82c2460d54b2ce6bfb267ff75032966ca2436e6507728d74c6a55c237f206",
+  "path": "$VARDA_DEV_CKPT"
+ },
+ "steps": 24,
+ "keys": [
+  "y",
+  "y_norm",
+  "window",
+  "window_norm"
+ ],
+ "fast-fp32-vs-cpu": {
+  "y": [
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05
+  ],
+  "y_norm": [
+   1.1e-05,
+   1.1e-05,
+   2.5e-05,
+   2.9e-05,
+   2.3e-05,
+   2.4e-05,
+   2.9e-05,
+   3.6e-05,
+   4.5e-05,
+   0.0002,
+   6.4e-05,
+   7.7e-05,
+   0.00011,
+   9.9e-05,
+   0.00014,
+   0.00016,
+   0.00024,
+   0.00026,
+   0.00028,
+   0.00022,
+   0.00036,
+   0.00059,
+   0.00084,
+   0.0012
+  ],
+  "window": [
+   1e-06,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05,
+   1.1e-05
+  ],
+  "window_norm": [
+   1e-06,
+   1.1e-05,
+   1.1e-05,
+   1.4e-05,
+   1.7e-05,
+   2.6e-05,
+   4.3e-05,
+   0.00011,
+   0.0002,
+   0.00019,
+   0.00055,
+   0.00049,
+   0.00012,
+   0.00023,
+   0.0002,
+   0.00011,
+   0.00018,
+   0.00017,
+   0.00016,
+   0.00025,
+   0.00036,
+   0.00057,
+   0.00086,
+   0.0012
+  ]
+ },
+ "fast-fp16-vs-cpu": {
+  "y": [
+   1.2e-05,
+   2e-05,
+   2.4e-05,
+   2.9e-05,
+   3.3e-05,
+   5.7e-05,
+   5.3e-05,
+   6.6e-05,
+   0.00011,
+   0.00013,
+   0.00018,
+   0.00023,
+   0.00021,
+   0.00019,
+   0.00018,
+   0.00021,
+   0.00042,
+   0.00056,
+   0.00071,
+   0.0008,
+   0.00078,
+   0.0008,
+   0.00068,
+   0.00066
+  ],
+  "y_norm": [
+   0.0019,
+   0.0026,
+   0.0029,
+   0.0037,
+   0.0043,
+   0.0056,
+   0.0069,
+   0.011,
+   0.016,
+   0.039,
+   0.053,
+   0.051,
+   0.041,
+   0.039,
+   0.036,
+   0.051,
+   0.057,
+   0.056,
+   0.052,
+   0.076,
+   0.077,
+   0.083,
+   0.085,
+   0.083
+  ],
+  "window": [
+   1e-06,
+   1.4e-05,
+   2e-05,
+   2.4e-05,
+   2.9e-05,
+   3.3e-05,
+   5.7e-05,
+   5.7e-05,
+   6.6e-05,
+   0.00011,
+   0.00013,
+   0.00018,
+   0.00023,
+   0.00023,
+   0.00021,
+   0.00019,
+   0.00021,
+   0.00042,
+   0.00056,
+   0.00071,
+   0.0008,
+   0.0008,
+   0.0008,
+   0.0008
+  ],
+  "window_norm": [
+   1e-06,
+   0.0028,
+   0.0029,
+   0.0052,
+   0.0062,
+   0.012,
+   0.033,
+   0.039,
+   0.055,
+   0.063,
+   0.11,
+   0.13,
+   0.13,
+   0.12,
+   0.08,
+   0.07,
+   0.084,
+   0.089,
+   0.089,
+   0.089,
+   0.084,
+   0.09,
+   0.11,
+   0.11
+  ]
+ },
+ "fast-fp16-vs-ref-fp16": {
+  "y": [
+   1.4e-05,
+   2.2e-05,
+   2.6e-05,
+   2.8e-05,
+   3.3e-05,
+   3.6e-05,
+   5.3e-05,
+   0.00011,
+   0.00012,
+   0.00013,
+   0.00018,
+   0.00022,
+   0.00022,
+   0.00019,
+   0.0002,
+   0.00022,
+   0.00041,
+   0.00054,
+   0.00068,
+   0.00078,
+   0.00076,
+   0.00079,
+   0.00067,
+   0.00065
+  ],
+  "y_norm": [
+   0.0022,
+   0.0023,
+   0.0029,
+   0.0041,
+   0.0046,
+   0.0049,
+   0.006,
+   0.011,
+   0.018,
+   0.039,
+   0.053,
+   0.051,
+   0.041,
+   0.039,
+   0.03,
+   0.051,
+   0.064,
+   0.055,
+   0.06,
+   0.086,
+   0.11,
+   0.13,
+   0.12,
+   0.11
+  ],
+  "window": [
+   1e-06,
+   1.4e-05,
+   2.2e-05,
+   2.6e-05,
+   2.8e-05,
+   3.3e-05,
+   3.6e-05,
+   5.3e-05,
+   0.00011,
+   0.00012,
+   0.00013,
+   0.00018,
+   0.00022,
+   0.00022,
+   0.00022,
+   0.0002,
+   0.00022,
+   0.00041,
+   0.00054,
+   0.00068,
+   0.00078,
+   0.00078,
+   0.00079,
+   0.00078
+  ],
+  "window_norm": [
+   1e-06,
+   0.0024,
+   0.0029,
+   0.0057,
+   0.0065,
+   0.012,
+   0.018,
+   0.033,
+   0.055,
+   0.072,
+   0.11,
+   0.13,
+   0.13,
+   0.12,
+   0.079,
+   0.069,
+   0.083,
+   0.11,
+   0.1,
+   0.096,
+   0.15,
+   0.18,
+   0.18,
+   0.17
+  ]
+ },
+ "v1": {
+  "fast-fp16-vs-cpu": {
+   "y": [
+    1.2e-05,
+    2e-05,
+    2.3e-05,
+    2.5e-05,
+    2.9e-05,
+    3.2e-05,
+    4.1e-05,
+    6.6e-05,
+    9.7e-05,
+    7.5e-05,
+    0.00014,
+    0.00011,
+    0.00015,
+    0.00011,
+    0.00017,
+    0.00019,
+    0.00019,
+    0.00021,
+    0.00021,
+    0.00022,
+    0.00026,
+    0.00032,
+    0.00034,
+    0.00036
+   ],
+   "y_norm": [
+    0.0019,
+    0.0019,
+    0.0026,
+    0.0036,
+    0.004,
+    0.0043,
+    0.005,
+    0.0067,
+    0.014,
+    0.012,
+    0.017,
+    0.013,
+    0.011,
+    0.011,
+    0.022,
+    0.039,
+    0.056,
+    0.048,
+    0.046,
+    0.037,
+    0.053,
+    0.049,
+    0.063,
+    0.04
+   ],
+   "window": [
+    1e-06,
+    1.2e-05,
+    2e-05,
+    2.3e-05,
+    2.5e-05,
+    2.9e-05,
+    3.2e-05,
+    4.1e-05,
+    6.6e-05,
+    9.7e-05,
+    9.7e-05,
+    0.00014,
+    0.00014,
+    0.00015,
+    0.00015,
+    0.00017,
+    0.00019,
+    0.00019,
+    0.00021,
+    0.00021,
+    0.00022,
+    0.00026,
+    0.00032,
+    0.00034
+   ],
+   "window_norm": [
+    1e-06,
+    0.0021,
+    0.0024,
+    0.0041,
+    0.0056,
+    0.011,
+    0.016,
+    0.028,
+    0.037,
+    0.057,
+    0.044,
+    0.03,
+    0.028,
+    0.028,
+    0.021,
+    0.038,
+    0.064,
+    0.088,
+    0.088,
+    0.077,
+    0.074,
+    0.084,
+    0.078,
+    0.085
+   ]
+  },
+  "fast-fp16-vs-ref-fp16": {
+   "y": [
+    1.4e-05,
+    2.2e-05,
+    2.6e-05,
+    2.8e-05,
+    3.3e-05,
+    3.6e-05,
+    4.7e-05,
+    7.5e-05,
+    0.00012,
+    8.5e-05,
+    0.00016,
+    0.00013,
+    0.00017,
+    0.00012,
+    0.0002,
+    0.00022,
+    0.00022,
+    0.00023,
+    0.00024,
+    0.00025,
+    0.0003,
+    0.00036,
+    0.00038,
+    0.00041
+   ],
+   "y_norm": [
+    0.0022,
+    0.0021,
+    0.0029,
+    0.0041,
+    0.0046,
+    0.0049,
+    0.0057,
+    0.0077,
+    0.016,
+    0.014,
+    0.019,
+    0.014,
+    0.012,
+    0.012,
+    0.025,
+    0.045,
+    0.064,
+    0.055,
+    0.052,
+    0.043,
+    0.061,
+    0.056,
+    0.072,
+    0.046
+   ],
+   "window": [
+    1e-06,
+    1.4e-05,
+    2.2e-05,
+    2.6e-05,
+    2.8e-05,
+    3.3e-05,
+    3.6e-05,
+    4.7e-05,
+    7.5e-05,
+    0.00012,
+    0.00012,
+    0.00016,
+    0.00016,
+    0.00017,
+    0.00017,
+    0.0002,
+    0.00022,
+    0.00022,
+    0.00023,
+    0.00024,
+    0.00025,
+    0.0003,
+    0.00036,
+    0.00038
+   ],
+   "window_norm": [
+    1e-06,
+    0.0024,
+    0.0027,
+    0.0046,
+    0.0064,
+    0.012,
+    0.018,
+    0.032,
+    0.042,
+    0.065,
+    0.05,
+    0.035,
+    0.032,
+    0.032,
+    0.023,
+    0.043,
+    0.073,
+    0.11,
+    0.1,
+    0.088,
+    0.085,
+    0.097,
+    0.09,
+    0.097
+   ]
+  }
+ },
+ "fp16_ensemble": [
+  "$SCRATCH/the Python project/rollout/v2/ensemble/chunks-mapper-8",
+  "$SCRATCH/the Python project/rollout/v2/ensemble/ulp-seed1",
+  "$SCRATCH/the Python project/rollout/v2/ensemble/ulp-seed2",
+  "$SCRATCH/the Python project/rollout/v2/ensemble/pyg-backend"
+ ],
+ "fp16_allowance": {
+  "fast-fp16-vs-cpu": 1.7,
+  "fast-fp16-vs-ref-fp16": 1.9
+ },
+ "fp16_mean_tolerance": {
+  "fast-fp16-vs-cpu": {
+   "y": 0.00028,
+   "y_norm": 0.033,
+   "window": 0.00026,
+   "window_norm": 0.061
+  },
+  "fast-fp16-vs-ref-fp16": {
+   "y": 0.00028,
+   "y_norm": 0.041,
+   "window": 0.00026,
+   "window_norm": 0.071
+  }
+ },
+ "fp16_leave_one_out": {
+  "fast-fp16-vs-cpu": {
+   "cuda-fp16-triton": {
+    "worst_ratio": 0.6816326530612244,
+    "key": "y",
+    "step": 7
+   },
+   "$SCRATCH/the Python project/rollout/v2/ensemble/chunks-mapper-8": {
+    "worst_ratio": 1.340123604673368,
+    "key": "y_norm",
+    "step": 9
+   },
+   "$SCRATCH/the Python project/rollout/v2/ensemble/ulp-seed1": {
+    "worst_ratio": 1.6199925400969786,
+    "key": "y",
+    "step": 18
+   },
+   "$SCRATCH/the Python project/rollout/v2/ensemble/ulp-seed2": {
+    "worst_ratio": 0.9769951718261858,
+    "key": "y",
+    "step": 5
+   },
+   "$SCRATCH/the Python project/rollout/v2/ensemble/pyg-backend": {
+    "worst_ratio": 0.8991826920688081,
+    "key": "y_norm",
+    "step": 19
+   }
+  },
+  "fast-fp16-vs-ref-fp16": {
+   "$SCRATCH/the Python project/rollout/v2/ensemble/chunks-mapper-8": {
+    "worst_ratio": 1.3907666208815328,
+    "key": "y_norm",
+    "step": 9
+   },
+   "$SCRATCH/the Python project/rollout/v2/ensemble/ulp-seed1": {
+    "worst_ratio": 1.8224127372933252,
+    "key": "y",
+    "step": 18
+   },
+   "$SCRATCH/the Python project/rollout/v2/ensemble/ulp-seed2": {
+    "worst_ratio": 0.6997034735612092,
+    "key": "y_norm",
+    "step": 16
+   },
+   "$SCRATCH/the Python project/rollout/v2/ensemble/pyg-backend": {
+    "worst_ratio": 0.7594443786597762,
+    "key": "window_norm",
+    "step": 8
+   }
+  }
+ },
+ "fp16_criterion": "fp16 checks (v2): step 0: rel <= the per-step tolerance (= the v1 one-step value); steps >= 1: rel <= fp16_allowance x the per-step tolerance; and per key, the mean over steps of rel <= fp16_mean_tolerance. Entries above the per-step tolerance alone are reported (valid runs have them too, see fp16_leave_one_out).",
+ "fp16_ensemble_dropped_identical": [
+  "$SCRATCH/the Python project/rollout/v2/ensemble/chunks-processor-4"
+ ],
+ "reference": {
+  "cuda-fp32-vs-cpu": {
+   "y": [
+    {
+     "max_abs": 0.03125,
+     "ref_absmax": 208940.140625,
+     "rel_absmax": 1.4956436760558442e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.046875,
+     "ref_absmax": 209083.109375,
+     "rel_absmax": 2.241931456831722e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.046875,
+     "ref_absmax": 209234.734375,
+     "rel_absmax": 2.2403068085238895e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.0625,
+     "ref_absmax": 209295.625,
+     "rel_absmax": 2.9862067112009626e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.078125,
+     "ref_absmax": 209417.484375,
+     "rel_absmax": 3.730586308643791e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.078125,
+     "ref_absmax": 209530.625,
+     "rel_absmax": 3.7285718973061815e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.078125,
+     "ref_absmax": 209627.625,
+     "rel_absmax": 3.726846592857215e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.078125,
+     "ref_absmax": 209701.453125,
+     "rel_absmax": 3.725534508024168e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.078125,
+     "ref_absmax": 209748.0625,
+     "rel_absmax": 3.7247066346560413e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.078125,
+     "ref_absmax": 209768.796875,
+     "rel_absmax": 3.72433846996578e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.078125,
+     "ref_absmax": 209772.734375,
+     "rel_absmax": 3.7242685629649053e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.09375,
+     "ref_absmax": 209927.3125,
+     "rel_absmax": 4.465831476787948e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.09375,
+     "ref_absmax": 210104.375,
+     "rel_absmax": 4.462067960269747e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.125,
+     "ref_absmax": 210265.5625,
+     "rel_absmax": 5.944863177487754e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.109375,
+     "ref_absmax": 210409.671875,
+     "rel_absmax": 5.198192603283817e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.09375,
+     "ref_absmax": 210536.234375,
+     "rel_absmax": 4.452915208553397e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.109375,
+     "ref_absmax": 210647.96875,
+     "rel_absmax": 5.192312114331745e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.109375,
+     "ref_absmax": 210747.59375,
+     "rel_absmax": 5.189857594756049e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.109375,
+     "ref_absmax": 210842.203125,
+     "rel_absmax": 5.187528795416537e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.109375,
+     "ref_absmax": 210939.359375,
+     "rel_absmax": 5.185139479140887e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.109375,
+     "ref_absmax": 211042.234375,
+     "rel_absmax": 5.182611922391423e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.109375,
+     "ref_absmax": 211142.765625,
+     "rel_absmax": 5.180144329181299e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.125,
+     "ref_absmax": 211236.890625,
+     "rel_absmax": 5.917526982628582e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.140625,
+     "ref_absmax": 211329.1875,
+     "rel_absmax": 6.654310351711355e-07,
+     "bitwise_equal": false
+    }
+   ],
+   "y_norm": [
+    {
+     "max_abs": 7.019215559012082e-05,
+     "ref_absmax": 71.93994828627547,
+     "rel_absmax": 9.75704838024076e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.00022260940772866888,
+     "ref_absmax": 71.83531785366267,
+     "rel_absmax": 3.0988852611768417e-06,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.0005856031266375794,
+     "ref_absmax": 71.74010520283991,
+     "rel_absmax": 8.162841760293343e-06,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.0006798611641443131,
+     "ref_absmax": 71.48933069130817,
+     "rel_absmax": 9.509966837988205e-06,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.0005434878332835069,
+     "ref_absmax": 73.41069454980607,
+     "rel_absmax": 7.403387702792722e-06,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.0005775811659987085,
+     "ref_absmax": 74.89732429540163,
+     "rel_absmax": 7.711639520267475e-06,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.000687883124783184,
+     "ref_absmax": 72.99917599099263,
+     "rel_absmax": 9.423162870606402e-06,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.0008586645126342773,
+     "ref_absmax": 71.88906498994311,
+     "rel_absmax": 1.1944299355602968e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.0010654330253601074,
+     "ref_absmax": 71.65183956993042,
+     "rel_absmax": 1.4869583694641521e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.004123091697692871,
+     "ref_absmax": 64.54181541648632,
+     "rel_absmax": 6.388248720750554e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.0013015631136568118,
+     "ref_absmax": 61.23286093844035,
+     "rel_absmax": 2.1255957891063116e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.0015402164426632226,
+     "ref_absmax": 60.75004720444895,
+     "rel_absmax": 2.535333738062391e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.0020142197608947754,
+     "ref_absmax": 59.48561774658947,
+     "rel_absmax": 3.38606176954472e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.0019057170242717802,
+     "ref_absmax": 58.214485940616214,
+     "rel_absmax": 3.2736130766760965e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.0025048572094874544,
+     "ref_absmax": 57.03002339738532,
+     "rel_absmax": 4.392172859606955e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.002794149165026738,
+     "ref_absmax": 55.486983224577216,
+     "rel_absmax": 5.035684051731086e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.004301776392594547,
+     "ref_absmax": 53.933895546068925,
+     "rel_absmax": 7.976016471719685e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.004637695994347268,
+     "ref_absmax": 54.68413738187837,
+     "rel_absmax": 8.480879860937776e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.005031774810731804,
+     "ref_absmax": 55.42153605870499,
+     "rel_absmax": 9.0790966266289e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.004018987710523447,
+     "ref_absmax": 56.576193007182155,
+     "rel_absmax": 7.103672935386887e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.006919434988503781,
+     "ref_absmax": 58.16675527481493,
+     "rel_absmax": 0.00011895858649519274,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.011179339099882668,
+     "ref_absmax": 57.39664705348332,
+     "rel_absmax": 0.00019477338265884314,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.015543198356127164,
+     "ref_absmax": 55.97597386826055,
+     "rel_absmax": 0.00027767624718255153,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.02107905666079546,
+     "ref_absmax": 54.39719184982596,
+     "rel_absmax": 0.00038750266225117465,
+     "bitwise_equal": false
+    }
+   ],
+   "window": [
+    {
+     "max_abs": 0.0,
+     "ref_absmax": 208870.0625,
+     "rel_absmax": 0.0,
+     "bitwise_equal": true
+    },
+    {
+     "max_abs": 0.03125,
+     "ref_absmax": 208940.140625,
+     "rel_absmax": 1.4956436760558442e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.046875,
+     "ref_absmax": 209083.109375,
+     "rel_absmax": 2.241931456831722e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.046875,
+     "ref_absmax": 209234.734375,
+     "rel_absmax": 2.2403068085238895e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.0625,
+     "ref_absmax": 209295.625,
+     "rel_absmax": 2.9862067112009626e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.078125,
+     "ref_absmax": 209417.484375,
+     "rel_absmax": 3.730586308643791e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.078125,
+     "ref_absmax": 209530.625,
+     "rel_absmax": 3.7285718973061815e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.078125,
+     "ref_absmax": 209627.625,
+     "rel_absmax": 3.726846592857215e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.078125,
+     "ref_absmax": 209701.453125,
+     "rel_absmax": 3.725534508024168e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.078125,
+     "ref_absmax": 209748.0625,
+     "rel_absmax": 3.7247066346560413e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.078125,
+     "ref_absmax": 209768.796875,
+     "rel_absmax": 3.72433846996578e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.078125,
+     "ref_absmax": 209772.734375,
+     "rel_absmax": 3.7242685629649053e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.09375,
+     "ref_absmax": 209927.3125,
+     "rel_absmax": 4.465831476787948e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.09375,
+     "ref_absmax": 210104.375,
+     "rel_absmax": 4.462067960269747e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.125,
+     "ref_absmax": 210265.5625,
+     "rel_absmax": 5.944863177487754e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.125,
+     "ref_absmax": 210409.671875,
+     "rel_absmax": 5.940791546610077e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.109375,
+     "ref_absmax": 210536.234375,
+     "rel_absmax": 5.195067743312297e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.109375,
+     "ref_absmax": 210647.96875,
+     "rel_absmax": 5.192312114331745e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.109375,
+     "ref_absmax": 210747.59375,
+     "rel_absmax": 5.189857594756049e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.109375,
+     "ref_absmax": 210842.203125,
+     "rel_absmax": 5.187528795416537e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.109375,
+     "ref_absmax": 210939.359375,
+     "rel_absmax": 5.185139479140887e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.109375,
+     "ref_absmax": 211042.234375,
+     "rel_absmax": 5.182611922391423e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.109375,
+     "ref_absmax": 211142.765625,
+     "rel_absmax": 5.180144329181299e-07,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.125,
+     "ref_absmax": 211236.890625,
+     "rel_absmax": 5.917526982628582e-07,
+     "bitwise_equal": false
+    }
+   ],
+   "window_norm": [
+    {
+     "max_abs": 0.0,
+     "ref_absmax": 5.150297892967501,
+     "rel_absmax": 0.0,
+     "bitwise_equal": true
+    },
+    {
+     "max_abs": 1.4464893865806516e-05,
+     "ref_absmax": 8.436052216924821,
+     "rel_absmax": 1.7146520071066342e-06,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 2.506004285862673e-05,
+     "ref_absmax": 8.436052216924821,
+     "rel_absmax": 2.9705888743018974e-06,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 3.795614070867259e-05,
+     "ref_absmax": 8.355646645509182,
+     "rel_absmax": 4.542573701231426e-06,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 6.539312323639024e-05,
+     "ref_absmax": 11.56079031148522,
+     "rel_absmax": 5.656457860966873e-06,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.00010573863983154297,
+     "ref_absmax": 12.434595021877612,
+     "rel_absmax": 8.503585331529078e-06,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.0001819133758544922,
+     "ref_absmax": 12.871851121754162,
+     "rel_absmax": 1.413265070686284e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.0004464387893676758,
+     "ref_absmax": 13.140255436947655,
+     "rel_absmax": 3.397489428648267e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.0008586645126342773,
+     "ref_absmax": 13.254254965719383,
+     "rel_absmax": 6.478406480448091e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.0010654330253601074,
+     "ref_absmax": 17.607246290735702,
+     "rel_absmax": 6.0511053674571465e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.004123091697692871,
+     "ref_absmax": 22.679997211815817,
+     "rel_absmax": 0.00018179418891395738,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.004123091697692871,
+     "ref_absmax": 25.51325163912702,
+     "rel_absmax": 0.0001616058884226938,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.0010109543800354004,
+     "ref_absmax": 26.315875208286343,
+     "rel_absmax": 3.841614128482685e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.0020142197608947754,
+     "ref_absmax": 26.678690787807,
+     "rel_absmax": 7.54991981021549e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.0020142197608947754,
+     "ref_absmax": 30.500157374383434,
+     "rel_absmax": 6.603965140804435e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.001156285927734757,
+     "ref_absmax": 32.46223008213428,
+     "rel_absmax": 3.5619423705924735e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.0019284486770629883,
+     "ref_absmax": 33.67087810028784,
+     "rel_absmax": 5.727348931379675e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.0019284486770629883,
+     "ref_absmax": 34.31926980852336,
+     "rel_absmax": 5.619142504553079e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.0017958709693743913,
+     "ref_absmax": 34.371898194104006,
+     "rel_absmax": 5.2248233694653695e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.002804875373840332,
+     "ref_absmax": 34.371898194104006,
+     "rel_absmax": 8.160373797224464e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.004018987710523447,
+     "ref_absmax": 34.118998282480106,
+     "rel_absmax": 0.00011779325047145867,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.006919434988503781,
+     "ref_absmax": 36.619637127761735,
+     "rel_absmax": 0.00018895422050094768,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.011179339099882668,
+     "ref_absmax": 39.42100005546081,
+     "rel_absmax": 0.0002835884194757775,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.015543198356127164,
+     "ref_absmax": 41.28183839571966,
+     "rel_absmax": 0.00037651419995236385,
+     "bitwise_equal": false
+    }
+   ]
+  },
+  "cuda-fp16-vs-cpu": {
+   "y": [
+    {
+     "max_abs": 1.40625,
+     "ref_absmax": 208940.140625,
+     "rel_absmax": 6.730396542251298e-06,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 2.28125,
+     "ref_absmax": 209083.109375,
+     "rel_absmax": 1.091073308991438e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 2.65625,
+     "ref_absmax": 209234.734375,
+     "rel_absmax": 1.2695071914968707e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 2.890625,
+     "ref_absmax": 209295.625,
+     "rel_absmax": 1.3811206039304452e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 3.375,
+     "ref_absmax": 209417.484375,
+     "rel_absmax": 1.6116132853341175e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 3.734375,
+     "ref_absmax": 209530.625,
+     "rel_absmax": 1.7822573669123547e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 4.90625,
+     "ref_absmax": 209627.625,
+     "rel_absmax": 2.340459660314331e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 7.828125,
+     "ref_absmax": 209701.453125,
+     "rel_absmax": 3.732985577040216e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 11.546875,
+     "ref_absmax": 209748.0625,
+     "rel_absmax": 5.505116406021629e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 8.875,
+     "ref_absmax": 209768.796875,
+     "rel_absmax": 4.230848501881126e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 15.84375,
+     "ref_absmax": 209772.734375,
+     "rel_absmax": 7.552816645692828e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 12.640625,
+     "ref_absmax": 209927.3125,
+     "rel_absmax": 6.021429441202416e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 16.9453125,
+     "ref_absmax": 210104.375,
+     "rel_absmax": 8.065187838187567e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 12.390625,
+     "ref_absmax": 210265.5625,
+     "rel_absmax": 5.8928456246847366e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 20.109375,
+     "ref_absmax": 210409.671875,
+     "rel_absmax": 9.557248400608961e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 22.203125,
+     "ref_absmax": 210536.234375,
+     "rel_absmax": 0.00010545987518923962,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 22.453125,
+     "ref_absmax": 210647.96875,
+     "rel_absmax": 0.00010659075011849599,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 24.203125,
+     "ref_absmax": 210747.59375,
+     "rel_absmax": 0.00011484413448967314,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 24.765625,
+     "ref_absmax": 210842.203125,
+     "rel_absmax": 0.00011746047343907443,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 26.171875,
+     "ref_absmax": 210939.359375,
+     "rel_absmax": 0.00012407298039372839,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 31.03125,
+     "ref_absmax": 211042.234375,
+     "rel_absmax": 0.00014703810396956237,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 38.015625,
+     "ref_absmax": 211142.765625,
+     "rel_absmax": 0.0001800470164699729,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 40.140625,
+     "ref_absmax": 211236.890625,
+     "rel_absmax": 0.00019002658522966032,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 42.625,
+     "ref_absmax": 211329.1875,
+     "rel_absmax": 0.00020169954043853977,
+     "bitwise_equal": false
+    }
+   ],
+   "y_norm": [
+    {
+     "max_abs": 0.07620862606927403,
+     "ref_absmax": 71.93994828627547,
+     "rel_absmax": 0.0010593366812832827,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.07447187159095847,
+     "ref_absmax": 71.83531785366267,
+     "rel_absmax": 0.0010367027503472147,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.10260689304163861,
+     "ref_absmax": 71.74010520283991,
+     "rel_absmax": 0.001430258469116056,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.14487259815768994,
+     "ref_absmax": 71.48933069130817,
+     "rel_absmax": 0.0020264925794766723,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.1661929640456492,
+     "ref_absmax": 73.41069454980607,
+     "rel_absmax": 0.0022638794669473435,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.18190999042735712,
+     "ref_absmax": 74.89732429540163,
+     "rel_absmax": 0.0024287915775186857,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.20789876580238342,
+     "ref_absmax": 72.99917599099263,
+     "rel_absmax": 0.0028479604458553896,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.2734894095389251,
+     "ref_absmax": 71.88906498994311,
+     "rel_absmax": 0.00380432558939506,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.5666690468788147,
+     "ref_absmax": 71.65183956993042,
+     "rel_absmax": 0.007908646174056143,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.43525156021840417,
+     "ref_absmax": 64.54181541648632,
+     "rel_absmax": 0.006743714248038104,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.5708475447727537,
+     "ref_absmax": 61.23286093844035,
+     "rel_absmax": 0.009322568568969,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.41760444780886585,
+     "ref_absmax": 60.75004720444895,
+     "rel_absmax": 0.006874141947634292,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.34917130435738386,
+     "ref_absmax": 59.48561774658947,
+     "rel_absmax": 0.005869844133499028,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.34229249273560924,
+     "ref_absmax": 58.214485940616214,
+     "rel_absmax": 0.005879850817282438,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.695470124952827,
+     "ref_absmax": 57.03002339738532,
+     "rel_absmax": 0.01219480693715992,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.2227116267195797,
+     "ref_absmax": 55.486983224577216,
+     "rel_absmax": 0.022036008369220476,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.7179832025382105,
+     "ref_absmax": 53.933895546068925,
+     "rel_absmax": 0.03185349741834899,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.49497907414667,
+     "ref_absmax": 54.68413738187837,
+     "rel_absmax": 0.027338441195601398,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.4336732027601187,
+     "ref_absmax": 55.42153605870499,
+     "rel_absmax": 0.025868521602171176,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.188312391655117,
+     "ref_absmax": 56.576193007182155,
+     "rel_absmax": 0.02100375314232021,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.756072995760083,
+     "ref_absmax": 58.16675527481493,
+     "rel_absmax": 0.030190320698882583,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.578167879314023,
+     "ref_absmax": 57.39664705348332,
+     "rel_absmax": 0.027495820057981006,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.9835649322925408,
+     "ref_absmax": 55.97597386826055,
+     "rel_absmax": 0.03543600575777137,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.2407455061038775,
+     "ref_absmax": 54.39719184982596,
+     "rel_absmax": 0.022808999213216687,
+     "bitwise_equal": false
+    }
+   ],
+   "window": [
+    {
+     "max_abs": 0.0,
+     "ref_absmax": 208870.0625,
+     "rel_absmax": 0.0,
+     "bitwise_equal": true
+    },
+    {
+     "max_abs": 1.40625,
+     "ref_absmax": 208940.140625,
+     "rel_absmax": 6.730396542251298e-06,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 2.28125,
+     "ref_absmax": 209083.109375,
+     "rel_absmax": 1.091073308991438e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 2.65625,
+     "ref_absmax": 209234.734375,
+     "rel_absmax": 1.2695071914968707e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 2.890625,
+     "ref_absmax": 209295.625,
+     "rel_absmax": 1.3811206039304452e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 3.375,
+     "ref_absmax": 209417.484375,
+     "rel_absmax": 1.6116132853341175e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 3.734375,
+     "ref_absmax": 209530.625,
+     "rel_absmax": 1.7822573669123547e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 4.90625,
+     "ref_absmax": 209627.625,
+     "rel_absmax": 2.340459660314331e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 7.828125,
+     "ref_absmax": 209701.453125,
+     "rel_absmax": 3.732985577040216e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 11.546875,
+     "ref_absmax": 209748.0625,
+     "rel_absmax": 5.505116406021629e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 11.546875,
+     "ref_absmax": 209768.796875,
+     "rel_absmax": 5.504572258609423e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 15.84375,
+     "ref_absmax": 209772.734375,
+     "rel_absmax": 7.552816645692828e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 15.84375,
+     "ref_absmax": 209927.3125,
+     "rel_absmax": 7.547255195771632e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 16.9453125,
+     "ref_absmax": 210104.375,
+     "rel_absmax": 8.065187838187567e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 16.9453125,
+     "ref_absmax": 210265.5625,
+     "rel_absmax": 8.059005144981836e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 20.109375,
+     "ref_absmax": 210409.671875,
+     "rel_absmax": 9.557248400608961e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 22.203125,
+     "ref_absmax": 210536.234375,
+     "rel_absmax": 0.00010545987518923962,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 22.453125,
+     "ref_absmax": 210647.96875,
+     "rel_absmax": 0.00010659075011849599,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 24.203125,
+     "ref_absmax": 210747.59375,
+     "rel_absmax": 0.00011484413448967314,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 24.765625,
+     "ref_absmax": 210842.203125,
+     "rel_absmax": 0.00011746047343907443,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 26.171875,
+     "ref_absmax": 210939.359375,
+     "rel_absmax": 0.00012407298039372839,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 31.03125,
+     "ref_absmax": 211042.234375,
+     "rel_absmax": 0.00014703810396956237,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 38.015625,
+     "ref_absmax": 211142.765625,
+     "rel_absmax": 0.0001800470164699729,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 40.140625,
+     "ref_absmax": 211236.890625,
+     "rel_absmax": 0.00019002658522966032,
+     "bitwise_equal": false
+    }
+   ],
+   "window_norm": [
+    {
+     "max_abs": 0.0,
+     "ref_absmax": 5.150297892967501,
+     "rel_absmax": 0.0,
+     "bitwise_equal": true
+    },
+    {
+     "max_abs": 0.01009178239048314,
+     "ref_absmax": 8.436052216924821,
+     "rel_absmax": 0.001196268364749629,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.011383489574939176,
+     "ref_absmax": 8.436052216924821,
+     "rel_absmax": 0.0013493858599050706,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.01911020278930664,
+     "ref_absmax": 8.355646645509182,
+     "rel_absmax": 0.0022871004004911565,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.03686976432800293,
+     "ref_absmax": 11.56079031148522,
+     "rel_absmax": 0.0031892079463956865,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.0721302330493927,
+     "ref_absmax": 12.434595021877612,
+     "rel_absmax": 0.005800770585812058,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.1111188530921936,
+     "ref_absmax": 12.871851121754162,
+     "rel_absmax": 0.00863270185780788,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.20789876580238342,
+     "ref_absmax": 13.140255436947655,
+     "rel_absmax": 0.01582151631678449,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.2734894095389251,
+     "ref_absmax": 13.254254965719383,
+     "rel_absmax": 0.020634083941064526,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.5666690468788147,
+     "ref_absmax": 17.607246290735702,
+     "rel_absmax": 0.032183854165598595,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.5666690468788147,
+     "ref_absmax": 22.679997211815817,
+     "rel_absmax": 0.024985410782307843,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.43525156021840417,
+     "ref_absmax": 25.51325163912702,
+     "rel_absmax": 0.017059823121522627,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.41760444780886585,
+     "ref_absmax": 26.315875208286343,
+     "rel_absmax": 0.015868917317155028,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.41760444780886585,
+     "ref_absmax": 26.678690787807,
+     "rel_absmax": 0.015653108734995504,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.34917130435738386,
+     "ref_absmax": 30.500157374383434,
+     "rel_absmax": 0.011448180416624569,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.695470124952827,
+     "ref_absmax": 32.46223008213428,
+     "rel_absmax": 0.021423978672850997,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.2227116267195797,
+     "ref_absmax": 33.67087810028784,
+     "rel_absmax": 0.036313624583171396,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.7179832025382105,
+     "ref_absmax": 34.31926980852336,
+     "rel_absmax": 0.050058850672619525,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.7179832025382105,
+     "ref_absmax": 34.371898194104006,
+     "rel_absmax": 0.04998220327653901,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.49497907414667,
+     "ref_absmax": 34.371898194104006,
+     "rel_absmax": 0.04349422501208012,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.4336732027601187,
+     "ref_absmax": 34.118998282480106,
+     "rel_absmax": 0.04201979175620466,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.756072995760083,
+     "ref_absmax": 36.619637127761735,
+     "rel_absmax": 0.047954407347985034,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.756072995760083,
+     "ref_absmax": 39.42100005546081,
+     "rel_absmax": 0.04454663740872861,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.9835649322925408,
+     "ref_absmax": 41.28183839571966,
+     "rel_absmax": 0.04804933620635966,
+     "bitwise_equal": false
+    }
+   ]
+  },
+  "cuda-fp16-vs-cuda-fp32": {
+   "y": [
+    {
+     "max_abs": 1.40625,
+     "ref_absmax": 208940.140625,
+     "rel_absmax": 6.730396542251298e-06,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 2.28125,
+     "ref_absmax": 209083.109375,
+     "rel_absmax": 1.091073308991438e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 2.65625,
+     "ref_absmax": 209234.734375,
+     "rel_absmax": 1.2695071914968707e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 2.890625,
+     "ref_absmax": 209295.625,
+     "rel_absmax": 1.3811206039304452e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 3.375,
+     "ref_absmax": 209417.484375,
+     "rel_absmax": 1.6116132853341175e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 3.75,
+     "ref_absmax": 209530.625,
+     "rel_absmax": 1.7897145107069672e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 4.90625,
+     "ref_absmax": 209627.625,
+     "rel_absmax": 2.340459660314331e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 7.8359375,
+     "ref_absmax": 209701.453125,
+     "rel_absmax": 3.7367111115482405e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 11.5390625,
+     "ref_absmax": 209748.0625,
+     "rel_absmax": 5.501391699386973e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 8.875,
+     "ref_absmax": 209768.796875,
+     "rel_absmax": 4.230848501881126e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 15.84375,
+     "ref_absmax": 209772.734375,
+     "rel_absmax": 7.552816645692828e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 12.640625,
+     "ref_absmax": 209927.3125,
+     "rel_absmax": 6.021429441202416e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 16.9453125,
+     "ref_absmax": 210104.375,
+     "rel_absmax": 8.065187838187567e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 12.34375,
+     "ref_absmax": 210265.578125,
+     "rel_absmax": 5.870551951523806e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 20.078125,
+     "ref_absmax": 210409.703125,
+     "rel_absmax": 9.542395004507946e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 22.1875,
+     "ref_absmax": 210536.265625,
+     "rel_absmax": 0.00010538564429331912,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 22.4375,
+     "ref_absmax": 210648.0,
+     "rel_absmax": 0.0001065165584292279,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 24.1875,
+     "ref_absmax": 210747.609375,
+     "rel_absmax": 0.00011476998515774978,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 24.75,
+     "ref_absmax": 210842.234375,
+     "rel_absmax": 0.00011738634848642383,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 26.15625,
+     "ref_absmax": 210939.390625,
+     "rel_absmax": 0.000123998888602554,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 30.984375,
+     "ref_absmax": 211042.265625,
+     "rel_absmax": 0.00014681597029031138,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 37.96875,
+     "ref_absmax": 211142.78125,
+     "rel_absmax": 0.000179824996977016,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 40.09375,
+     "ref_absmax": 211236.90625,
+     "rel_absmax": 0.000189804663928134,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 42.59375,
+     "ref_absmax": 211329.203125,
+     "rel_absmax": 0.0002015516519730879,
+     "bitwise_equal": false
+    }
+   ],
+   "y_norm": [
+    {
+     "max_abs": 0.07619258214799629,
+     "ref_absmax": 71.93992422039355,
+     "rel_absmax": 0.0010591140173372214,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.0745200033547917,
+     "ref_absmax": 71.83530983170203,
+     "rel_absmax": 0.0010373728954379043,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.10258483264988172,
+     "ref_absmax": 71.74013729068247,
+     "rel_absmax": 0.0014299503252164158,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.1448926530592871,
+     "ref_absmax": 71.48933871326881,
+     "rel_absmax": 0.0020267728820436586,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.16624310129964215,
+     "ref_absmax": 73.41069454980607,
+     "rel_absmax": 0.0022645624362926196,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.18183779278160728,
+     "ref_absmax": 74.89734033932291,
+     "rel_absmax": 0.0024278271025084458,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.20798149704933167,
+     "ref_absmax": 72.99915994707135,
+     "rel_absmax": 0.0028490943895810635,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.2731813550111184,
+     "ref_absmax": 71.88908905582502,
+     "rel_absmax": 0.00380003917978403,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.5665560364723206,
+     "ref_absmax": 71.65179143816658,
+     "rel_absmax": 0.007907074269890962,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.43501813066444583,
+     "ref_absmax": 64.54171113099801,
+     "rel_absmax": 0.006740108420452396,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.5703094466942744,
+     "ref_absmax": 61.23302538863345,
+     "rel_absmax": 0.009313755821709565,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.4173300272078695,
+     "ref_absmax": 60.750203632681405,
+     "rel_absmax": 0.006869607050722067,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.3496403183690404,
+     "ref_absmax": 59.48568192227458,
+     "rel_absmax": 0.005877722286614934,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.3424787723130507,
+     "ref_absmax": 58.21451000649813,
+     "rel_absmax": 0.005883048268804837,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.6957865550102653,
+     "ref_absmax": 57.030071529149154,
+     "rel_absmax": 0.01220034512239101,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.2234111514906445,
+     "ref_absmax": 55.48701932340009,
+     "rel_absmax": 0.022048601031533607,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.7182560371801578,
+     "ref_absmax": 53.93371104097423,
+     "rel_absmax": 0.03185866509120378,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.4954075353395417,
+     "ref_absmax": 54.68393282188208,
+     "rel_absmax": 0.02734637869244741,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.433471210668344,
+     "ref_absmax": 55.42129941086614,
+     "rel_absmax": 0.025864987394851508,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.1883252886321998,
+     "ref_absmax": 56.5760365789497,
+     "rel_absmax": 0.021004039174323166,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.7629924307485867,
+     "ref_absmax": 58.16663494540535,
+     "rel_absmax": 0.030309341986231704,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.5893472184139057,
+     "ref_absmax": 57.39663502054236,
+     "rel_absmax": 0.027690599245845604,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.999108130648668,
+     "ref_absmax": 55.976102219630775,
+     "rel_absmax": 0.03571360011465004,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.2411436775653613,
+     "ref_absmax": 54.39720388276692,
+     "rel_absmax": 0.022816313872312043,
+     "bitwise_equal": false
+    }
+   ],
+   "window": [
+    {
+     "max_abs": 0.0,
+     "ref_absmax": 208870.0625,
+     "rel_absmax": 0.0,
+     "bitwise_equal": true
+    },
+    {
+     "max_abs": 1.40625,
+     "ref_absmax": 208940.140625,
+     "rel_absmax": 6.730396542251298e-06,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 2.28125,
+     "ref_absmax": 209083.109375,
+     "rel_absmax": 1.091073308991438e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 2.65625,
+     "ref_absmax": 209234.734375,
+     "rel_absmax": 1.2695071914968707e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 2.890625,
+     "ref_absmax": 209295.625,
+     "rel_absmax": 1.3811206039304452e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 3.375,
+     "ref_absmax": 209417.484375,
+     "rel_absmax": 1.6116132853341175e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 3.75,
+     "ref_absmax": 209530.625,
+     "rel_absmax": 1.7897145107069672e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 4.90625,
+     "ref_absmax": 209627.625,
+     "rel_absmax": 2.340459660314331e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 7.8359375,
+     "ref_absmax": 209701.453125,
+     "rel_absmax": 3.7367111115482405e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 11.5390625,
+     "ref_absmax": 209748.0625,
+     "rel_absmax": 5.501391699386973e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 11.5390625,
+     "ref_absmax": 209768.796875,
+     "rel_absmax": 5.500847920139457e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 15.84375,
+     "ref_absmax": 209772.734375,
+     "rel_absmax": 7.552816645692828e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 15.84375,
+     "ref_absmax": 209927.3125,
+     "rel_absmax": 7.547255195771632e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 16.9453125,
+     "ref_absmax": 210104.375,
+     "rel_absmax": 8.065187838187567e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 16.9453125,
+     "ref_absmax": 210265.578125,
+     "rel_absmax": 8.059004546110844e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 20.078125,
+     "ref_absmax": 210409.703125,
+     "rel_absmax": 9.542395004507946e-05,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 22.1875,
+     "ref_absmax": 210536.265625,
+     "rel_absmax": 0.00010538564429331912,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 22.4375,
+     "ref_absmax": 210648.0,
+     "rel_absmax": 0.0001065165584292279,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 24.1875,
+     "ref_absmax": 210747.609375,
+     "rel_absmax": 0.00011476998515774978,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 24.75,
+     "ref_absmax": 210842.234375,
+     "rel_absmax": 0.00011738634848642383,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 26.15625,
+     "ref_absmax": 210939.390625,
+     "rel_absmax": 0.000123998888602554,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 30.984375,
+     "ref_absmax": 211042.265625,
+     "rel_absmax": 0.00014681597029031138,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 37.96875,
+     "ref_absmax": 211142.78125,
+     "rel_absmax": 0.000179824996977016,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 40.09375,
+     "ref_absmax": 211236.90625,
+     "rel_absmax": 0.000189804663928134,
+     "bitwise_equal": false
+    }
+   ],
+   "window_norm": [
+    {
+     "max_abs": 0.0,
+     "ref_absmax": 5.150297892967501,
+     "rel_absmax": 0.0,
+     "bitwise_equal": true
+    },
+    {
+     "max_abs": 0.010088444616484615,
+     "ref_absmax": 8.43604458772711,
+     "rel_absmax": 0.0011958737903260306,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.011386032640842814,
+     "ref_absmax": 8.43604458772711,
+     "rel_absmax": 0.0013496885326338118,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.01911550760269165,
+     "ref_absmax": 8.35564373914815,
+     "rel_absmax": 0.002287736073898294,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.036852478981018066,
+     "ref_absmax": 11.560787405124188,
+     "rel_absmax": 0.0031877135777692465,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.07213851809501648,
+     "ref_absmax": 12.434599381419162,
+     "rel_absmax": 0.005801434841786057,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.11093991994857788,
+     "ref_absmax": 12.871864298097762,
+     "rel_absmax": 0.008618791915400544,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.20798149704933167,
+     "ref_absmax": 13.140268613291255,
+     "rel_absmax": 0.015827796460641634,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.2731813550111184,
+     "ref_absmax": 13.254265946005717,
+     "rel_absmax": 0.020610824931685024,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.5665560364723206,
+     "ref_absmax": 17.60720705486176,
+     "rel_absmax": 0.03217750746651674,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.5665560364723206,
+     "ref_absmax": 22.679965241844457,
+     "rel_absmax": 0.024980463172272708,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.43501813066444583,
+     "ref_absmax": 25.51327198365425,
+     "rel_absmax": 0.017050660179656757,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.4173300272078695,
+     "ref_absmax": 26.31578511109433,
+     "rel_absmax": 0.01585854366290328,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.4173300272078695,
+     "ref_absmax": 26.678577439726723,
+     "rel_absmax": 0.015642889061484543,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.3496403183690404,
+     "ref_absmax": 30.500081808996583,
+     "rel_absmax": 0.01146358624736237,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 0.6957865550102653,
+     "ref_absmax": 32.462221363051185,
+     "rel_absmax": 0.021433732067461544,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.2234111514906445,
+     "ref_absmax": 33.67086938120474,
+     "rel_absmax": 0.036334409356639875,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.7182560371801578,
+     "ref_absmax": 34.31929305941162,
+     "rel_absmax": 0.05006676664946478,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.7182560371801578,
+     "ref_absmax": 34.37192725771433,
+     "rel_absmax": 0.049990098730775055,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.4954075353395417,
+     "ref_absmax": 34.37192725771433,
+     "rel_absmax": 0.043506653674879894,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.433471210668344,
+     "ref_absmax": 34.11902153336837,
+     "rel_absmax": 0.04201384290186665,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.7629924307485867,
+     "ref_absmax": 36.61952377968146,
+     "rel_absmax": 0.04814351058619699,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.7629924307485867,
+     "ref_absmax": 39.420869269214336,
+     "rel_absmax": 0.044722312405358164,
+     "bitwise_equal": false
+    },
+    {
+     "max_abs": 1.999108130648668,
+     "ref_absmax": 41.281725047639384,
+     "rel_absmax": 0.048425983370164016,
+     "bitwise_equal": false
+    }
+   ]
+  }
+ },
+ "ensemble": {
+  "$SCRATCH/the Python project/rollout/v2/ensemble/chunks-mapper-8": {
+   "vs-cpu": {
+    "y": [
+     6.879960909856883e-06,
+     1.120965728415861e-05,
+     1.3441840851143337e-05,
+     1.634948174382527e-05,
+     1.6116132853341175e-05,
+     1.7598859355285178e-05,
+     1.9305065351000374e-05,
+     2.7419933979057877e-05,
+     6.089895347662627e-05,
+     6.152607152383469e-05,
+     9.727789486464332e-05,
+     0.00012742505813768279,
+     0.00011720365175641869,
+     8.865277213428613e-05,
+     8.740389562950076e-05,
+     9.788991933469885e-05,
+     9.472260814288056e-05,
+     0.0001207754003122515,
+     0.000127983746138348,
+     0.00014236911541298266,
+     0.0001795404844542743,
+     0.00018922327213880834,
+     0.00020829694978852608,
+     0.00021193978470200668
+    ],
+    "y_norm": [
+     0.0011397905144986393,
+     0.0010713488459248765,
+     0.0015458241808867844,
+     0.0020958957002943208,
+     0.0024217000232537402,
+     0.002274451681008888,
+     0.0022391413020580297,
+     0.00451920447093148,
+     0.008801895277211766,
+     0.021725929283621142,
+     0.02985487871036334,
+     0.02868890666864914,
+     0.023209740266323834,
+     0.019370956253392597,
+     0.015156516229692624,
+     0.022210905625691727,
+     0.0320356951552567,
+     0.03173601154649783,
+     0.025940105212362966,
+     0.02746659546612544,
+     0.031070141766800966,
+     0.03898164289025543,
+     0.028117386671714317,
+     0.03846742794325984
+    ],
+    "window": [
+     0.0,
+     6.879960909856883e-06,
+     1.120965728415861e-05,
+     1.3441840851143337e-05,
+     1.634948174382527e-05,
+     1.6339968031859805e-05,
+     1.7598859355285178e-05,
+     1.9305065351000374e-05,
+     2.7419933979057877e-05,
+     6.089895347662627e-05,
+     6.152607152383469e-05,
+     9.727789486464332e-05,
+     0.00012742505813768279,
+     0.00012731767246636344,
+     0.00011711380459650876,
+     8.859205393882276e-05,
+     9.788991933469885e-05,
+     9.783799541147961e-05,
+     0.0001207754003122515,
+     0.000127983746138348,
+     0.00014236911541298266,
+     0.0001795404844542743,
+     0.00018922327213880834,
+     0.00020829694978852608
+    ],
+    "window_norm": [
+     0.0,
+     0.0011769767742431712,
+     0.0013036512654320002,
+     0.0029331276529354533,
+     0.0023296707970009347,
+     0.004593472380659725,
+     0.007134953449696512,
+     0.011182684497258443,
+     0.023372504032930886,
+     0.03581888830884035,
+     0.061826767634899735,
+     0.07165294578140387,
+     0.06946755986401888,
+     0.06532750981772328,
+     0.04526683979144797,
+     0.0347379171922644,
+     0.036601841632543854,
+     0.05034518059064914,
+     0.05049056079362116,
+     0.05049056079362116,
+     0.04554516499799039,
+     0.04935191810333978,
+     0.05675694668803764,
+     0.05419854554657882
+    ]
+   },
+   "vs-cuda-fp16": {
+    "y": [
+     6.206917078130429e-06,
+     8.967727167662196e-06,
+     1.239637730062014e-05,
+     1.2467353451112744e-05,
+     1.671294436193672e-05,
+     1.7897051684448132e-05,
+     3.0150047356817277e-05,
+     5.7373034777968965e-05,
+     5.4939222321340445e-05,
+     6.0632067704716465e-05,
+     0.00010211911692214322,
+     0.0001243735177147784,
+     0.00012114497394490647,
+     8.367385595508543e-05,
+     8.632675534596533e-05,
+     8.738831828584418e-05,
+     8.734220453207759e-05,
+     9.126767764463851e-05,
+     0.00010782670714132947,
+     0.00011251758503929448,
+     0.00015670024017745295,
+     0.00012669248618093568,
+     0.00027805152674254316,
+     0.0002792969155786903
+    ],
+    "y_norm": [
+     0.001085996419766289,
+     0.0013054640706104531,
+     0.0015243962090727653,
+     0.0017482825431028922,
+     0.0021294684919238123,
+     0.002295486070822744,
+     0.003305199926087251,
+     0.004310053800278975,
+     0.01013552025338114,
+     0.021838689391280783,
+     0.02989727736183449,
+     0.028769934960846195,
+     0.023103981804079455,
+     0.019339063647719763,
+     0.01512302623689449,
+     0.015843810981550143,
+     0.023063016072627143,
+     0.028173651002827108,
+     0.02819628026123671,
+     0.04175577072939869,
+     0.061304469140939254,
+     0.06653878516049094,
+     0.0635261260128187,
+     0.059580421420031
+    ],
+    "window": [
+     0.0,
+     6.206917078130429e-06,
+     8.967727167662196e-06,
+     1.239637730062014e-05,
+     1.2467353451112744e-05,
+     1.671294436193672e-05,
+     1.7897051684448132e-05,
+     3.0150047356817277e-05,
+     5.7373034777968965e-05,
+     5.7360272796518156e-05,
+     6.0632067704716465e-05,
+     0.00010211911692214322,
+     0.0001243735177147784,
+     0.000124268417103707,
+     0.0001210521415193909,
+     8.632675534596533e-05,
+     8.738831828584418e-05,
+     8.734220453207759e-05,
+     9.126767764463851e-05,
+     0.00010782670714132947,
+     0.00011251758503929448,
+     0.00015670024017745295,
+     0.00015662654614599902,
+     0.00027805152674254316
+    ],
+    "window_norm": [
+     0.0,
+     0.0008108318445255557,
+     0.001266062903494942,
+     0.002535165389157655,
+     0.0036704142110424907,
+     0.006569989252316911,
+     0.008405221581141984,
+     0.018358349355366933,
+     0.02337127070063855,
+     0.041119987580077295,
+     0.06202339497937391,
+     0.07160459990296839,
+     0.06936011064534842,
+     0.06544838690482987,
+     0.044990915621820456,
+     0.03466997724096979,
+     0.02611452617245596,
+     0.03627373863578452,
+     0.044833834826037235,
+     0.04548590857827243,
+     0.06929574686452508,
+     0.09745470618283741,
+     0.09687627476778891,
+     0.09243899744891372
+    ]
+   }
+  },
+  "$SCRATCH/the Python project/rollout/v2/ensemble/ulp-seed1": {
+   "vs-cpu": {
+    "y": [
+     6.132139071828961e-06,
+     1.031288470142592e-05,
+     1.2060318319220271e-05,
+     1.3661895703744405e-05,
+     1.607882699025474e-05,
+     1.6629430661985568e-05,
+     1.9603213078428954e-05,
+     2.287478187926839e-05,
+     2.8829229352237758e-05,
+     4.1563617324818104e-05,
+     4.454225201306026e-05,
+     5.277124195071092e-05,
+     8.284572846234163e-05,
+     0.0001039236394214578,
+     8.591869774284824e-05,
+     0.0001112115573336211,
+     0.0002389205331466079,
+     0.0003178417072674169,
+     0.00040232991186166256,
+     0.0004568848615334428,
+     0.00044015182683738584,
+     0.00045570469684426347,
+     0.0003874500791876064,
+     0.0003764121555618057
+    ],
+    "y_norm": [
+     0.0021143245067170866,
+     0.0011461129425864222,
+     0.0015952764653866436,
+     0.0017009655730223505,
+     0.0021167132324272533,
+     0.003185954224657205,
+     0.003915251629563251,
+     0.0034798276820634673,
+     0.00342252238505601,
+     0.009263934080560945,
+     0.016429327244524207,
+     0.01779991059158282,
+     0.019981067349729813,
+     0.022186259380085224,
+     0.014719794639312339,
+     0.028988536875883507,
+     0.009401642855269007,
+     0.01380750545469114,
+     0.0116173911837484,
+     0.012716149190186335,
+     0.014394412120544533,
+     0.02203165711102082,
+     0.02833809197780618,
+     0.027214044286796628
+    ],
+    "window": [
+     7.480727401994243e-08,
+     6.132139071828961e-06,
+     1.031288470142592e-05,
+     1.2060318319220271e-05,
+     1.3661895703744405e-05,
+     1.607882699025474e-05,
+     1.6629430661985568e-05,
+     1.9603213078428954e-05,
+     2.287478187926839e-05,
+     2.8829229352237758e-05,
+     4.1563617324818104e-05,
+     4.454225201306026e-05,
+     5.277124195071092e-05,
+     8.284572846234163e-05,
+     0.0001039236394214578,
+     0.0001038524622241774,
+     0.0001112115573336211,
+     0.0002389205331466079,
+     0.0003178417072674169,
+     0.00040232991186166256,
+     0.0004568848615334428,
+     0.0004566621476758614,
+     0.00045570469684426347,
+     0.00045550163948783506
+    ],
+    "window_norm": [
+     1.4042773997167888e-06,
+     0.0015780157676805228,
+     0.0016250315337030976,
+     0.0018826840162307062,
+     0.002627374613599131,
+     0.006813869239482484,
+     0.01853808317835304,
+     0.021750729590223183,
+     0.021563652087176814,
+     0.014207875226990473,
+     0.026362927555677207,
+     0.039431066047781224,
+     0.04109099165864463,
+     0.04455189139483967,
+     0.04234606624822194,
+     0.03978659757783098,
+     0.047770849769535294,
+     0.046868318245445614,
+     0.021967117466759032,
+     0.021967117466759032,
+     0.021085944696727178,
+     0.022864132820851896,
+     0.03207790886648135,
+     0.03842494321160161
+    ]
+   },
+   "vs-cuda-fp16": {
+    "y": [
+     6.0199617444518015e-06,
+     9.042458227392715e-06,
+     1.1276222725262899e-05,
+     1.2168734206774716e-05,
+     1.3504655935314936e-05,
+     1.4056642677160305e-05,
+     2.5416974409578963e-05,
+     5.3423981734810064e-05,
+     5.0022627510210314e-05,
+     4.510161793022828e-05,
+     5.99232892515421e-05,
+     5.9544472873622215e-05,
+     8.02427421034709e-05,
+     0.00010466663065074406,
+     8.617823619698302e-05,
+     0.00011061765469643376,
+     0.00023142902602130112,
+     0.00030679581648538923,
+     0.0003859529146337071,
+     0.000444514830691775,
+     0.0004294911851024826,
+     0.0004458657881075569,
+     0.0003775405673035223,
+     0.0003660619534163059
+    ],
+    "y_norm": [
+     0.0013031957037195469,
+     0.0013054640706104531,
+     0.0013066293150743437,
+     0.0017482825431028922,
+     0.0021294958239885006,
+     0.0025041909722702113,
+     0.0028311323572419774,
+     0.0037399158009896864,
+     0.008444564938049036,
+     0.008972929673004336,
+     0.01651483049375245,
+     0.017912338465867934,
+     0.020542233811771594,
+     0.021982614405655274,
+     0.016976322123031132,
+     0.02860435625846858,
+     0.02657977345474298,
+     0.021252795179213167,
+     0.02850246252440912,
+     0.01977605812279913,
+     0.02230684331025422,
+     0.026320204906806224,
+     0.020192265747887923,
+     0.02836385961838616
+    ],
+    "window": [
+     7.480727401994243e-08,
+     6.0199617444518015e-06,
+     9.042458227392715e-06,
+     1.1276222725262899e-05,
+     1.2168734206774716e-05,
+     1.3504655935314936e-05,
+     1.4056642677160305e-05,
+     2.5416974409578963e-05,
+     5.3423981734810064e-05,
+     5.341209817545911e-05,
+     5.0017731527908e-05,
+     5.99232892515421e-05,
+     5.987941053353634e-05,
+     8.02427421034709e-05,
+     0.00010466663065074406,
+     0.00010459461067078897,
+     0.00011061765469643376,
+     0.00023142902602130112,
+     0.00030679581648538923,
+     0.0003859529146337071,
+     0.000444514830691775,
+     0.00044429867295293885,
+     0.0004458657881075569,
+     0.0004456665199850552
+    ],
+    "window_norm": [
+     1.4042773997167888e-06,
+     0.0009267942432084996,
+     0.0016217067817299233,
+     0.003241360974313932,
+     0.002358813335818058,
+     0.00408860825627268,
+     0.009902434079974844,
+     0.01572519606917106,
+     0.0202796968745188,
+     0.03425975151654358,
+     0.026606670243579166,
+     0.03955336185495138,
+     0.04121627914922899,
+     0.0457451900148323,
+     0.041906994872705855,
+     0.03940918521310856,
+     0.04714706651246274,
+     0.04626716566267552,
+     0.04174089166886517,
+     0.0459798382137391,
+     0.046333767497441815,
+     0.03546082188020576,
+     0.03832055839832608,
+     0.03656534077631175
+    ]
+   }
+  },
+  "$SCRATCH/the Python project/rollout/v2/ensemble/ulp-seed2": {
+   "vs-cpu": {
+    "y": [
+     7.47821838027922e-06,
+     1.0163422604303806e-05,
+     1.176161074475042e-05,
+     1.2989999193724189e-05,
+     1.835448463852745e-05,
+     3.206571831683316e-05,
+     2.9889309674714865e-05,
+     2.4737549133280474e-05,
+     3.497499529942023e-05,
+     4.3053352712804414e-05,
+     6.390844854047778e-05,
+     6.0512016510476694e-05,
+     6.127906665437118e-05,
+     6.219813099446563e-05,
+     0.00010143901565836706,
+     0.00011258453952292505,
+     0.00011541768071285995,
+     0.00012248063923624278,
+     0.00012568641195752066,
+     0.00013288771750826788,
+     0.00013637673087207145,
+     0.000140677919568195,
+     0.0001538187170047017,
+     0.0001585943967157873
+    ],
+    "y_norm": [
+     0.0010582773446019993,
+     0.0012788904047680175,
+     0.0014624905120942005,
+     0.0018053788372435662,
+     0.0018549447417698368,
+     0.002764194343598097,
+     0.0026208068710956373,
+     0.0039106032416551945,
+     0.003652697319211313,
+     0.006249136517300305,
+     0.012613696281914109,
+     0.014066465499698476,
+     0.018080830945825955,
+     0.011631704490491106,
+     0.02039789780549602,
+     0.01934450844964833,
+     0.01779505051179625,
+     0.014142366852386628,
+     0.013400026517186163,
+     0.014000577570936278,
+     0.02159758356981668,
+     0.028207140895390975,
+     0.03299691643534213,
+     0.02244457778958296
+    ],
+    "window": [
+     7.480727401994243e-08,
+     7.47821838027922e-06,
+     1.0163422604303806e-05,
+     1.176161074475042e-05,
+     1.2989999193724189e-05,
+     1.835448463852745e-05,
+     3.206571831683316e-05,
+     3.205088069857205e-05,
+     2.987878675435383e-05,
+     3.497499529942023e-05,
+     4.3053352712804414e-05,
+     6.390844854047778e-05,
+     6.386139011806766e-05,
+     6.127906665437118e-05,
+     6.219813099446563e-05,
+     0.00010143901565836706,
+     0.00011258453952292505,
+     0.00011541768071285995,
+     0.00012248063923624278,
+     0.00012568641195752066,
+     0.00013288771750826788,
+     0.00013637673087207145,
+     0.000140677919568195,
+     0.0001538187170047017
+    ],
+    "window_norm": [
+     1.4042773997167888e-06,
+     0.0012608665953670328,
+     0.0014815726186010114,
+     0.0021757935065773665,
+     0.0026097560973151407,
+     0.006458161484861978,
+     0.010408336057283663,
+     0.010195734230388897,
+     0.017369099748028964,
+     0.013074984741169818,
+     0.017783539029797298,
+     0.030273393657343977,
+     0.0324723550458758,
+     0.040314924249418876,
+     0.0352637327401938,
+     0.020178685205878524,
+     0.021990255265480586,
+     0.021574794818458514,
+     0.016952741302179337,
+     0.013758163955660785,
+     0.02321578647495212,
+     0.034305674675309816,
+     0.04106936171286602,
+     0.044742061010281935
+    ]
+   },
+   "vs-cuda-fp16": {
+    "y": [
+     5.758224277301723e-06,
+     9.71503776496738e-06,
+     1.3591208847667864e-05,
+     1.1870114962436685e-05,
+     1.3579267294073582e-05,
+     1.4541354493614108e-05,
+     2.66840963009656e-05,
+     5.4690659126011976e-05,
+     5.497646925172779e-05,
+     4.886318969814988e-05,
+     5.8470829164028034e-05,
+     5.478091504373244e-05,
+     5.5924506081381014e-05,
+     6.494755781948903e-05,
+     7.151197023498032e-05,
+     9.878034109423237e-05,
+     9.435183368560737e-05,
+     0.00012552085966886515,
+     0.00012101787818679795,
+     0.00015622092616713107,
+     0.00016976784820548055,
+     0.00019743899131468244,
+     0.00029739456325309784,
+     0.00029929686678028806
+    ],
+    "y_norm": [
+     0.0008689086487299627,
+     0.001305491997365055,
+     0.0015243962090727653,
+     0.002076046952816174,
+     0.0019165243759378997,
+     0.0025041374032503325,
+     0.002841165533302195,
+     0.003814644059267345,
+     0.010076747783579547,
+     0.005959097994871066,
+     0.012698320046478901,
+     0.014176968957414096,
+     0.018640459004209436,
+     0.010371363381632996,
+     0.014315429149062912,
+     0.025462180220992132,
+     0.032546429672318945,
+     0.0288800950147449,
+     0.025316785801298935,
+     0.024744436537974018,
+     0.027328527042421714,
+     0.021669568016361232,
+     0.01648486659590559,
+     0.02455126309851418
+    ],
+    "window": [
+     7.480727401994243e-08,
+     5.758224277301723e-06,
+     9.71503776496738e-06,
+     1.3591208847667864e-05,
+     1.3587175617380356e-05,
+     1.3579267294073582e-05,
+     1.4541354493614108e-05,
+     2.66840963009656e-05,
+     5.4690659126011976e-05,
+     5.497646925172779e-05,
+     5.4971088410418614e-05,
+     5.8470829164028034e-05,
+     5.84280140072418e-05,
+     5.5924506081381014e-05,
+     6.494755781948903e-05,
+     7.151197023498032e-05,
+     9.878034109423237e-05,
+     9.872821590844608e-05,
+     0.00012552085966886515,
+     0.00012546434033695587,
+     0.00015622092616713107,
+     0.00016976784820548055,
+     0.00019743899131468244,
+     0.00029739456325309784
+    ],
+    "window_norm": [
+     1.4042773997167888e-06,
+     0.0007530014695599257,
+     0.0013900405404369074,
+     0.0021340952399090157,
+     0.0023028564800554566,
+     0.003065072089491726,
+     0.005479837094282769,
+     0.015780924181048223,
+     0.02068491092383794,
+     0.04088154661524516,
+     0.03174926208422999,
+     0.030412740108859623,
+     0.032621196341960715,
+     0.041510156437933814,
+     0.036298994923130955,
+     0.025140137680450893,
+     0.04196798185507217,
+     0.05118934486902769,
+     0.05111093205793241,
+     0.04595802686422878,
+     0.04115511303963161,
+     0.0434437099064672,
+     0.040330691516379094,
+     0.030104444163685705
+    ]
+   }
+  },
+  "$SCRATCH/the Python project/rollout/v2/ensemble/pyg-backend": {
+   "vs-cpu": {
+    "y": [
+     7.1790896450680515e-06,
+     1.0761270992792265e-05,
+     1.1724272297941688e-05,
+     1.5154999059344885e-05,
+     1.7384532198280066e-05,
+     1.8754716643450092e-05,
+     1.9491407680643235e-05,
+     3.129448986740301e-05,
+     5.169892808902585e-05,
+     7.009205000475598e-05,
+     8.543472083441493e-05,
+     9.080524002802161e-05,
+     9.139802538619198e-05,
+     9.45976353117739e-05,
+     9.713194178707475e-05,
+     0.00011585001067586422,
+     0.00011475009772673158,
+     0.00014605742088099168,
+     0.0001419159663317524,
+     0.00017444290676252557,
+     0.0001490371114253419,
+     0.00018322910512932712,
+     0.00019224565784814606,
+     0.00020140379331179701
+    ],
+    "y_norm": [
+     0.0010582773446019993,
+     0.0014659960716185327,
+     0.0016132794451593454,
+     0.001690782334195832,
+     0.002293301786341837,
+     0.0026640233594129557,
+     0.0032788003373048625,
+     0.005727060216596781,
+     0.007889905923344372,
+     0.006758504387655378,
+     0.007210748030067174,
+     0.006273585613446893,
+     0.007875926770311497,
+     0.008989939216386083,
+     0.009949220995922558,
+     0.014494457078984465,
+     0.021276946113486316,
+     0.029287221288725893,
+     0.029436193527403818,
+     0.04322060269309228,
+     0.04368501704606575,
+     0.04702746459089804,
+     0.04836059092481601,
+     0.046891780487180824
+    ],
+    "window": [
+     0.0,
+     7.1790896450680515e-06,
+     1.0761270992792265e-05,
+     1.1724272297941688e-05,
+     1.5154999059344885e-05,
+     1.7384532198280066e-05,
+     1.8754716643450092e-05,
+     1.9491407680643235e-05,
+     3.129448986740301e-05,
+     5.169892808902585e-05,
+     7.009205000475598e-05,
+     8.543472083441493e-05,
+     9.080524002802161e-05,
+     9.139802538619198e-05,
+     9.45976353117739e-05,
+     9.713194178707475e-05,
+     0.00011585001067586422,
+     0.00011578856014959793,
+     0.00014605742088099168,
+     0.00014599188181386538,
+     0.00017444290676252557,
+     0.00017435787253188288,
+     0.00018322910512932712,
+     0.00019224565784814606
+    ],
+    "window_norm": [
+     0.0,
+     0.0011450443808328308,
+     0.0011450443808328308,
+     0.002008881316540399,
+     0.0034923768671744466,
+     0.0034335790273316057,
+     0.007367892132906875,
+     0.01821499772289374,
+     0.03106270440527154,
+     0.03210759161918289,
+     0.024926205597009123,
+     0.01730609401077282,
+     0.01677826513055532,
+     0.01756099551455508,
+     0.015360719733609293,
+     0.014027320670731085,
+     0.022772764112059692,
+     0.03343744186943945,
+     0.0465946461100854,
+     0.0465946461100854,
+     0.04774987873770461,
+     0.05130074731425986,
+     0.060693862286299735,
+     0.057957999002351414
+    ]
+   },
+   "vs-cuda-fp16": {
+    "y": [
+     6.206917078130429e-06,
+     9.490844585775824e-06,
+     1.2844439130763037e-05,
+     1.261666307328176e-05,
+     1.5668385339315672e-05,
+     1.6703914905484925e-05,
+     2.8733852301738098e-05,
+     5.271613260443252e-05,
+     5.102829463066875e-05,
+     6.919802321582507e-05,
+     8.543444719890465e-05,
+     9.125190467882604e-05,
+     9.258777935015872e-05,
+     9.764426884989542e-05,
+     0.00010180987662737072,
+     0.00010104390262944957,
+     9.958123956205024e-05,
+     9.838522196136093e-05,
+     9.767395189846889e-05,
+     9.718437891478233e-05,
+     0.00010668794996253705,
+     0.00011396403546649586,
+     0.0001310740370810818,
+     0.0001483175678758048
+    ],
+    "y_norm": [
+     0.0008689086487299627,
+     0.001305491997365055,
+     0.0013066572661581581,
+     0.002185339154471884,
+     0.0021294958239885006,
+     0.002086781169375277,
+     0.0034246078580047077,
+     0.005728180728100378,
+     0.00571994730176143,
+     0.00677637457576797,
+     0.0076888721279006,
+     0.006276819353814709,
+     0.007868239568176998,
+     0.009430485970507102,
+     0.012009475508683878,
+     0.01334519842666585,
+     0.018839129085790874,
+     0.025798771989081825,
+     0.033999716226334666,
+     0.04881978899631726,
+     0.06253226126717235,
+     0.06924522046258183,
+     0.0620452084944953,
+     0.05931008792730347
+    ],
+    "window": [
+     0.0,
+     6.206917078130429e-06,
+     9.490844585775824e-06,
+     1.2844439130763037e-05,
+     1.2840627506535282e-05,
+     1.5668385339315672e-05,
+     1.6703914905484925e-05,
+     2.8733852301738098e-05,
+     5.271613260443252e-05,
+     5.270440649809947e-05,
+     6.919802321582507e-05,
+     8.543444719890465e-05,
+     9.125190467882604e-05,
+     9.258777935015872e-05,
+     9.764426884989542e-05,
+     0.00010180987662737072,
+     0.00010174894638632048,
+     0.00010099058298974407,
+     9.953440880416507e-05,
+     9.834092122099258e-05,
+     9.762881967201457e-05,
+     0.00010668794996253705,
+     0.00011396403546649586,
+     0.0001310740370810818
+    ],
+    "window_norm": [
+     0.0,
+     0.0006950202702184537,
+     0.0011004577388206375,
+     0.0026000290801955627,
+     0.0018993925558354293,
+     0.004416397332665029,
+     0.009847322957462344,
+     0.018211509771516126,
+     0.031061065272537783,
+     0.023320448050967706,
+     0.018022095014379416,
+     0.013851548494652064,
+     0.014442957246988054,
+     0.017521663779438673,
+     0.01797799478807649,
+     0.021090521605360287,
+     0.021996193592287237,
+     0.029630367616785912,
+     0.04105459679176919,
+     0.054847943403525855,
+     0.08101883119801881,
+     0.09940650712969108,
+     0.10081667387988877,
+     0.09619891229229714
+    ]
+   }
+  }
+ },
+ "sources": {
+  "cpu-fp32-pyg": "$SCRATCH/the Python project/rollout/ref/cpu-fp32-pyg/rollout.pt",
+  "cuda-fp32-triton": "$SCRATCH/the Python project/rollout/v2/ref/cuda-fp32-triton/rollout.pt",
+  "cuda-fp16-triton": "$SCRATCH/the Python project/rollout/v2/ref/cuda-fp16-triton/rollout.pt"
+ }
+}

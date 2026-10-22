@@ -39,9 +39,15 @@ Names, shapes and dtypes are exactly those of the Python engine's `weights.pt`, 
 `.bias` [out]) and `ln_dst ln_mlp` (+ `ln_src` in mapper blocks) (LayerNorm `.weight`,
 `.bias`), plus `enc.emb_src enc.emb_dst dec.emb_dst dec.out_norm dec.out_proj`.
 
-Bit-identity rule: for every converted model, each tensor in `model.safetensors` is
+In addition (not in `weights.pt`; optional, older files lack them):
+`grid.latitudes`, `grid.longitudes` F64 [n_data_nodes], degrees: the checkpoint's supporting
+arrays (zip members `*/anemoi-metadata/data/{latitudes,longitudes}.numpy`) that
+anemoi-inference uses to compute forcings, checked against `nodes.data.attr` by the
+converter (`docs/forcings.md`). `Model::load` consumes them; the rollout uses them.
+
+Bit-identity rule: for every converted model, each `weights.pt` tensor in `model.safetensors` is
 bitwise equal (same dtype, shape and bytes) to the tensor of the same name in the Python
-engine's `weights.pt` for the same checkpoint, and the two have the same name set
+engine's `weights.pt` for the same checkpoint, and the name sets differ only by `grid.*`
 (`python/tests/test_convert.py` checks this when `weights.pt` is available).
 
 Loading is strict: the engine consumes every tensor in the file, and fails if one is left
@@ -52,7 +58,12 @@ over or missing (names listed in config `absent` are allowed to be missing).
 The `config` JSON has the content of the Python engine's `config.json`, format v3
 (`$IE_ROOT/docs/contracts.md` §1: `format_version`, `source`, `architecture`, `dims`,
 `variables`, `indices`, `residual`, `bounding`, `mappers`, `blocks`, `absent`, `unused`),
-with identical values except `source.checkpoint` (the path converted). Every value is read
+with identical values except `source.checkpoint` (the path converted), plus an optional
+top-level `forcings` section for the rollout (`docs/forcings.md` §1.1):
+`{"dynamic": [names], "dynamic_input_index": [model-input indices], "constant": [names],
+"constant_input_index": [...], "timestep_hours": int, "source": str}`: the inputs refreshed
+with computed forcings after each step, the inputs constant in time (inherited through the
+roll), and the step length. Prognostic inputs are `indices.residual_input`. Every value is read
 from the checkpoint by the converter, never hard-coded; the engine reads sizes, epsilons,
 activation variants, index lists and bounding from it and asserts nothing model-specific.
 

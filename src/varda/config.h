@@ -49,6 +49,13 @@ struct Config {
     std::vector<BlockInfo> blocks;     // execution order
     std::vector<std::string> absent;   // weight names with no tensor (bias=False)
 
+    // Rollout (optional `forcings` section, docs/format.md §1.2): inputs refreshed with
+    // computed forcings each step, and inputs constant in time (inherited through the roll).
+    bool has_forcings = false;
+    std::vector<std::string> forcing_dynamic, forcing_constant;
+    std::vector<int> forcing_dynamic_index, forcing_constant_index;  // model-input space
+    int timestep_hours = 0;  // 0 = unknown
+
     // Encoder source features: n_input_steps * n_input_vars + node_attr_dim.
     int src_features() const { return n_input_steps * n_input_vars + node_attr_dim; }
     bool is_absent(const std::string& name) const;

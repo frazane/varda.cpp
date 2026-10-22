@@ -148,6 +148,25 @@ Config parse_config(const std::string& json_text) {
     }
 
     c.absent = j.value("absent", std::vector<std::string>{});
+
+    if (j.contains("forcings")) {
+        const json& f = j.at("forcings");
+        c.has_forcings = true;
+        c.forcing_dynamic = f.at("dynamic").get<std::vector<std::string>>();
+        c.forcing_dynamic_index = f.at("dynamic_input_index").get<std::vector<int>>();
+        c.forcing_constant = f.at("constant").get<std::vector<std::string>>();
+        c.forcing_constant_index = f.at("constant_input_index").get<std::vector<int>>();
+        require(c.forcing_dynamic.size() == c.forcing_dynamic_index.size(), "forcings.dynamic sizes");
+        require(c.forcing_constant.size() == c.forcing_constant_index.size(), "forcings.constant sizes");
+        check_range(c.forcing_dynamic_index, c.n_input_vars, "forcings.dynamic_input_index");
+        check_range(c.forcing_constant_index, c.n_input_vars, "forcings.constant_input_index");
+        for (size_t i = 0; i < c.forcing_dynamic.size(); ++i)
+            require(c.var_input[c.forcing_dynamic_index[i]] == c.forcing_dynamic[i], "forcings.dynamic name/index");
+        for (size_t i = 0; i < c.forcing_constant.size(); ++i)
+            require(c.var_input[c.forcing_constant_index[i]] == c.forcing_constant[i], "forcings.constant name/index");
+    }
+    c.timestep_hours = j.value("timestep_hours", 0);
+    if (j.contains("forcings")) c.timestep_hours = j.at("forcings").value("timestep_hours", c.timestep_hours);
     return c;
 }
 
