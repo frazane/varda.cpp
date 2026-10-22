@@ -105,3 +105,18 @@ uuid (`checkpoint.uuid`). Tables: `cuda-fp32` (engine fp32 vs `cpu-fp32-pyg`), `
 reference's own cross-device fp32 spread × 3, floored at 1e-5): a from-scratch fp32
 implementation with different GEMM kernels is exactly that kind of neutral perturbation.
 Never loosen a tolerance to make a test pass without saying so explicitly.
+
+## 5. Rollout files (`varda_rollout` = "1")
+
+Reference rollouts of the original model, exported from the Python reference drivers
+(`python/reference/export_rollout.py` for Varda, `python/export_rollout.py` for
+dev) to `$VARDA_SCRATCH/rollout/ref/<tag>/rollout.safetensors` (Varda) and
+`$VARDA_SCRATCH/rollout-engine/ref/dev/<tag>/rollout.safetensors`; read by
+`apps/varda-rollout`. Tensors: `x0` [2, G, V_in] physical; `y` [N, G, V_out] physical;
+`window` [N, 2, G, V_in] (the window step s sees); `forcings` [N−1, G, F] (forcing s = valid
+date of output s); `forcing_index`, `prog_in`, `prog_out`, `kept_in` (I64); `mul_in`,
+`add_in`, `mul_out`, `add_out`. Metadata: `varda_rollout`, `tag`, `steps`, `start_date`,
+`dates`, `forcing_vars`, `in_vars`, `out_vars`, `kept_vars`, `run` (JSON), `checkpoint_uuid`
+(when known). Consumers refuse a file whose variables, grid size or uuid differ from the
+model's. Per-step tolerances: `tolerances/rollout/<model>.json` (keyed by uuid; method in
+`docs/rollout.md`, judging in `docs/rollout-engine.md` §4).

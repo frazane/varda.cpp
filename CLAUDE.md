@@ -6,7 +6,10 @@
 
 - `docs/format.md`: the contracts (converted file, activation names, golden files,
   tolerances). Code that produces or consumes any of them follows it exactly.
-- `docs/design.md`: engine design (CPU oracle, CUDA path, precision plan, rollout).
+- `docs/design.md`: the map: pipeline, decisions, verification, methodology additions.
+- `docs/cpu.md`, `docs/cuda.md`: the two backends. `docs/rollout-engine.md`: the C++ rollout.
+  `docs/forcings.md`: computed forcings. `docs/rollout.md`: reference rollouts and their
+  tolerances. `docs/tools.md`: converter. `docs/testing.md`: every test suite and how to run it.
 - `docs/results.md`: parity and benchmark numbers, each with its full configuration.
 - The maths is specified in the Python project (read-only, `$IE_ROOT` =
   `$HOME/projects/the Python project`): `docs/spec-model.md` (encoder, processor,
