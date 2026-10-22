@@ -89,7 +89,7 @@ reference's `x_data` is fp32), `enc.x_dst` is the file's own buffer.
 |---|---|---|
 | `normalise`, `denormalise` | spec-interface §2.3 | `__fmul_rn`/`__fadd_rn`, `__fsub_rn`/`__fdiv_rn`: bitwise the reference's two ops |
 | `assemble_x_data` | `[xn t0 | xn t1 | attr | 0]` | time-major features, zero padding to the GEMM's K |
-| `layernorm` | warp per row, two-pass fp32 statistics in registers | in place allowed; C a multiple of 256 (up to 2048) |
+| `layernorm` | warp per row, two-pass fp32 statistics in registers | in place allowed; any C that is a multiple of 256 up to 2048 (256, 512, ..., 2048; checked at load), as for every kernel |
 | `add_layernorm` | `out1 = T(y + r1)`, optional `out2 = T(out1 + r2)`, then LN | residual + next LN in one pass; the latent skip uses `r2` |
 | `gelu_inplace` | exact erf (or tanh) in fp32, 8 elements per thread | bandwidth-bound |
 | `attention` | §3.2 | fp32 online softmax, folded edge projection, fused `+ x_r` |
@@ -157,7 +157,14 @@ through GEMM row counts. Varda: fp16 20.1 GB of buffers + 0.7 GB weights and gra
 CUDA graph: `Model::predict_step` runs its first call eagerly (this creates every cuBLASLt plan),
 captures `predict_step_device` on the internal buffers on the second call and replays it from
 then on; host copies stay outside the graph. A graph over static buffers needs no extra memory.
-Hooked calls always run eagerly.
+Hooked calls always run eagerly. If anything fails during the capture (an exception from the
+backend or cuBLASLt, an invalidated capture, instantiation), the capture is always ended and the
+partial graph destroyed, a warning is printed, and the call and all later calls run eagerly
+(`VARDA_DEBUG_CAPTURE_THROW=1` forces such a failure, for testing).
+
+Loading is strict: every Linear weight and bias is taken with its exact expected shape
+(`[N, K]` from the config: C, mlp_hidden, F_src, node_attr_dim, V_out), including the parts
+stacked into `[q|k|v|self]`, `[q|self]`, `[k|v]`; a mismatch fails at load.
 
 ### 4.1 Tuning knobs (environment, read at load; defaults are the measured best)
 
@@ -228,9 +235,9 @@ backend's scratch buffers: one forward in flight per model.
 `ctest` (GPU node): `test_cuda_kernels` checks the attention against a host double reference that
 materialises `e = W_e a + b_e` and adds it to k and v with a two-pass softmax (fp32 1e-5, fp16
 2e-3 rel_absmax), on a graph with every degree class 0, 1, 2, 3, 5, 8, 17, 33, 64, odd node
-counts, shuffled stored edge order, four channel/head layouts (C 256-1024, head_dim 8-128,
+counts, shuffled stored edge order, five channel/head layouts (C 256-1024 incl. 768, head_dim 8-128,
 1-3 edge attributes), destination sub-ranges (bitwise equal to the full launch), zero in-degree
-(output = `x_r` exactly) and `vpl` invariance (bitwise); LayerNorm and add+LN (sums bitwise, LN
+(output = `x_r` exactly) and `vpl` invariance (bitwise); LayerNorm and add+LN for every accepted C (sums bitwise, LN
 vs double), GELU erf/tanh, normaliser and denormaliser (bitwise), input assembly (bitwise), output
 assembly with residual and all three bounding types (bitwise). `test_cuda_gemm` checks the
 Linear wrapper in both precisions with and without bias, N = 67 in rows of 72 (padding left

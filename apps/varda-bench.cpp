@@ -162,6 +162,9 @@ int main(int argc, char** argv) {
         CK(cudaMalloc((void**)&dyn, out_n * 4));
         CK(cudaMalloc((void**)&dy2, out_n * 4));
         CK(cudaMemcpy(dx, x, in_n * 4, cudaMemcpyHostToDevice));
+        // a pageable cudaMemcpy may return before its DMA has landed, and the work below runs on a
+        // non-blocking stream that does not order with it
+        CK(cudaDeviceSynchronize());
         be->prepare();
         cudaGraph_t graph = nullptr;
         cudaGraphExec_t exec = nullptr;

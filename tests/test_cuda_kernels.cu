@@ -1,8 +1,9 @@
 // Unit tests of the CUDA kernels (src/varda/cuda/kernels.h) against simple host references:
 // graph attention (zero in-degree destinations, degrees up to 64, odd sizes, destination
-// sub-ranges, several channel/head layouts, invariance to the warp split), LayerNorm and the
-// fused residual + LayerNorm, GELU (erf and tanh), normaliser, input assembly and output
-// assembly (residual and every bounding type). fp32 and fp16 storage.
+// sub-ranges, several channel/head layouts incl. C = 768, invariance to the warp split), LayerNorm
+// and the fused residual + LayerNorm (every C the backend accepts), GELU (erf and tanh),
+// normaliser, input assembly and output assembly (residual and every bounding type). fp32 and
+// fp16 storage.
 #include <cuda_fp16.h>
 
 #include <algorithm>
@@ -409,12 +410,12 @@ int main() {
         return 0;
     }
     std::mt19937 rng(1234);
-    const int layouts[][3] = {{1024, 16, 3}, {256, 8, 3}, {512, 4, 2}, {256, 32, 1}};  // C, heads, attr dim
+    const int layouts[][3] = {{1024, 16, 3}, {256, 8, 3}, {512, 4, 2}, {256, 32, 1}, {768, 12, 3}};  // C, heads, attr dim
     for (const auto& l : layouts) {
         test_attention<float>(rng, l[0], l[1], l[2]);
         test_attention<__half>(rng, l[0], l[1], l[2]);
     }
-    for (int C : {256, 1024}) {
+    for (int C : {256, 768, 1024, 1280, 1536, 1792, 2048}) {
         test_layernorm<float>(rng, C);
         test_layernorm<__half>(rng, C);
     }

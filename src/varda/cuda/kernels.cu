@@ -491,11 +491,17 @@ void layernorm(const T* x, int64_t ldx, const float* w, const float* b, T* y, in
                float eps, cudaStream_t s) {
     if (rows <= 0) return;
     const unsigned grid = blocks_for(rows, 8);
-    switch (C) {
-        case 256: layernorm_kernel<T, 1><<<grid, 256, 0, s>>>(x, ldx, w, b, y, ldy, rows, eps); break;
-        case 512: layernorm_kernel<T, 2><<<grid, 256, 0, s>>>(x, ldx, w, b, y, ldy, rows, eps); break;
-        case 1024: layernorm_kernel<T, 4><<<grid, 256, 0, s>>>(x, ldx, w, b, y, ldy, rows, eps); break;
-        case 2048: layernorm_kernel<T, 8><<<grid, 256, 0, s>>>(x, ldx, w, b, y, ldy, rows, eps); break;
+#define VARDA_LN(VPL) layernorm_kernel<T, VPL><<<grid, 256, 0, s>>>(x, ldx, w, b, y, ldy, rows, eps)
+    switch (C) {  // every multiple of 256 up to 2048 (the backend's load-time check)
+        case 256: VARDA_LN(1); break;
+        case 512: VARDA_LN(2); break;
+        case 768: VARDA_LN(3); break;
+        case 1024: VARDA_LN(4); break;
+        case 1280: VARDA_LN(5); break;
+        case 1536: VARDA_LN(6); break;
+        case 1792: VARDA_LN(7); break;
+        case 2048: VARDA_LN(8); break;
+#undef VARDA_LN
         default: bad_channels(C);
     }
     VARDA_CUDA_LAUNCH();
@@ -511,7 +517,11 @@ void add_layernorm(const T* y, const T* r1, T* out1, const T* r2, T* out2, const
     switch (C) {
         case 256: VARDA_ADDLN(1); break;
         case 512: VARDA_ADDLN(2); break;
+        case 768: VARDA_ADDLN(3); break;
         case 1024: VARDA_ADDLN(4); break;
+        case 1280: VARDA_ADDLN(5); break;
+        case 1536: VARDA_ADDLN(6); break;
+        case 1792: VARDA_ADDLN(7); break;
         case 2048: VARDA_ADDLN(8); break;
         default: bad_channels(C);
     }

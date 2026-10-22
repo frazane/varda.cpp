@@ -3,6 +3,7 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -91,7 +92,8 @@ private:
     struct Hook;
 
     // loading
-    Lin<T> load_linear(SafeTensorsFile& f, const std::vector<std::string>& names, int64_t K_pad, int64_t N_pad = 0);
+    Lin<T> load_linear(SafeTensorsFile& f, const std::vector<std::string>& names, int64_t N_each, int64_t K,
+                       int64_t K_pad, int64_t N_pad = 0);
     Norm load_norm(SafeTensorsFile& f, const std::string& name);
     Block<T> load_block(SafeTensorsFile& f, const std::string& pre, bool mapper);
     GraphBuf load_graph(SafeTensorsFile& f, const std::string& g, int64_t n_src, int64_t n_dst);
@@ -105,6 +107,7 @@ private:
     void attention(const GraphBuf& G, const Block<T>& blk, int64_t lo, int64_t n, const T* q, int64_t ldq,
                    const T* k, const T* v, int64_t ldkv, const T* xr, int64_t ldxr, T* out, cudaStream_t s);
     void forward(const float* xn, float* yn, cudaStream_t s, Hook* hk);
+    bool capture_graph(cudaStream_t s);
 
     Config cfg_;
     Options opts_;
@@ -145,7 +148,11 @@ private:
 
     // CUDA graph of predict_step_device on x_dev_ -> y_dev_
     bool ran_eager_ = false;
+    bool graph_failed_ = false;
     cudaGraphExec_t graph_exec_ = nullptr;
+    // VARDA_DEBUG_CAPTURE_THROW=1: forward() throws when it runs inside a stream capture (test of the
+    // capture unwind path only)
+    bool debug_capture_throw_ = env_int("VARDA_DEBUG_CAPTURE_THROW", 0) != 0;
 };
 
 // ====================================================================== hook
@@ -197,21 +204,19 @@ DeviceBuffer Engine<T>::upload(const void* host, size_t bytes) {
     return b;
 }
 
-// Rows of several Linear weights stacked ([N_total, K]), stored as T with K padded to K_pad (zero
-// columns) and N to N_pad (zero rows).
+// Several Linear layers stacked by output rows: each `<name>.weight` must be F32 [N_each, K] and
+// each `<name>.bias` F32 [N_each] (unless listed in config `absent`); strict, like the CPU backend.
+// Stored as T with K padded to K_pad (zero columns) and the stacked N to N_pad (zero rows).
 template <class T>
-Lin<T> Engine<T>::load_linear(SafeTensorsFile& f, const std::vector<std::string>& names, int64_t K_pad,
-                              int64_t N_pad) {
+Lin<T> Engine<T>::load_linear(SafeTensorsFile& f, const std::vector<std::string>& names, int64_t N_each, int64_t K,
+                              int64_t K_pad, int64_t N_pad) {
     Lin<T> L;
     std::vector<const TensorView*> ws;
     for (const auto& n : names) {
-        const TensorView& w = f.take(n + ".weight");
-        if (w.dtype != DType::F32 || w.shape.size() != 2) throw std::runtime_error(n + ".weight: expected F32 [out, in]");
-        if (!ws.empty() && w.dim(1) != ws[0]->dim(1)) throw std::runtime_error(n + ".weight: input size mismatch");
-        ws.push_back(&w);
-        L.N += w.dim(0);
+        ws.push_back(&f.take(n + ".weight", DType::F32, {N_each, K}));
+        L.N += N_each;
     }
-    L.K = ws[0]->dim(1);
+    L.K = K;
     L.ldw = std::max<int64_t>(K_pad, L.K);
     L.N = std::max<int64_t>(L.N, N_pad);  // extra output rows: zero weights and bias
     std::vector<float> host(L.N * L.ldw, 0.0f), bias(L.N, 0.0f);
@@ -223,7 +228,7 @@ Lin<T> Engine<T>::load_linear(SafeTensorsFile& f, const std::vector<std::string>
             std::memcpy(&host[(row + r) * L.ldw], w.as<float>() + r * L.K, L.K * sizeof(float));
         const std::string bn = names[i] + ".bias";
         if (!cfg_.is_absent(bn)) {
-            const TensorView& b = f.take(bn, DType::F32, {w.dim(0)});
+            const TensorView& b = f.take(bn, DType::F32, {N_each});
             std::memcpy(&bias[row], b.as<float>(), w.dim(0) * sizeof(float));
             any_bias = true;
         }
@@ -276,14 +281,14 @@ Block<T> Engine<T>::load_block(SafeTensorsFile& f, const std::string& pre, bool 
     b.ln_mlp = load_norm(f, pre + ".ln_mlp");
     auto P = [&](const char* n) { return pre + "." + n; };
     if (mapper) {
-        b.qs = load_linear(f, {P("q"), P("self")}, C_);
-        b.kv = load_linear(f, {P("k"), P("v")}, C_);
+        b.qs = load_linear(f, {P("q"), P("self")}, C_, C_, C_);
+        b.kv = load_linear(f, {P("k"), P("v")}, C_, C_, C_);
     } else {
-        b.qkvs = load_linear(f, {P("q"), P("k"), P("v"), P("self")}, C_);
+        b.qkvs = load_linear(f, {P("q"), P("k"), P("v"), P("self")}, C_, C_, C_);
     }
-    b.proj = load_linear(f, {P("proj")}, C_);
-    b.mlp1 = load_linear(f, {P("mlp1")}, C_);
-    b.mlp2 = load_linear(f, {P("mlp2")}, mlp_);
+    b.proj = load_linear(f, {P("proj")}, C_, C_, C_);
+    b.mlp1 = load_linear(f, {P("mlp1")}, mlp_, C_, C_);
+    b.mlp2 = load_linear(f, {P("mlp2")}, C_, mlp_, mlp_);
     const int A = cfg_.edge_attr_dim;
     const TensorView& we = f.take(P("edge") + ".weight", DType::F32, {C_, A});
     // [4, C]: W_e[:, 0..2] (attribute-major, zero padded to 3 attributes), then b_e
@@ -295,8 +300,6 @@ Block<T> Engine<T>::load_block(SafeTensorsFile& f, const std::string& pre, bool 
         for (int c = 0; c < C_; ++c) w4[size_t(3) * C_ + c] = round_op<T>(bv.as<float>()[c]);
     }
     b.w_e = upload_vec(w4);
-    if (b.mlp1.N != mlp_ || b.mlp2.N != C_ || b.proj.N != C_)
-        throw std::runtime_error(pre + ": unexpected block shapes");
     return b;
 }
 
@@ -423,14 +426,11 @@ Engine<T>::Engine(const Config& cfg, SafeTensorsFile& file, const Options& opts)
     }
 
     // ---- weights
-    enc_emb_src_ = load_linear(file, {"enc.emb_src"}, ldF_);
-    enc_emb_dst_ = load_linear(file, {"enc.emb_dst"}, ldA_);
-    dec_emb_dst_ = load_linear(file, {"dec.emb_dst"}, ldF_);
+    enc_emb_src_ = load_linear(file, {"enc.emb_src"}, C_, F_, ldF_);
+    enc_emb_dst_ = load_linear(file, {"enc.emb_dst"}, C_, A_node_, ldA_);
+    dec_emb_dst_ = load_linear(file, {"dec.emb_dst"}, C_, F_, ldF_);
     dec_out_norm_ = load_norm(file, "dec.out_norm");
-    dec_out_proj_ = load_linear(file, {"dec.out_proj"}, C_, ldVo_);  // N padded: aligned GEMM kernels
-    if (enc_emb_src_.K != ldF_ || dec_emb_dst_.K != ldF_ || enc_emb_dst_.K != ldA_ || dec_out_proj_.N != ldVo_ ||
-        file.peek("dec.out_proj.weight").dim(0) != V_out_)
-        throw std::runtime_error("CUDA backend: embedding shapes do not match the config");
+    dec_out_proj_ = load_linear(file, {"dec.out_proj"}, V_out_, C_, C_, ldVo_);  // N padded: aligned GEMM kernels
     enc_ = load_block(file, "enc.block", true);
     for (int i = 0; i < n_proc_; ++i) proc_.push_back(load_block(file, "proc." + std::to_string(i), false));
     dec_ = load_block(file, "dec.block", true);
@@ -537,6 +537,11 @@ void Engine<T>::forward(const float* xn, float* yn, cudaStream_t s, Hook* hk) {
     add_layernorm<T>(ybuf_, out1_, z_enc_, nullptr, nullptr, proc_[0].ln_dst.W(), proc_[0].ln_dst.B(), xh_, C, H, C_,
                      eps_, s);
     if (hk) hk->dev("enc.out", z_enc_, C, H, C, {H, C});
+    if (debug_capture_throw_) {
+        cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+        VARDA_CUDA_CHECK(cudaStreamIsCapturing(s, &st));
+        if (st == cudaStreamCaptureStatusActive) throw std::runtime_error("VARDA_DEBUG_CAPTURE_THROW: forced throw in capture");
+    }
 
     // ---- processor (xh_ holds LN_dst of the block input)
     T* z_in = z_enc_;
@@ -646,6 +651,39 @@ void Engine<T>::prepare() {
     ran_eager_ = true;
 }
 
+// Captures predict_step_device (internal buffers) into graph_exec_. Whatever fails inside the
+// capture (an exception from our code or cuBLASLt, an invalidated capture, instantiation), the
+// capture is always ended and the partial graph destroyed, so the stream is usable again; the
+// caller then runs eagerly. Returns false on failure (with a warning on stderr).
+template <class T>
+bool Engine<T>::capture_graph(cudaStream_t s) {
+    VARDA_CUDA_CHECK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+    std::string err;
+    try {
+        predict_step_device(x_dev_, y_dev_, s);
+    } catch (const std::exception& e) {
+        err = e.what();
+    }
+    cudaGraph_t g = nullptr;
+    const cudaError_t ec = cudaStreamEndCapture(s, &g);  // ends the capture in every case
+    if (err.empty() && ec != cudaSuccess) err = std::string("cudaStreamEndCapture: ") + cudaGetErrorString(ec);
+    if (err.empty()) {
+        const cudaError_t ei = cudaGraphInstantiate(&graph_exec_, g, 0);
+        if (ei != cudaSuccess) {
+            graph_exec_ = nullptr;
+            err = std::string("cudaGraphInstantiate: ") + cudaGetErrorString(ei);
+        }
+    }
+    if (g) cudaGraphDestroy(g);
+    if (err.empty()) return true;
+    (void)cudaGetLastError();  // clear the (non-sticky) error state left by the failed capture
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    VARDA_CUDA_CHECK(cudaStreamIsCapturing(s, &st));
+    if (st != cudaStreamCaptureStatusNone) throw std::runtime_error("CUDA backend: stream still capturing after unwind");
+    std::fprintf(stderr, "varda: CUDA graph capture failed (%s); running without a graph\n", err.c_str());
+    return false;
+}
+
 template <class T>
 void Engine<T>::predict_step(const float* x, float* y, const ActivationHook* hook) {
     VARDA_CUDA_CHECK(cudaSetDevice(dev_));
@@ -669,15 +707,9 @@ void Engine<T>::predict_step(const float* x, float* y, const ActivationHook* hoo
         predict_step_device(x_dev_, y_dev_, s);
         ran_eager_ = true;
     } else {
-        if (!graph_exec_) {
-            cudaGraph_t g;
-            VARDA_CUDA_CHECK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
-            predict_step_device(x_dev_, y_dev_, s);
-            VARDA_CUDA_CHECK(cudaStreamEndCapture(s, &g));
-            VARDA_CUDA_CHECK(cudaGraphInstantiate(&graph_exec_, g, 0));
-            cudaGraphDestroy(g);
-        }
-        VARDA_CUDA_CHECK(cudaGraphLaunch(graph_exec_, s));
+        if (!graph_exec_ && !graph_failed_ && !capture_graph(s)) graph_failed_ = true;
+        if (graph_exec_) VARDA_CUDA_CHECK(cudaGraphLaunch(graph_exec_, s));
+        else predict_step_device(x_dev_, y_dev_, s);  // capture failed: eager from now on
     }
     VARDA_CUDA_CHECK(cudaMemcpyAsync(y, y_dev_, out_n * sizeof(float), cudaMemcpyDeviceToHost, s));
     VARDA_CUDA_CHECK(cudaStreamSynchronize(s));
