@@ -1,0 +1,47 @@
+{
+ "method": "Synthetic generality models (python/tests/synthetic.py, docs/testing.md). The reference is an independent float64 numpy implementation of the spec, rounded to F32. synthetic-fp32: engine fp32 (CPU and CUDA) vs the reference, 1e-5 per key (measured worst 9.2e-7; see docs/testing.md), 1e-6 for copies and input assembly (in.x, in.x_norm, enc.x_src, enc.x_dst; bitwise in practice). synthetic-fp16: engine CUDA fp16 vs the same reference, single value for all non-exact keys, about 2x the worst measured over all models and keys (docs/testing.md). Metric: rel_absmax (docs/format.md section 2).",
+ "model": "synthetic-e",
+ "checkpoint": {
+  "uuid": "synthetic-e-v1"
+ },
+ "synthetic-fp32": {
+  "in.x": 1e-06,
+  "in.x_norm": 1e-06,
+  "enc.x_src": 1e-06,
+  "enc.x_dst": 1e-06,
+  "enc.emb_src": 1e-05,
+  "enc.emb_dst": 1e-05,
+  "enc.out": 1e-05,
+  "proc.0.out": 1e-05,
+  "proc.1.out": 1e-05,
+  "proc.2.out": 1e-05,
+  "proc.3.out": 1e-05,
+  "latent": 1e-05,
+  "dec.emb_dst": 1e-05,
+  "dec.block_out": 1e-05,
+  "dec.out": 1e-05,
+  "out.pre_bound": 1e-05,
+  "out.norm": 1e-05,
+  "out.y": 1e-05
+ },
+ "synthetic-fp16": {
+  "in.x": 1e-06,
+  "in.x_norm": 1e-06,
+  "enc.x_src": 1e-06,
+  "enc.x_dst": 1e-06,
+  "enc.emb_src": 0.003,
+  "enc.emb_dst": 0.003,
+  "enc.out": 0.003,
+  "proc.0.out": 0.003,
+  "proc.1.out": 0.003,
+  "proc.2.out": 0.003,
+  "proc.3.out": 0.003,
+  "latent": 0.003,
+  "dec.emb_dst": 0.003,
+  "dec.block_out": 0.003,
+  "dec.out": 0.003,
+  "out.pre_bound": 0.003,
+  "out.norm": 0.003,
+  "out.y": 0.003
+ }
+}
