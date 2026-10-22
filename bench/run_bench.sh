@@ -22,7 +22,7 @@ VARDA_SCRATCH=${VARDA_SCRATCH:-$VARDA_SCRATCH}
 IE_ROOT=${IE_ROOT:-$HOME/projects/the Python project}
 IE_SCRATCH=${IE_SCRATCH:-$SCRATCH/the Python project}
 export SCRATCH=${SCRATCH:-$SCRATCH}       # used by $IE_ROOT/tools/run.sh
-BIN=${BIN:-$VARDA_ROOT/build-cuda/apps}
+BIN=${BIN:-$VARDA_ROOT/build-cuda}
 WARMUP=${WARMUP:-5}; ITERS=${ITERS:-20}; FP32_ITERS=${FP32_ITERS:-$ITERS}
 STEPS=${STEPS:-"ref engine varda"}
 JID=${SLURM_JOB_ID:-local$$}

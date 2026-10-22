@@ -40,7 +40,7 @@ if(VARDA_CUDA)
   check_language(CUDA)
   if(CMAKE_CUDA_COMPILER)
     if(NOT CMAKE_CUDA_ARCHITECTURES)
-      set(CMAKE_CUDA_ARCHITECTURES 80 CACHE STRING "CUDA architectures (A100 = 80)" FORCE)
+      set(CMAKE_CUDA_ARCHITECTURES 80)  # A100; override with -DCMAKE_CUDA_ARCHITECTURES=...
     endif()
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 17)
@@ -48,6 +48,8 @@ if(VARDA_CUDA)
     find_package(CUDAToolkit REQUIRED)
     file(GLOB VARDA_CUDA_SRC CONFIGURE_DEPENDS src/varda/cuda/*.cu src/varda/cuda/*.cpp)
     target_sources(varda PRIVATE ${VARDA_CUDA_SRC})
+    # varda was created before enable_language(CUDA), so it did not pick up the default.
+    set_target_properties(varda PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
     target_compile_definitions(varda PUBLIC VARDA_WITH_CUDA)
     target_compile_options(varda PRIVATE
       $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -lineinfo -Xcompiler=-Wall>)
