@@ -70,8 +70,9 @@ LogPWeights log_p_weights(const float* p, size_t K, size_t N, const std::vector<
     w.N = N;
     w.levels_hpa = levels_hpa;
     const size_t L = levels_hpa.size();
-    w.k.assign(L * N, -1);
-    w.r.assign(L * N, std::numeric_limits<double>::quiet_NaN());
+    w.k.resize(L * N);  // uninitialised: every entry is written below
+    w.r.resize(L * N);
+    const double nan = std::numeric_limits<double>::quiet_NaN();
     std::vector<double> t0(L), log_t0(L);
     for (size_t j = 0; j < L; ++j) {
         t0[j] = double(levels_hpa[j]) * 100.0;  // np.array(sorted(target_p)) * 100.0
@@ -83,6 +84,8 @@ LogPWeights log_p_weights(const float* p, size_t K, size_t N, const std::vector<
             // coords.where((coords >= t0) & (tkm1 <= t0)).fillna(inf).argmin: with p increasing,
             // the smallest qualifying k (tkm1 is NaN at k = 0, so k >= 1).
             int32_t ks = -1;
+            w.k[j * N + size_t(n)] = -1;
+            w.r[j * N + size_t(n)] = nan;
             for (size_t k = 1; k < K; ++k) {
                 const double pk = p[k * N + n], pkm1 = p[(k - 1) * N + n];
                 if (pk >= t0[j] && pkm1 <= t0[j]) {
@@ -132,6 +135,14 @@ float extrapolate_geopotential(float hsurf, float t2m, float ps, int p_target_pa
 
 void interpolate_extrapolate(const float* x, size_t K, const LogPWeights& w, const float* t2m, const float* ps,
                              const float* hsurf, ExtrapKind kind, const std::vector<int>& extrap_hpa, float* out) {
+    std::vector<float*> lev(w.levels_hpa.size());
+    for (size_t j = 0; j < lev.size(); ++j) lev[j] = out + j * w.N;
+    interpolate_extrapolate(x, K, w, t2m, ps, hsurf, kind, extrap_hpa, lev.data());
+}
+
+void interpolate_extrapolate(const float* x, size_t K, const LogPWeights& w, const float* t2m, const float* ps,
+                             const float* hsurf, ExtrapKind kind, const std::vector<int>& extrap_hpa,
+                             float* const* out_levels) {
     const size_t N = w.N, L = w.levels_hpa.size();
     std::vector<char> extrap(L, 0);
     for (size_t j = 0; j < L; ++j)
@@ -162,7 +173,7 @@ void interpolate_extrapolate(const float* x, size_t K, const LogPWeights& w, con
                         break;
                 }
             }
-            out[j * N + size_t(n)] = v;
+            out_levels[j][n] = v;
         }
     }
 }

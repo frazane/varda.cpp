@@ -86,12 +86,18 @@ struct InputModel {
     Config config;
     std::vector<double> latitudes, longitudes;
     std::vector<Model::CutoutSource> cutout;
+    double load_seconds = 0;  // load(): wall time (reported by build_input as seconds["model_grid"])
 
     static InputModel from(const Model& m);
-    // From a converted file without touching the weights (config, grid.*, cutout masks).
+    // From a converted file without touching the weights (config, grid.*, cutout masks). The
+    // grid tensors are first read into the page cache with parallel reads (a cold memory map is
+    // read one small request at a time).
     static InputModel load(const std::string& model_path);
 };
 
+// The KENDA (lam_0) and IFS (global) branches run concurrently, and every GRIB file is read ahead
+// of its use by a pool of parallel readers (GribPrefetch); the results do not depend on the
+// scheduling (every value is computed as in the sequential order, log lines keep that order).
 InputState build_input(const InputModel& model, const InputFiles& files);
 InputState build_input(const Model& model, const InputFiles& files);
 

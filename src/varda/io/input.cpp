@@ -4,12 +4,15 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <omp.h>
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
 #include "nlohmann/json.hpp"
 #include "varda/format.h"
@@ -54,7 +57,42 @@ InputModel InputModel::from(const Model& m) {
     return r;
 }
 
+namespace {
+
+double now_s() {
+    using namespace std::chrono;
+    return duration<double>(steady_clock::now().time_since_epoch()).count();
+}
+
+// Reads the header and the grid.* tensors of a converted file into the page cache with parallel
+// reads, before SafeTensorsFile maps it. Best effort: any problem is left to SafeTensorsFile.
+void warm_grid_tensors(const std::string& path) {
+    try {
+        char b[8];
+        if (read_file_range(path, 0, 8, b, 1) != 8) return;
+        uint64_t n = 0;
+        for (int i = 7; i >= 0; --i) n = (n << 8) | uint8_t(b[i]);
+        if (n == 0 || n > (uint64_t(1) << 30)) return;
+        std::string h(size_t(n), '\0');
+        read_file_range(path, 8, n, h.data(), 4, size_t(1) << 20);
+        const nlohmann::json j = nlohmann::json::parse(h);
+        std::vector<std::pair<uint64_t, uint64_t>> ranges;
+        for (const auto& [k, v] : j.items()) {
+            if (k.rfind("grid.", 0) != 0) continue;
+            const auto& o = v.at("data_offsets");
+            const uint64_t a = o.at(0).get<uint64_t>(), e = o.at(1).get<uint64_t>();
+            if (e > a) ranges.push_back({8 + n + a, e - a});
+        }
+        warm_file_cache(path, ranges, 8);
+    } catch (const std::exception&) {
+    }
+}
+
+}  // namespace
+
 InputModel InputModel::load(const std::string& path) {
+    const double t0 = now_s();
+    warm_grid_tensors(path);
     SafeTensorsFile f(path);
     InputModel r;
     r.config = parse_config(f.metadata("config"));
@@ -72,6 +110,7 @@ InputModel InputModel::load(const std::string& path) {
         src.mask.assign(t.as<uint8_t>(), t.as<uint8_t>() + t.numel());
         r.cutout.push_back(std::move(src));
     }
+    r.load_seconds = now_s() - t0;
     return r;
 }
 
@@ -94,11 +133,6 @@ const std::vector<int>& kenda_extrapolate_levels() {
 namespace {
 
 constexpr double kG = 9.80665;  // earthkit-meteo / geopotential_from_height
-
-double now_s() {
-    using namespace std::chrono;
-    return duration<double>(steady_clock::now().time_since_epoch()).count();
-}
 
 long yyyymmdd(const DateTime& d) { return long(d.year) * 10000 + d.month * 100 + d.day; }
 long hhmm(const DateTime& d) { return long(d.hour) * 100 + d.minute; }
@@ -124,6 +158,27 @@ void check_valid_at(const GribHandle& h, const DateTime& d, const std::string& w
                                  iso(d));
 }
 
+int env_int(const char* name, int dflt) {
+    const char* v = std::getenv(name);
+    if (!v || !*v) return dflt;
+    try {
+        return std::max(1, std::stoi(v));
+    } catch (const std::exception&) {
+        return dflt;
+    }
+}
+
+// Tuning (A100 node, 32 cores, Lustre; docs: the integrator's): VARDA_INPUT_IO_THREADS reader
+// threads of the GRIB prefetch pool (I/O-bound, mostly blocked on the file system), default 16;
+// VARDA_INPUT_IFS_THREADS OpenMP threads of the IFS branch, default a quarter of the threads
+// (4..16): it has slack, and its handle clones contend with the parser for ecCodes' global lock,
+// which paces the KENDA branch. VARDA_INPUT_TRACE adds per-file and per-branch timelines to the log.
+int input_io_threads() { return env_int("VARDA_INPUT_IO_THREADS", 16); }
+int input_ifs_threads() {
+    const int n = omp_get_max_threads();
+    return env_int("VARDA_INPUT_IFS_THREADS", std::min(n, std::max(4, std::min(16, n / 4))));
+}
+
 // Runs f(i) for i in [0, n) in parallel; rethrows the first exception.
 template <class F>
 void parallel_for(int64_t n, F f) {
@@ -140,12 +195,29 @@ void parallel_for(int64_t n, F f) {
     if (!err.empty()) throw std::runtime_error(err);
 }
 
+// The messages of a GRIB file, from the prefetch pool when there is one (same handles as
+// read_messages), with the time spent waiting for it.
+struct GribReader {
+    GribPrefetch* pool = nullptr;
+    double wait_s = 0;
+    std::shared_ptr<const std::vector<GribHandle>> operator()(const std::string& path) {
+        const double t0 = now_s();
+        auto r = pool ? pool->take(path) : std::make_shared<const std::vector<GribHandle>>(read_messages(path));
+        wait_s += now_s() - t0;
+        return r;
+    }
+};
+
+// A float buffer whose pages are first touched by the parallel loop that fills it.
+using FloatBuf = std::vector<float, DefaultInitAllocator<float>>;
+
 // The model-level messages of one KENDA file, sorted by level: [n_levels][N] float32.
-std::vector<float> read_levels(const std::string& path, const std::string& short_name, const std::string& type_of_level,
-                               long n_levels, size_t N, const DateTime* valid, std::vector<std::string>& log) {
-    std::vector<GribHandle> msgs = read_messages(path);
+FloatBuf read_levels(GribReader& rd, const std::string& path, const std::string& short_name,
+                               const std::string& type_of_level, long n_levels, size_t N, const DateTime* valid,
+                               std::vector<std::string>& log) {
+    const auto msgs = rd(path);
     std::vector<const GribHandle*> by_level(size_t(n_levels), nullptr);
-    for (const auto& h : msgs) {
+    for (const auto& h : *msgs) {  // serial: ecCodes serialises key lookups internally
         const std::string sn = h.get_string("shortName");
         if (sn != short_name) throw std::runtime_error(path + ": message shortName " + sn + ", expected " + short_name);
         if (h.get_string("typeOfLevel") != type_of_level)
@@ -160,10 +232,9 @@ std::vector<float> read_levels(const std::string& path, const std::string& short
     }
     for (long k = 0; k < n_levels; ++k)
         if (!by_level[size_t(k)]) throw std::runtime_error(path + ": level " + std::to_string(k + 1) + " missing");
-    std::vector<float> out(size_t(n_levels) * N);
-    parallel_for(n_levels, [&](int64_t k) {
-        const std::vector<float> v = by_level[size_t(k)]->get_float_array("values");
-        std::copy(v.begin(), v.end(), out.begin() + k * int64_t(N));
+    FloatBuf out(size_t(n_levels) * N);
+    parallel_for(n_levels, [&](int64_t k) {  // decoded in place (codes_get_float_array)
+        by_level[size_t(k)]->get_float_array("values", out.data() + k * int64_t(N), N);
     });
     log.push_back("read " + path + ": " + short_name + " " + type_of_level + " levels 1.." + std::to_string(n_levels));
     return out;
@@ -185,6 +256,22 @@ const GribHandle& one_message(const std::vector<GribHandle>& msgs, const std::st
 
 std::vector<float>& slot_field(FieldState& st, const std::string& name) {
     return st.has(name) ? st.at(name) : st.add(name);
+}
+
+// Adds the fields of `names` not yet in `st` (in that order), NaN-filled as FieldState::add does,
+// the fills in parallel.
+void add_fields(FieldState& st, const std::vector<std::string>& names) {
+    std::vector<std::string> fresh;
+    for (const auto& n : names)
+        if (!st.has(n) && std::find(fresh.begin(), fresh.end(), n) == fresh.end()) fresh.push_back(n);
+    std::vector<std::vector<float>> v(fresh.size());
+    const size_t n = st.n_dates * st.n_points;
+#pragma omp parallel for schedule(dynamic, 1)
+    for (int64_t i = 0; i < int64_t(fresh.size()); ++i) v[size_t(i)].assign(n, std::numeric_limits<float>::quiet_NaN());
+    for (size_t i = 0; i < fresh.size(); ++i) {
+        st.names.push_back(fresh[i]);
+        st.values.push_back(std::move(v[i]));
+    }
 }
 
 void put_slot(FieldState& st, const std::string& name, size_t slot, const std::vector<float>& v) {
@@ -229,36 +316,61 @@ Retrieved retrieved_variables(const IoConfig& io, const Config& cfg) {
 
 // --------------------------------------------------------------------------------------------- KENDA
 
+std::string kenda_horizontal_path(const std::string& dir) {
+    return dir + "/constants/horizontal_constants_icon-ch1-eps.grib2";
+}
+std::string kenda_vertical_path(const std::string& dir) {
+    return dir + "/constants/vertical_constants_icon-ch1-eps.grib2";
+}
+std::string kenda_raw_dir(const std::string& dir, const DateTime& d) { return dir + "/raw/" + kenda_stamp(d); }
+
 struct KendaConstants {
     std::vector<float> hsurf;       // float decode
     std::vector<double> hsurf_d;    // double decode (geopotential_from_height)
-    std::vector<float> hhl;         // [81][N]
-    std::vector<GribHandle> horizontal;
-    std::string horizontal_path;
+    std::shared_ptr<const std::vector<GribHandle>> horizontal;
+    std::string horizontal_path, vertical_path;
+
+    // HHL [81][N], read on first use (its log line keeps its place, after the horizontal one).
+    const FloatBuf& hhl(GribReader& rd, std::vector<std::string>& log) {
+        if (!hhl_read_) {
+            std::vector<std::string> l;
+            hhl_ = read_levels(rd, vertical_path, "HHL", "generalVertical", 81, hsurf.size(), nullptr, l);
+            log.insert(log.begin() + int64_t(hhl_log_at_), l.begin(), l.end());
+            hhl_read_ = true;
+        }
+        return hhl_;
+    }
+    size_t hhl_log_at_ = 0;
+
+private:
+    FloatBuf hhl_;
+    bool hhl_read_ = false;
 };
 
-KendaConstants read_kenda_constants(const std::string& dir, size_t N, std::vector<std::string>& log) {
+KendaConstants read_kenda_constants(GribReader& rd, const std::string& dir, size_t N, std::vector<std::string>& log) {
     KendaConstants c;
-    c.horizontal_path = dir + "/constants/horizontal_constants_icon-ch1-eps.grib2";
-    c.horizontal = read_messages(c.horizontal_path);
-    const GribHandle& hs = one_message(c.horizontal, "HSURF", c.horizontal_path);
+    c.horizontal_path = kenda_horizontal_path(dir);
+    c.vertical_path = kenda_vertical_path(dir);
+    c.horizontal = rd(c.horizontal_path);
+    const GribHandle& hs = one_message(*c.horizontal, "HSURF", c.horizontal_path);
     c.hsurf = hs.get_float_array("values");
     c.hsurf_d = hs.get_double_array("values");
     if (c.hsurf.size() != N) throw std::runtime_error(c.horizontal_path + ": HSURF size");
-    log.push_back("read " + c.horizontal_path + ": " + std::to_string(c.horizontal.size()) + " messages");
-    c.hhl = read_levels(dir + "/constants/vertical_constants_icon-ch1-eps.grib2", "HHL", "generalVertical", 81, N,
-                        nullptr, log);
+    log.push_back("read " + c.horizontal_path + ": " + std::to_string(c.horizontal->size()) + " messages");
+    c.hhl_log_at_ = log.size();
     return c;
 }
 
-// model_to_pressure_level + naming for one valid time (spec §1.3, §2.1-2.2, §1.6).
-void kenda_prognostics(const IoConfig& io, const std::vector<const IoVariable*>& progs, const std::string& dir,
-                       const DateTime& d, size_t slot, const KendaConstants& kc, FieldState& out,
-                       std::vector<std::string>& log) {
-    const size_t N = out.n_points;
-    const std::string raw = dir + "/raw/" + kenda_stamp(d);
-    // What the requests ask for: pressure-level params and levels, surface params.
+// What the KENDA requests ask for (spec §1.3): pressure-level params and the target levels, surface params.
+struct KendaRequest {
     std::vector<std::string> pl_params, sfc_params;
+    std::vector<int> targets;  // the configured levels the model needs, ascending
+};
+
+KendaRequest kenda_request(const std::vector<const IoVariable*>& progs) {
+    KendaRequest r;
+    std::vector<std::string>& pl_params = r.pl_params;
+    std::vector<std::string>& sfc_params = r.sfc_params;
     std::vector<int> levels;
     for (const IoVariable* v : progs) {
         const std::string p = v->param();
@@ -276,18 +388,40 @@ void kenda_prognostics(const IoConfig& io, const std::vector<const IoVariable*>&
         }
     }
     const auto& IL = kenda_interpolate_levels();
-    std::vector<int> targets;  // the configured levels the model needs, ascending (the 600 hPa ones are dropped)
+    std::vector<int>& targets = r.targets;  // the 600 hPa ones are dropped
     for (int l : IL)
         if (std::find(levels.begin(), levels.end(), l) != levels.end()) targets.push_back(l);
     if (targets.size() != levels.size())
         throw std::runtime_error("a model pressure level is not among model_to_pressure_level's levels");
+    return r;
+}
+
+// The KENDA files of one valid time, in the order kenda_prognostics reads them (T_2M and PS twice).
+std::vector<std::string> kenda_files(const KendaRequest& q, const std::string& dir, const DateTime& d) {
+    const std::string raw = kenda_raw_dir(dir, d);
+    std::vector<std::string> f = {raw + "/T_2M.grib2", raw + "/PS.grib2", raw + "/P.grib2"};
+    for (const auto& sn : q.pl_params)
+        if (sn != "FI") f.push_back(raw + "/" + sn + ".grib2");
+    for (const auto& sn : q.sfc_params) f.push_back(raw + "/" + sn + ".grib2");
+    return f;
+}
+
+// model_to_pressure_level + naming for one valid time (spec §1.3, §2.1-2.2, §1.6).
+void kenda_prognostics(GribReader& rd, const IoConfig& io, const KendaRequest& q, const std::string& dir,
+                       const DateTime& d, size_t slot, KendaConstants& kc, FieldState& out,
+                       std::vector<std::string>& log) {
+    const size_t N = out.n_points;
+    const std::string raw = kenda_raw_dir(dir, d);
+    const std::vector<std::string>& pl_params = q.pl_params;
+    const std::vector<std::string>& sfc_params = q.sfc_params;
+    const std::vector<int>& targets = q.targets;
 
     // Auxiliaries (VI:112-115), every one required for this valid time.
     auto read_sfc = [&](const std::string& p) {
         const std::string path = raw + "/" + p + ".grib2";
         if (!file_exists(path)) throw std::runtime_error("KENDA file missing: " + path);
-        std::vector<GribHandle> msgs = read_messages(path);
-        const GribHandle& h = one_message(msgs, p, path);
+        const auto msgs = rd(path);
+        const GribHandle& h = one_message(*msgs, p, path);
         check_valid_at(h, d, path);
         std::vector<float> v = h.get_float_array("values");
         if (v.size() != N) throw std::runtime_error(path + ": size");
@@ -295,7 +429,7 @@ void kenda_prognostics(const IoConfig& io, const std::vector<const IoVariable*>&
         return std::make_pair(v, h.get_long("level"));
     };
     const std::vector<float> t2m = read_sfc("T_2M").first, ps = read_sfc("PS").first;
-    std::vector<float> p = read_levels(raw + "/P.grib2", "P", "generalVerticalLayer", 80, N, &d, log);
+    FloatBuf p = read_levels(rd, raw + "/P.grib2", "P", "generalVerticalLayer", 80, N, &d, log);
     const size_t K = 80;
     clamp_top_pressure(p.data(), N);
     check_pressure_increasing(p.data(), K, N);
@@ -303,30 +437,40 @@ void kenda_prognostics(const IoConfig& io, const std::vector<const IoVariable*>&
     p.clear();
     p.shrink_to_fit();
     const auto& EL = kenda_extrapolate_levels();
-    std::vector<float> lev_out(targets.size() * N);
+    {  // the model-level fields, created up front in the order the loops below create them
+        std::vector<std::string> names;
+        auto add = [&](const std::string& sn) {
+            for (int l : targets)
+                if (const auto name = io.kenda_name(sn, l)) names.push_back(*name);
+        };
+        for (const std::string& sn : pl_params)
+            if (sn != "FI") add(sn);
+        if (std::find(pl_params.begin(), pl_params.end(), "FI") != pl_params.end()) add("FI");
+        add_fields(out, names);
+    }
 
-    auto emit_levels = [&](const std::string& short_name) {
+    // The output of each target level, written in place: this slot of the named field.
+    auto level_fields = [&](const std::string& short_name) {
+        std::vector<float*> dst;
         for (size_t j = 0; j < targets.size(); ++j) {
             const auto name = io.kenda_name(short_name, targets[j]);
             if (!name) throw std::runtime_error("KENDA namer: no rule for " + short_name);
-            std::vector<float>& f = slot_field(out, *name);
-            std::copy(lev_out.begin() + int64_t(j * N), lev_out.begin() + int64_t((j + 1) * N),
-                      f.begin() + int64_t(slot * N));
+            dst.push_back(slot_field(out, *name).data() + slot * N);
         }
+        return dst;
     };
     for (const std::string& sn : pl_params) {
         if (sn == "FI") continue;  // FI is skipped from the retrieval and computed from HHL (add_geopotential)
         const ExtrapKind kind = sn == "T" ? ExtrapKind::Temperature : ExtrapKind::LowestLevel;
-        const std::vector<float> x = read_levels(raw + "/" + sn + ".grib2", sn, "generalVerticalLayer", 80, N, &d, log);
-        interpolate_extrapolate(x.data(), K, w, t2m.data(), ps.data(), kc.hsurf.data(), kind, EL, lev_out.data());
-        emit_levels(sn);
+        const FloatBuf x = read_levels(rd, raw + "/" + sn + ".grib2", sn, "generalVerticalLayer", 80, N, &d, log);
+        interpolate_extrapolate(x.data(), K, w, t2m.data(), ps.data(), kc.hsurf.data(), kind, EL,
+                                level_fields(sn).data());
     }
     if (std::find(pl_params.begin(), pl_params.end(), "FI") != pl_params.end()) {
-        std::vector<float> fi(K * N);
-        geopotential_from_hhl(kc.hhl.data(), K + 1, N, fi.data());
+        FloatBuf fi(K * N);
+        geopotential_from_hhl(kc.hhl(rd, log).data(), K + 1, N, fi.data());
         interpolate_extrapolate(fi.data(), K, w, t2m.data(), ps.data(), kc.hsurf.data(), ExtrapKind::Geopotential, EL,
-                                lev_out.data());
-        emit_levels("FI");
+                                level_fields("FI").data());
     }
     // Surface fields pass through as decoded.
     for (const std::string& sn : sfc_params) {
@@ -349,7 +493,7 @@ void kenda_constants(const IoConfig& io, const std::vector<const IoVariable*>& c
             vals.resize(N);
             for (size_t n = 0; n < N; ++n) vals[n] = float(kc.hsurf_d[n] * kG);
         } else {
-            const GribHandle& h = one_message(kc.horizontal, p, kc.horizontal_path);
+            const GribHandle& h = one_message(*kc.horizontal, p, kc.horizontal_path);
             vals = h.get_float_array("values");
             level = h.get_long("level");
         }
@@ -458,7 +602,10 @@ void select_ifs(const std::vector<const IoVariable*>& vars, const std::vector<co
 }
 
 void run_regrid(const Regridder& rg, const std::vector<IfsTask>& tasks, FieldState& out, InputStages* stages) {
-    // Allocate every output field first (single-threaded), then regrid in parallel.
+    // Allocate every output field first, then regrid in parallel.
+    std::vector<std::string> names;
+    for (const auto& t : tasks) names.push_back(t.name);
+    add_fields(out, names);
     std::vector<float*> dst(tasks.size());
     for (size_t i = 0; i < tasks.size(); ++i) dst[i] = slot_field(out, tasks[i].name).data();
     std::vector<std::vector<double>> keep(tasks.size());
@@ -493,18 +640,25 @@ FieldState merge(const FieldState& lam, const FieldState& global, const std::vec
     for (const auto& n : global.names)
         if (!lam.has(n)) throw std::runtime_error("cutout: field " + n + " in global but not in lam_0");
     FieldState out(lam.n_dates, G);
+    std::vector<std::pair<const std::vector<float>*, const std::vector<float>*>> src;
     for (const auto& n : lam.names) {
         if (!global.has(n)) throw std::runtime_error("cutout: field " + n + " missing in the global source");
-        const auto& a = lam.at(n);
-        const auto& b = global.at(n);
-        std::vector<float>& o = out.add(n);
-        for (size_t s = 0; s < lam.n_dates; ++s) {
-            float* dst = o.data() + s * G;
-            const float* sa = a.data() + s * lam.n_points;
-            const float* sb = b.data() + s * global.n_points;
-            for (size_t i = 0; i < idx_l.size(); ++i) dst[i] = sa[idx_l[i]];
-            for (size_t i = 0; i < idx_g.size(); ++i) dst[idx_l.size() + i] = sb[idx_g[i]];
-        }
+        src.push_back({&lam.at(n), &global.at(n)});
+        out.names.push_back(n);
+    }
+    out.values.resize(src.size());
+    // Copies only (every point is written): fields allocated, then one (field, date) per iteration.
+    const int64_t n_fields = int64_t(src.size()), n_dates = int64_t(lam.n_dates);
+#pragma omp parallel for schedule(dynamic, 1)
+    for (int64_t f = 0; f < n_fields; ++f) out.values[size_t(f)].resize(lam.n_dates * G);
+#pragma omp parallel for schedule(dynamic, 1)
+    for (int64_t fs = 0; fs < n_fields * n_dates; ++fs) {
+        const size_t f = size_t(fs / n_dates), s = size_t(fs % n_dates);
+        float* dst = out.values[f].data() + s * G;
+        const float* sa = src[f].first->data() + s * lam.n_points;
+        const float* sb = src[f].second->data() + s * global.n_points;
+        for (size_t i = 0; i < idx_l.size(); ++i) dst[i] = sa[idx_l[i]];
+        for (size_t i = 0; i < idx_g.size(); ++i) dst[idx_l.size() + i] = sb[idx_g[i]];
     }
     return out;
 }
@@ -550,69 +704,183 @@ InputState build_input(const InputModel& model, const InputFiles& files) {
                       " computed forcings");
     }
 
-    // ---- lam_0: KENDA
+    // ---- KENDA (lam_0) and IFS (global) run concurrently. Every GRIB file is read ahead of its use
+    // by a pool of parallel readers, in the order the branches need them: KENDA's first files
+    // (constants, T_2M, PS, P), the IFS files, then the rest of KENDA in the order its branch reads them.
+    const KendaRequest kq = kenda_request(rv.prognostics);
+    std::vector<std::string> ahead;
+    ahead.push_back(kenda_horizontal_path(files.kenda_dir));
+    for (size_t s = 0; s < T; ++s) {
+        std::vector<std::string> f = kenda_files(kq, files.kenda_dir, st.dates[s]);
+        if (s == 0) {  // HHL (FI) after the first date's model-level files
+            size_t n_ml = 3;
+            for (const auto& sn : kq.pl_params) n_ml += sn != "FI";
+            f.insert(f.begin() + int64_t(n_ml), kenda_vertical_path(files.kenda_dir));
+        }
+        ahead.insert(ahead.end(), f.begin(), f.end());
+        if (s == 0) {  // the IFS files after T_2M, PS and P of the first date
+            std::vector<std::string> ifs;
+            for (size_t t = 0; t < T; ++t) ifs.insert(ifs.end(), ifs_files[t].begin(), ifs_files[t].end());
+            ifs.insert(ifs.end(), files.ifs_constant_files.begin(), files.ifs_constant_files.end());
+            ahead.insert(ahead.begin() + 4, ifs.begin(), ifs.end());
+        }
+    }
+    GribPrefetch::Options po;
+    po.threads = input_io_threads();
+    GribPrefetch pool(ahead, po);
+    GribReader rd_kenda{&pool}, rd_ifs{&pool};
+
     double t0 = now_s();
+    const int ifs_threads = input_ifs_threads();
+
+    // ---- the x0 buffer and the computed forcings (dates and grid only), on their own thread
+    std::vector<std::string> fnames;  // the computed forcings among the inputs, in model-input order
+    for (const auto& n : cfg.var_input)
+        if (std::find(rv.computed.begin(), rv.computed.end(), n) != rv.computed.end()) fnames.push_back(n);
+    std::vector<std::vector<float>> forc(T);
+    std::exception_ptr x0_err;
+    std::thread x0_thread([&] {
+        try {
+            omp_set_num_threads(std::max(1, std::min(8, ifs_threads)));
+            st.x0.assign(T * G * V, std::numeric_limits<float>::quiet_NaN());
+            for (size_t s = 0; s < T; ++s) {
+                forc[s].resize(G * fnames.size());
+                if (!fnames.empty())
+                    compute_forcings(st.dates[s], fnames, model.latitudes.data(), model.longitudes.data(), G,
+                                     forc[s].data());
+            }
+        } catch (...) {
+            x0_err = std::current_exception();
+        }
+    });
+    struct JoinX0 {
+        std::thread& t;
+        ~JoinX0() {
+            if (t.joinable()) t.join();
+        }
+    } join_x0{x0_thread};
+    std::vector<std::string> trace_ifs, trace_kenda;  // VARDA_INPUT_TRACE: branch timelines
+    auto mark = [&](std::vector<std::string>& tr, const std::string& what) {
+        char b[48];
+        std::snprintf(b, sizeof b, "%7.3f s ", now_s() - t0);
+        tr.push_back(b + what);
+    };
+
+    // ---- global: IFS open data, regridded to N320 (own thread, own log; appended after KENDA's)
+    FieldState prog_glob(T, N_glob), const_glob(T, N_glob);
+    std::vector<std::string> log_ifs;
+    double ifs_s = 0;
+    std::exception_ptr ifs_err;
+    std::thread ifs_thread([&] {
+        try {
+            omp_set_num_threads(ifs_threads);
+            auto& log = log_ifs;
+            // ecCodes loads its ECMWF concept tables on the first key lookups, under its global
+            // lock: do it now, from the N320 template (also ECMWF GRIB2), while the IFS files are
+            // still being read, rather than when the parser needs the lock. Best effort.
+            try {
+                const GribHandle h = read_first_message(files.n320_template);
+                h.get_string("shortName");
+                h.get_string("levtype");
+                h.get_long("level");
+                h.get_long("validityDate");
+                h.get_long("validityTime");
+                h.get_long("step");
+            } catch (const std::exception&) {
+            }
+            mark(trace_ifs, "ecCodes concepts loaded");
+            const RegridMatrix m =
+                files.regrid_matrix.size() > 4 &&
+                        files.regrid_matrix.compare(files.regrid_matrix.size() - 4, 4, ".mat") == 0
+                    ? RegridMatrix::load_mir_mat(files.regrid_matrix, RegridGeometry::ifs_open_data_0p25())
+                    : RegridMatrix::load(files.regrid_matrix);
+            mark(trace_ifs, "matrix loaded");
+            if (m.n_target() != int64_t(N_glob))
+                throw std::runtime_error("regrid matrix has " + std::to_string(m.n_target()) + " rows, global source " +
+                                         std::to_string(N_glob) + " points");
+            log.push_back("regrid matrix " + files.regrid_matrix + ": " + std::to_string(m.n_target()) + " x " +
+                          std::to_string(m.n_source()) + ", nnz " + std::to_string(m.nnz()));
+            Regridder rg(m, read_first_message(files.n320_template));
+            log.push_back("N320 encoding template " + files.n320_template);
+            rg.target_coordinates(&prog_glob.latitudes, &prog_glob.longitudes);
+            const_glob.latitudes = prog_glob.latitudes;
+            const_glob.longitudes = prog_glob.longitudes;
+            mark(trace_ifs, "template and coordinates");
+
+            std::vector<std::shared_ptr<const std::vector<GribHandle>>> loaded;
+            std::vector<std::string> paths;
+            std::vector<std::vector<size_t>> per_slot(T);
+            for (size_t s = 0; s < T; ++s)
+                for (const auto& p : ifs_files[s]) {
+                    per_slot[s].push_back(loaded.size());
+                    loaded.push_back(rd_ifs(p));
+                    paths.push_back(p);
+                    log.push_back("read " + p + ": " + std::to_string(loaded.back()->size()) + " messages");
+                }
+            std::vector<IfsTask> tasks_prog, tasks_const;
+            for (size_t s = 0; s < T; ++s) {
+                std::vector<const std::vector<GribHandle>*> fs;
+                std::vector<std::string> ps;
+                for (size_t i : per_slot[s]) {
+                    fs.push_back(loaded[i].get());
+                    ps.push_back(paths[i]);
+                }
+                select_ifs(rv.prognostics, fs, ps, &st.dates[s], s, T, tasks_prog, log);
+            }
+            std::vector<std::shared_ptr<const std::vector<GribHandle>>> cfiles;
+            for (const auto& p : files.ifs_constant_files) {
+                cfiles.push_back(rd_ifs(p));
+                log.push_back("read " + p + ": " + std::to_string(cfiles.back()->size()) + " messages (constants run)");
+            }
+            std::vector<const std::vector<GribHandle>*> cfs;
+            for (const auto& f : cfiles) cfs.push_back(f.get());
+            select_ifs(rv.constants, cfs, files.ifs_constant_files, nullptr, size_t(-1), T, tasks_const, log);
+            InputStages* sp = files.keep_stages ? &st.stages : nullptr;
+            mark(trace_ifs, "files taken, messages selected");
+            run_regrid(rg, tasks_prog, prog_glob, sp);
+            run_regrid(rg, tasks_const, const_glob, sp);
+            mark(trace_ifs, "regridded");
+            ifs_s = now_s() - t0;
+        } catch (...) {
+            ifs_err = std::current_exception();
+        }
+    });
+    struct Joiner {
+        std::thread& t;
+        ~Joiner() {
+            if (t.joinable()) t.join();
+        }
+    } joiner{ifs_thread};
+
+    // ---- lam_0: KENDA (this thread)
     FieldState prog_lam(T, N_lam), const_lam(T, N_lam);
-    {
-        const KendaConstants kc = read_kenda_constants(files.kenda_dir, N_lam, log);
-        for (size_t s = 0; s < T; ++s)
-            kenda_prognostics(io, rv.prognostics, files.kenda_dir, st.dates[s], s, kc, prog_lam, log);
+    std::exception_ptr kenda_err;
+    try {
+        KendaConstants kc = read_kenda_constants(rd_kenda, files.kenda_dir, N_lam, log);
+        mark(trace_kenda, "constants");
+        for (size_t s = 0; s < T; ++s) {
+            kenda_prognostics(rd_kenda, io, kq, files.kenda_dir, st.dates[s], s, kc, prog_lam, log);
+            mark(trace_kenda, "date " + iso(st.dates[s]));
+        }
+        kc.hhl(rd_kenda, log);  // read (and checked) even when no FI is requested
         kenda_constants(io, rv.constants, kc, const_lam, log);
+    } catch (...) {
+        kenda_err = std::current_exception();
     }
     st.seconds["kenda"] = now_s() - t0;
-
-    // ---- global: IFS open data, regridded to N320
-    t0 = now_s();
-    FieldState prog_glob(T, N_glob), const_glob(T, N_glob);
-    {
-        const RegridMatrix m = files.regrid_matrix.size() > 4 &&
-                                       files.regrid_matrix.compare(files.regrid_matrix.size() - 4, 4, ".mat") == 0
-                                   ? RegridMatrix::load_mir_mat(files.regrid_matrix, RegridGeometry::ifs_open_data_0p25())
-                                   : RegridMatrix::load(files.regrid_matrix);
-        if (m.n_target() != int64_t(N_glob))
-            throw std::runtime_error("regrid matrix has " + std::to_string(m.n_target()) + " rows, global source " +
-                                     std::to_string(N_glob) + " points");
-        log.push_back("regrid matrix " + files.regrid_matrix + ": " + std::to_string(m.n_target()) + " x " +
-                      std::to_string(m.n_source()) + ", nnz " + std::to_string(m.nnz()));
-        Regridder rg(m, read_first_message(files.n320_template));
-        log.push_back("N320 encoding template " + files.n320_template);
-        rg.target_coordinates(&prog_glob.latitudes, &prog_glob.longitudes);
-        const_glob.latitudes = prog_glob.latitudes;
-        const_glob.longitudes = prog_glob.longitudes;
-
-        std::vector<std::vector<GribHandle>> loaded;
-        std::vector<std::string> paths;
-        std::vector<std::vector<size_t>> per_slot(T);
-        for (size_t s = 0; s < T; ++s)
-            for (const auto& p : ifs_files[s]) {
-                per_slot[s].push_back(loaded.size());
-                loaded.push_back(read_messages(p));
-                paths.push_back(p);
-                log.push_back("read " + p + ": " + std::to_string(loaded.back().size()) + " messages");
-            }
-        std::vector<IfsTask> tasks_prog, tasks_const;
-        for (size_t s = 0; s < T; ++s) {
-            std::vector<const std::vector<GribHandle>*> fs;
-            std::vector<std::string> ps;
-            for (size_t i : per_slot[s]) {
-                fs.push_back(&loaded[i]);
-                ps.push_back(paths[i]);
-            }
-            select_ifs(rv.prognostics, fs, ps, &st.dates[s], s, T, tasks_prog, log);
-        }
-        std::vector<std::vector<GribHandle>> cfiles;
-        for (const auto& p : files.ifs_constant_files) {
-            cfiles.push_back(read_messages(p));
-            log.push_back("read " + p + ": " + std::to_string(cfiles.back().size()) + " messages (constants run)");
-        }
-        std::vector<const std::vector<GribHandle>*> cfs;
-        for (const auto& f : cfiles) cfs.push_back(&f);
-        select_ifs(rv.constants, cfs, files.ifs_constant_files, nullptr, size_t(-1), T, tasks_const, log);
-        InputStages* sp = files.keep_stages ? &st.stages : nullptr;
-        run_regrid(rg, tasks_prog, prog_glob, sp);
-        run_regrid(rg, tasks_const, const_glob, sp);
+    st.seconds["kenda_read_wait"] = rd_kenda.wait_s;
+    ifs_thread.join();
+    if (kenda_err) std::rethrow_exception(kenda_err);  // KENDA's error first, as in the sequential order
+    if (ifs_err) std::rethrow_exception(ifs_err);
+    st.seconds["ifs"] = ifs_s;
+    st.seconds["ifs_read_wait"] = rd_ifs.wait_s;
+    st.seconds["kenda_ifs"] = now_s() - t0;
+    log.insert(log.end(), log_ifs.begin(), log_ifs.end());
+    if (std::getenv("VARDA_INPUT_TRACE")) {
+        for (const auto& l : pool.trace()) log.push_back("trace prefetch " + l);
+        for (const auto& l : trace_kenda) log.push_back("trace kenda " + l);
+        for (const auto& l : trace_ifs) log.push_back("trace ifs " + l);
     }
-    st.seconds["ifs"] = now_s() - t0;
 
     // Every requested variable present in both sources, nothing else.
     for (const auto* v : rv.prognostics)
@@ -659,43 +927,49 @@ InputState build_input(const InputModel& model, const InputFiles& files) {
 
     // ---- x0 (spec §3)
     t0 = now_s();
-    st.x0.assign(T * G * V, std::numeric_limits<float>::quiet_NaN());
     std::vector<int> fcol(V, -1);
-    std::vector<std::string> fnames;
-    for (size_t i = 0; i < V; ++i) {
+    for (size_t i = 0, k = 0; i < V; ++i) {
         const std::string& n = cfg.var_input[i];
         const bool in_p = prog.has(n), in_c = cons.has(n), comp = std::find(rv.computed.begin(), rv.computed.end(), n) !=
                                                                     rv.computed.end();
         if (int(in_p) + int(in_c) + int(comp) != 1) throw std::runtime_error("input " + n + " is not set exactly once");
-        if (comp) {
-            fcol[i] = int(fnames.size());
-            fnames.push_back(n);
-        }
+        if (comp) fcol[i] = int(k++);
     }
-    std::vector<float> forc(G * fnames.size());
+    x0_thread.join();
+    if (x0_err) std::rethrow_exception(x0_err);
     for (size_t s = 0; s < T; ++s) {
-        if (!fnames.empty())
-            compute_forcings(st.dates[s], fnames, model.latitudes.data(), model.longitudes.data(), G, forc.data());
+        // Row by row (contiguous writes), each column gathered from its field or forcing.
+        std::vector<const float*> col(V);
+        std::vector<size_t> stride(V, 1);
         for (size_t i = 0; i < V; ++i) {
             const std::string& n = cfg.var_input[i];
-            float* base = st.x0.data() + s * G * V + i;
             if (fcol[i] >= 0) {
-                const size_t F = fnames.size(), k = size_t(fcol[i]);
-#pragma omp parallel for schedule(static)
-                for (int64_t g = 0; g < int64_t(G); ++g) base[size_t(g) * V] = forc[size_t(g) * F + k];
+                col[i] = forc[s].data() + size_t(fcol[i]);
+                stride[i] = fnames.size();
             } else {
-                const float* src = (prog.has(n) ? prog.at(n) : cons.at(n)).data() + s * G;
-#pragma omp parallel for schedule(static)
-                for (int64_t g = 0; g < int64_t(G); ++g) base[size_t(g) * V] = src[g];
+                col[i] = (prog.has(n) ? prog.at(n) : cons.at(n)).data() + s * G;
             }
         }
+        float* xs = st.x0.data() + s * G * V;
+#pragma omp parallel for schedule(static)
+        for (int64_t g = 0; g < int64_t(G); ++g) {
+            float* row = xs + size_t(g) * V;
+            for (size_t i = 0; i < V; ++i) row[i] = col[i][size_t(g) * stride[i]];
+        }
     }
-    // NaN rule (spec §3)
+    // NaN rule (spec §3); integer counts, so the sum does not depend on the threads
     {
         std::vector<int64_t> nan(V, 0);
-        for (size_t s = 0; s < T; ++s)
-            for (size_t g = 0; g < G; ++g)
-                for (size_t i = 0; i < V; ++i) nan[i] += std::isnan(st.x0[(s * G + g) * V + i]);
+        const float* x = st.x0.data();
+#pragma omp parallel
+        {
+            std::vector<int64_t> mine(V, 0);
+#pragma omp for schedule(static)
+            for (int64_t r = 0; r < int64_t(T * G); ++r)
+                for (size_t i = 0; i < V; ++i) mine[i] += std::isnan(x[size_t(r) * V + i]);
+#pragma omp critical(varda_io_input_nan)
+            for (size_t i = 0; i < V; ++i) nan[i] += mine[i];
+        }
         std::string msg;
         for (size_t i = 0; i < V; ++i)
             if (nan[i]) msg += " " + cfg.var_input[i] + ":" + std::to_string(nan[i]);
@@ -709,11 +983,17 @@ InputState build_input(const InputModel& model, const InputFiles& files) {
     st.seconds["x0"] = now_s() - t0;
 
     // ---- step-0 output fields (spec §4.1)
-    for (const auto& n : io.initial_state_fields) {
-        const FieldState& src = prog.has(n) ? prog : cons;
-        const auto& f = src.at(n);
-        st.initial_names.push_back(n);
-        st.initial_values.emplace_back(f.begin() + int64_t((T - 1) * G), f.begin() + int64_t(T * G));
+    {
+        std::vector<const std::vector<float>*> src;
+        for (const auto& n : io.initial_state_fields) {
+            src.push_back(&(prog.has(n) ? prog : cons).at(n));
+            st.initial_names.push_back(n);
+        }
+        st.initial_values.resize(src.size());
+#pragma omp parallel for schedule(dynamic, 1)
+        for (int64_t i = 0; i < int64_t(src.size()); ++i)
+            st.initial_values[size_t(i)].assign(src[size_t(i)]->begin() + int64_t((T - 1) * G),
+                                                src[size_t(i)]->begin() + int64_t(T * G));
     }
 
     if (files.keep_stages) {
@@ -725,6 +1005,7 @@ InputState build_input(const InputModel& model, const InputFiles& files) {
         st.stages.states["cutout.constant_forcings"] = std::move(cons);
     }
     st.seconds["total"] = now_s() - t_start;
+    if (model.load_seconds > 0) st.seconds["model_grid"] = model.load_seconds;
     return st;
 }
 

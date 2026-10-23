@@ -157,6 +157,10 @@ T load_le(const unsigned char* p, bool little) {
 }  // namespace
 
 RegridMatrix RegridMatrix::load(const std::string& path) {
+    try {  // parallel reads into the page cache first: a cold mapping is read one small request at a time
+        warm_file_cache(path, {}, 8);
+    } catch (const std::exception&) {  // SafeTensorsFile reports a missing file
+    }
     SafeTensorsFile f(path);
     RegridMatrix m;
     m.path_ = path;
