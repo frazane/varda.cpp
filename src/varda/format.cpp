@@ -5,11 +5,20 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <system_error>
+#include <thread>
 
 #include "nlohmann/json.hpp"
+
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22  // Linux >= 5.14; older kernels reject it with EINVAL
+#endif
 
 namespace varda {
 
@@ -114,6 +123,50 @@ void SafeTensorsFile::open_and_parse() {
             fail(path, "tensor " + v.name + " is not aligned to its element size");
         tensors_.emplace(v.name, std::move(v));
     }
+}
+
+// Left to page faults, a cold mapping on Lustre is read as one serial read-ahead stream at
+// ~100 MB/s (13 s for Varda's 1.3 GB), and even a cached one costs a fault per page. Here
+// kThreads threads take kChunk-sized pieces of the mapping in file order and populate them with
+// MADV_POPULATE_READ (or by touching every page on kernels without it): the reads run in
+// parallel (~3 GB/s on a cold A100 node) and the page tables are filled, so the backend's reads
+// fault on nothing. Chosen by measurement (16 or 32 threads, 8 or 32 MB chunks were within noise;
+// a parallel pread into the page cache alone left the per-page faults and was 1 s slower).
+// VARDA_PREFETCH_THREADS overrides the thread count; 0 disables the prefetch.
+void SafeTensorsFile::prefetch(int threads) const {
+    constexpr int kThreads = 32;
+    constexpr size_t kChunk = size_t{8} << 20;
+    if (const char* e = std::getenv("VARDA_PREFETCH_THREADS"); e && *e) threads = std::atoi(e);
+    else if (threads <= 0) threads = kThreads;
+    if (threads <= 0 || !map_) return;
+    const size_t n_chunks = (map_size_ + kChunk - 1) / kChunk;
+    threads = static_cast<int>(std::min<size_t>(static_cast<size_t>(threads), n_chunks));
+    const size_t page = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+    std::atomic<size_t> next{0};
+    std::atomic<bool> populate{true};
+    auto worker = [&] {
+        unsigned sum = 0;
+        for (size_t c; (c = next.fetch_add(1)) < n_chunks;) {
+            const size_t lo = c * kChunk, hi = std::min(map_size_, lo + kChunk);
+            char* p = static_cast<char*>(map_) + lo;  // lo is a multiple of kChunk: page aligned
+            if (populate.load(std::memory_order_relaxed)) {
+                if (::madvise(p, hi - lo, MADV_POPULATE_READ) == 0) continue;
+                if (errno != EINVAL) continue;  // EINTR, or an I/O error that surfaces where the bytes are read, as before
+                populate.store(false, std::memory_order_relaxed);  // kernel without it: touch the pages
+            }
+            const volatile unsigned char* q = reinterpret_cast<const unsigned char*>(p);
+            for (size_t o = 0; o < hi - lo; o += page) sum += q[o];
+        }
+        (void)sum;
+    };
+    std::vector<std::thread> pool;
+    try {
+        for (int i = 1; i < threads; ++i) pool.emplace_back(worker);
+    } catch (const std::system_error&) {
+        // fewer threads than asked: the ones started (and this one) still cover every chunk
+    }
+    worker();
+    for (auto& t : pool) t.join();
 }
 
 SafeTensorsFile::~SafeTensorsFile() {

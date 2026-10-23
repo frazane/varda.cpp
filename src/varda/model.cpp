@@ -17,6 +17,7 @@ std::unique_ptr<Model> Model::load(const std::string& path, const Options& opts)
     std::unique_ptr<Model> m(new Model());
     m->opts_ = opts;
     m->file_ = std::make_unique<SafeTensorsFile>(path);
+    m->file_->prefetch();  // every byte is read below: one parallel pass beats serial page faults
     if (m->file_->metadata("varda_format") != "1")
         throw std::runtime_error(path + ": unsupported varda_format " + m->file_->metadata("varda_format"));
     m->cfg_ = parse_config(m->file_->metadata("config"));

@@ -54,6 +54,13 @@ public:
     // Throws, listing the names, unless every tensor was taken.
     void require_all_consumed() const;
 
+    // Pages the whole mapping in with several parallel readers and fills its page tables, so the
+    // tensors' bytes are resident before they are read: left to page faults, a cold file on a
+    // parallel file system is read as one slow serial stream. Contents and pointers are unchanged.
+    // threads <= 0: the default (32); the environment variable VARDA_PREFETCH_THREADS overrides
+    // it, and 0 there disables the prefetch.
+    void prefetch(int threads = 0) const;
+
 private:
     void open_and_parse();
     std::string path_;
