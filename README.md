@@ -56,7 +56,7 @@ All seven items of the definition of done are met (details and job ids: `docs/re
 | CUDA fp32 / fp16 vs anemoi | Varda worst 0.33 / 0.67 (and 0.62 vs anemoi's own fp16); dev 0.31 / 0.66 / 0.73 |
 | generality: 6 synthetic models vs float64 reference | ≤ 9.2e-7 fp32 (tol 1e-5), ≤ 1.4e-3 fp16 (tol 3e-3), CPU and CUDA |
 | computed forcings vs anemoi-inference | bitwise (0 of 194M values differ) |
-| rollout, 24 × 6 h steps vs anemoi-inference's loop | CUDA fp32 0.50, fp16 0.73 / 0.84 of per-step tolerances; CPU 8 steps 0.29; device loop == host loop bitwise |
+| rollout, 24 × 6 h steps vs anemoi-inference's loop | CPU fp32 0.58, CUDA fp32 0.50, fp16 0.73 / 0.84 of per-step tolerances; forcings, dates and device loop == host loop bitwise |
 
 Speed, A100-SXM4-80GB, one warm forward pass, all implementations in the same job:
 

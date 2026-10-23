@@ -59,3 +59,29 @@ tolerances exclude.
 CPU (cpu-short, AMD EPYC 7713, 64 threads on 64 cores, fp32): Varda forward 60 s warm, peak RSS
 24.7 GB; dev 5.3 s. For comparison (from the Python project): anemoi CPU 196-213 s,
 Python plain path 242 s, both at 64 threads.
+
+## 4. Rollout (24 steps × 6 h, from the golden input, newest slot 2024-06-01T00 UTC)
+
+References: the original model driven by anemoi-inference 9505dd0's own loop (docs/rollout.md),
+replaying identical forcings; per-step tolerances `tolerances/rollout/varda.json`
+(sha256 `7b020cd8…`; fp32 tables and the fp16 ensemble criterion, docs/rollout-engine.md §4).
+GPU rows: integrator re-run from a clean build, job 284075 (A100-SXM4-80GB),
+`$VARDA_SCRATCH/jobs/int-rollout-verify/`; CPU row: job 284016 (cpu-long, 64 threads).
+
+| engine | vs reference | table | worst ratio (key, step) | entries above per-step tol | means / mean tol (y, y_norm, window, window_norm) |
+|---|---|---|---|---|---|
+| CPU fp32 | cpu-fp32-pyg | fast-fp32-vs-cpu | 0.58 (y_norm, 23) | 0/96 | – |
+| CUDA fp32 | cpu-fp32-pyg | fast-fp32-vs-cpu | 0.50 (y_norm, 8) | 0/96 | – |
+| CUDA fp16 | cpu-fp32-pyg | fast-fp16-vs-cpu | 0.73 (y_norm, 13) | 0/96 | 0.54 / 0.49 / 0.54 / 0.53 |
+| CUDA fp16 | cuda-fp16-triton | fast-fp16-vs-ref-fp16 | 0.84 (window_norm, 5) | 0/96 | 0.53 / 0.50 / 0.54 / 0.55 |
+
+Bitwise checks (all pass): valid dates (23/23); computed forcings vs the reference's recorded
+forcings (0 of 23 × 1 688 650 × 5 differ), and the forcing columns of every window the model
+sees; device loop vs host loop (y and windows, every step); computed vs replayed forcings;
+in-place (9505dd0) vs roll (eaeb36fa) constants (equal here: the constants are equal in both
+slots of every window). dev (1 h steps, eaeb36fa references): CPU 0.56, CUDA fp32
+0.58, fp16 1.23 / 1.02 within the fp16 allowance (as the Python fast path: 1.22 / 1.00), all PASS.
+
+Speed (CUDA fp16, graph on, forcings computed and overlapped): 727.7 ms per step wall,
+726.1 ms GPU, against 724–725 ms for the forward pass alone: the state update costs ~2 ms
+(0.3%). fp32: 7442.6 ms per step. Host-level loop (host copies every step): 1007 ms per step.
