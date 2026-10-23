@@ -89,8 +89,13 @@ synthetic correctness checks, not meteorological forecast qualification.
 It also generates three independent golden models with 7/35/96 channels,
 including one hidden node, incomplete SIMD groups, 1/7/37-row chunks, and 8,201
 data nodes crossing the default chunk boundary: ten further parity checks,
-including hook inertness. CI runs GPU parity and integration with Metal API and
-shader validation enabled.
+including hook inertness. CI runs GPU parity and integration with Metal API
+validation. The direct kernel test below also enables GPU Shader Validation.
+Global shader instrumentation changes MPS GEMM results on the hosted Apple
+Paravirtual GPU (an API-only control passes, while the first embedding GEMM
+fails with instrumentation). Full inference therefore disables global shader
+instrumentation in hosted CI; the full suite additionally passes with both
+validation layers enabled on the physical M1.
 
 The macOS-only `test_metal_kernels` CTest target directly checks the production
 LayerNorm shader against double-precision mathematical references: 384 cases

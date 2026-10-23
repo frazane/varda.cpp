@@ -157,7 +157,7 @@ if(VARDA_METAL)
   target_link_libraries(test_metal_kernels PRIVATE varda)
   add_test(NAME test_metal_kernels COMMAND test_metal_kernels)
   set_tests_properties(test_metal_kernels PROPERTIES SKIP_RETURN_CODE 77
-    ENVIRONMENT "MTL_DEBUG_LAYER=1;MTL_SHADER_VALIDATION=1")
+    ENVIRONMENT "MTL_DEBUG_LAYER=1;MTL_SHADER_VALIDATION=1;MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1")
 endif()
 if(VARDA_HAVE_GRIB)
   file(GLOB VARDA_IO_TESTS CONFIGURE_DEPENDS tests/io/*.cpp)
