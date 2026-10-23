@@ -6,6 +6,9 @@ A from-scratch C++/CUDA inference engine for the **forecaster** of
 encoder–processor–decoder on a stretched grid (1 688 650 data nodes: 1 km over the Alps,
 31 km globally; 189 809 hidden nodes; 6-hourly steps).
 
+> **Not an official MeteoSwiss product.** varda.cpp is an independent project. It is not developed, endorsed or
+> supported by MeteoSwiss, and its forecasts are not MeteoSwiss forecasts. See [Licence and disclaimer](#licence-and-disclaimer).
+
 The checkpoint is identified by its sha256 (`1ad7a7a6…a9c7d8`) and uuid; file and directory
 names use `varda`. The engine is verified against golden activations, reference rollouts and
 calibrated tolerances produced by running the original anemoi model; it replaces PyTorch with
@@ -104,6 +107,7 @@ bench/          same-job benchmark driver (original anemoi, varda.cpp)
 ## Build
 
 ```
+cp tools/env.local.example.sh tools/env.local.sh   # once: toolchain, scratch and data paths for this machine
 source tools/env.sh
 cmake -S . -B build && cmake --build build -j
 .venv/bin/python -I python/convert.py MODEL.ckpt model.safetensors     # once per checkpoint
@@ -113,3 +117,14 @@ build/varda-rollout ...                                                  # docs/
 
 `build/varda-forecast` runs a forecast from real data (KENDA-CH1 and IFS open data in, GRIB out, as
 anemoi-inference does); it needs ecCodes (`-DVARDA_GRIB=ON`, `tools/env.sh`): `docs/forecast.md`.
+
+## Licence and disclaimer
+
+- The code is licensed under the BSD 3-Clause License (`LICENSE`), for every version of this repository.
+- `third_party/nlohmann/json.hpp` is © Niels Lohmann, MIT License (notice in the file).
+- The model weights are not part of this repository. Varda-single-1.0 is published by MeteoSwiss on
+  [Hugging Face](https://huggingface.co/MeteoSwiss/Varda-single-1.0) under CC BY 4.0. Files taken from or derived
+  from that repository by the tools here (the converted model, the assets bundle, the GRIB templates) remain under
+  CC BY 4.0: credit MeteoSwiss when you share them.
+- varda.cpp is not an official MeteoSwiss product. It is not developed, endorsed or supported by MeteoSwiss, and
+  forecasts made with it are not MeteoSwiss forecasts. It comes without warranty (see `LICENSE`).
