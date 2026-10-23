@@ -4,10 +4,10 @@ How varda.cpp runs N forecast steps with anemoi-inference's semantics, the two i
 (host-level oracle, device-resident CUDA loop), how they are verified against the original
 model driven by anemoi-inference's own loop, and what they cost.
 
-The semantics are those of `$IE_ROOT/docs/rollout.md` §1 (anemoi-inference `Runner.forecast`); the
-dynamic forcings are `docs/forcings.md`. The references and their tolerances come from the Python
-project (dev, `$IE_SCRATCH/rollout/`) and from this project's reference driver
-(Varda = varda, `python/reference/run_rollout.py`, `$VARDA_SCRATCH/rollout/`).
+The semantics are those of anemoi-inference's `Runner.forecast` (§1); the dynamic forcings are
+`docs/forcings.md`. The references are rollouts of the original model with anemoi-inference's own loop:
+the dev model (anemoi-inference eaeb36fa, `$REF_SCRATCH/rollout/`, read-only) and Varda (this project's
+reference driver `python/reference/run_rollout.py`, `$VARDA_SCRATCH/rollout/`).
 
 | file | content |
 |---|---|
@@ -16,7 +16,7 @@ project (dev, `$IE_SCRATCH/rollout/`) and from this project's reference driver
 | `apps/varda-rollout.cpp` | run N steps, computed or replayed forcings, `--compare` with per-step metrics and the rollout tolerances, bitwise self-checks, benchmark, JSON report |
 | `tests/test_rollout.cpp` | state update on tiny synthetic windows (T = 2..5, slot values that differ) vs the literal upstream definitions (9505dd0 `advance_map`, eaeb36fa `roll(-1)`), both constant sources, invalid index sets, dates, real configs |
 | `tests/test_rollout_cuda.cu` | device update kernel bitwise equal to the host update, both constant sources (T = 2, 3, 4) |
-| `python/export_rollout.py` | the Python project's reference rollouts (`rollout.pt`) to the rollout file read by the app |
+| `python/export_rollout.py` | the dev model's reference rollouts (`rollout.pt`) to the rollout file read by the app |
 
 ## 1. Semantics
 
@@ -41,19 +41,19 @@ Step `s` (0-based):
      slot's own values** (`ConstantSource::Newest`, the default).
 
    `ConstantSource::Oldest` (`--constants oldest`) is the explicit option for anemoi-inference **eaeb36fa**
-   (the Python project's references): there `copy_prognostic_fields_to_input_tensor` did `torch.roll(-1)` into a
+   (the dev model's references): there `copy_prognostic_fields_to_input_tensor` did `torch.roll(-1)` into a
    new tensor, so the constant inputs of the newest slot were the **oldest** slot's. The two semantics differ only
    if a constant input differs between slots; for real inputs they are equal in every slot and never change
    (checked for every window of both models' references and of our runs, §4), so both give bitwise the same
    rollout. `Metadata.advance_map` can also be overridden by a checkpoint's `timesteps.advance_map`; Varda's and
-   dev's metadata have none, so the formula applies. Models with more than one output step are
+   the dev model's metadata have none, so the formula applies. Models with more than one output step are
    rejected (`check_rollout_model`).
 3. The valid date of output `s` is `date0 + (s + 1) * timestep_hours`, `date0` the date of the newest input
-   slot (`x0[T-1]`): Varda 6 h, dev 1 h.
+   slot (`x0[T-1]`): Varda 6 h, the dev model 1 h.
 
 `StateUpdate::from_config` builds one source per input channel (prognostic: an output index; forcing: a
 column; constant: kept). Every input must be exactly one of the three, as anemoi-inference's `check` mask
-requires (Varda: 79 = 66 + 5 + 8; dev: 84 = 71 + 5 + 8); anything else, or a config without the
+requires (Varda: 79 = 66 + 5 + 8; the dev model: 84 = 71 + 5 + 8); anything else, or a config without the
 `forcings` section, is rejected with an error naming the channel or the section. Coordinates for the
 computed forcings are the file's `grid.latitudes` / `grid.longitudes` (F64, `Model::latitudes()`), so the
 rollout needs a file that carries them (every file now under `converted/`); `check_rollout_model` says so.
@@ -88,7 +88,7 @@ Engineered like a decode loop, on the CUDA backend's device-level API (`src/vard
 **Buffers** (all allocated once, in the constructor): window `win` and normalised window `xn`
 `(T, G, V_in)`, normalised output `yn`, two physical outputs `y[0..1]` and two forcing slots `f[0..1]`
 `(G, F)`; pinned host `hy[0..1]` and `hf[0..1]`; the update's per-channel `kind` / `src` tables. Varda:
-3.56 GB of device memory and 0.97 GB pinned on top of the backend's; dev 0.09 / 0.02 GB
+3.56 GB of device memory and 0.97 GB pinned on top of the backend's; the dev model 0.09 / 0.02 GB
 (plus one pinned window copy when `on_window` is used).
 
 **Graphs.** After `prepare()` (one eager forward: every cuBLASLt plan exists), four graphs are captured
@@ -124,16 +124,15 @@ the forcing upload only copy values; the forcings are the same `compute_forcings
 replayed array). Checked on both models at every step (§4).
 
 **Not done, on purpose.** A ring-indexed window (no roll copy) would need a gather or a forward that
-takes the slot order: the update costs ~0.05 ms per step on dev (§5), not worth it. Forcings
-computed on the device: the host computation is hidden behind the step (0.4 ms on dev, 10.4 ms on
+takes the slot order: the update costs ~0.05 ms per step on the dev model (§5), not worth it. Forcings
+computed on the device: the host computation is hidden behind the step (0.4 ms on the dev model, 10.4 ms on
 Varda, vs a 32 ms / 727 ms fp16 step) and stays bitwise anemoi's (glibc libm in double, `docs/forcings.md` §7).
 
 ## 4. Verification
 
 ### Method
 
-`varda-rollout --compare REF` (`apps/varda-rollout.cpp` header), the same procedure as
-`$IE_ROOT/tests/test_rollout_gpu.py`: per step `s`, the contract metric `rel_absmax` (float64,
+`varda-rollout --compare REF` (`apps/varda-rollout.cpp` header): per step `s`, the contract metric `rel_absmax` (float64,
 `docs/format.md` §2) of `y`, `y_norm = y*mul_out + add_out`, `window` (the window step `s` sees) and
 `window_norm`; tolerances from `tolerances/rollout/<model>.json` (found by checkpoint uuid; the run fails
 without one), table by reference and precision:
@@ -144,7 +143,7 @@ without one), table by reference and precision:
 | CUDA fp16 | `fast-fp16-vs-cpu` | `fast-fp16-vs-ref-fp16` |
 
 fp16 (the file's `fp16_criterion`, tolerances v2): step 0 within the one-step tolerance; steps >= 1
-within `fp16_allowance` x the per-step tolerance (dev 1.7 vs CPU, 1.9 vs the reference fp16);
+within `fp16_allowance` x the per-step tolerance (the dev model 1.7 vs CPU, 1.9 vs the reference fp16);
 per key, the mean over steps within `fp16_mean_tolerance`. Entries above the bare per-step tolerance are
 counted. The C++ CPU fp32 path is held to the fp32 table, as for one step (`docs/format.md` §4).
 
@@ -167,17 +166,17 @@ report (used for Varda, whose tolerance file arrived after the runs).
 Input: the reference's `x0` (the golden one-step input `in.x`) with its `start_date` 2024-06-01T00:00, so
 step 0 of the CPU run is the one-step parity case.
 
-### dev (24 steps, 1 h)
+### Dev model (24 steps, 1 h)
 
-References: `$IE_SCRATCH/rollout/ref/cpu-fp32-pyg`, `.../v2/ref/cuda-fp32-triton`, `.../v2/ref/cuda-fp16-triton`,
-exported by `python/export_rollout.py` (job 283445, `--verify`: every tensor bitwise equal to `rollout.pt`, and
+References: `$REF_SCRATCH/rollout/ref/cpu-fp32-pyg`, `.../v2/ref/cuda-fp32-triton`, `.../v2/ref/cuda-fp16-triton`,
+exported by `python/export_rollout.py` (run `dev-export`, `--verify`: every tensor bitwise equal to `rollout.pt`, and
 `forcings.pt` equal to the rollout's forcings) to `$VARDA_SCRATCH/rollout-engine/ref/dev/<tag>/rollout.safetensors`.
 
-**CPU fp32** vs `cpu-fp32-pyg`, table `fast-fp32-vs-cpu` (cpu-short, 64 threads `OMP_PLACES=cores
-OMP_PROC_BIND=spread` on `-c 128`, job 283467): **PASS**, worst 0.56 x tolerance (`window_norm`, step 6),
+**CPU fp32** vs `cpu-fp32-pyg`, table `fast-fp32-vs-cpu` (CPU node, 64 threads `OMP_PLACES=cores
+OMP_PROC_BIND=spread` on `-c 128`, run `dev-cpu`): **PASS**, worst 0.56 x tolerance (`window_norm`, step 6),
 0 of 96 entries above.
 
-**CUDA fp32** vs `cpu-fp32-pyg`, `fast-fp32-vs-cpu` (A100-SXM4-80GB, graph on, job 283466): **PASS**, worst
+**CUDA fp32** vs `cpu-fp32-pyg`, `fast-fp32-vs-cpu` (A100-SXM4-80GB, graph on, run `dev-gpu`): **PASS**, worst
 0.58 x (`window_norm`, step 15), 0 of 96 above.
 
 | step | CPU y | CPU y_norm | CPU window_norm | CUDA fp32 y | CUDA fp32 y_norm | CUDA fp32 window_norm | tol y | tol y_norm | tol window_norm |
@@ -193,10 +192,10 @@ OMP_PROC_BIND=spread` on `-c 128`, job 283467): **PASS**, worst 0.56 x tolerance
 | 23 | 7.39e-07 | 8.27e-05 | 6.06e-05 | 5.18e-07 | 8.81e-05 | 8.54e-05 | 1.1e-05 | 1.2e-03 | 1.2e-03 |
 
 (`window` is the previous step's `y` plus exact forcings and constants, so it follows `y`; all 24 rows of
-all four keys are in the logs and `check-*.json`.) Step-0 `y_norm` is 4.46e-7 on the CPU (the one-step
-`out.y` parity) and 1.45e-6 on CUDA fp32, the same value as the Python engine's fast path (`$IE_ROOT/docs/rollout.md` §5.2).
+all four keys are in the runs' `check-*.json` reports.) Step-0 `y_norm` is 4.46e-7 on the CPU (the one-step
+`out.y` parity) and 1.45e-6 on CUDA fp32.
 
-**CUDA fp16** (job 283466): **PASS** against both references.
+**CUDA fp16** (run `dev-gpu`): **PASS** against both references.
 
 | step | y vs CPU | tol | y_norm vs CPU | tol | window_norm vs CPU | tol | y vs ref fp16 | tol | y_norm vs ref fp16 | tol |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -215,32 +214,28 @@ all four keys are in the logs and `check-*.json`.) Step-0 `y_norm` is 4.46e-7 on
 - vs the reference's fp16 rollout (`fast-fp16-vs-ref-fp16`): worst 1.02 x (`y`, step 15), 2 of 96 above
   (allowance 1.9); means 0.55, 0.50, 0.53, 0.45.
 
-These are the Python engine's fast-path numbers almost exactly (1.22 x, 4 of 96; 1.00 x, 2 of 96;
-`$IE_ROOT/docs/rollout.md` §5.2): the same fp16 trajectory statistics, as expected from a backend with the
-same cast placement.
-
 **Forcings and self-checks** (all three runs): dates 23 of 23 equal; computed forcings bitwise equal to the
 recorded ones, 0 of 23 x 40 320 x 5 elements differ; the forcing columns of every window fed to the model
 bitwise equal to the reference's recorded forcings (steps 1-23, against all three references); computed vs
 replayed forcings: `y` bitwise equal at all 24 steps, windows equal; CUDA fp32 and fp16: device loop vs
 host-level `Rollout`: `y` bitwise equal at all 24 steps, windows equal.
 
-### Varda (varda, 24 steps, 6 h)
+### Varda (24 steps, 6 h)
 
 References: the original Varda forecaster driven by anemoi-inference's own loop (`python/reference/run_rollout.py`,
 24 steps from the golden input, forcings recorded once and replayed, `$VARDA_SCRATCH/rollout/ref/{cpu-fp32-pyg,
 cuda-fp32-triton,cuda-fp16-triton}/rollout.safetensors`); tolerances `tolerances/rollout/varda.json` (sha256
-`7b020cd8...c5f95` when judged; calibrated by the reference agent with the same method as dev; its
+`7b020cd8...c5f95` when judged; calibrated with the same method as the dev model's (`docs/rollout.md` §4); its
 `fp16_allowance` is 1.0 for both fp16 tables, i.e. no extra factor). The GPU and CPU runs were made before the file
 existed; their recorded per-step metrics were judged with `varda-rollout --judge REPORT.json` (same table choice and
 criterion as a live run; `*.judged.json` next to each report).
 
-**CPU fp32**, 24 steps (~60 s per forward, 73 s per step with the window copy and comparison; cpu-long, 64 threads
-`OMP_PLACES=cores OMP_PROC_BIND=spread`, `-c 128`; job 284016, constants in place) vs `cpu-fp32-pyg`,
-`fast-fp32-vs-cpu`: **PASS**, worst 0.58 x (`y_norm`, step 23), 0 of 96 above. (The earlier 8-step run, job 283674,
+**CPU fp32**, 24 steps (~60 s per forward, 73 s per step with the window copy and comparison; CPU node, 64 threads
+`OMP_PLACES=cores OMP_PROC_BIND=spread`, `-c 128`; run `const-cpu`, constants in place) vs `cpu-fp32-pyg`,
+`fast-fp32-vs-cpu`: **PASS**, worst 0.58 x (`y_norm`, step 23), 0 of 96 above. (The earlier 8-step run, `varda-cpu-roll`,
 roll semantics: worst 0.29 x, 0 of 32 above; its 8 steps are bitwise the first 8 of this run's metrics.)
 
-**CUDA fp32**, 24 steps (job 283673) vs `cpu-fp32-pyg`, `fast-fp32-vs-cpu`: **PASS**, worst 0.50 x (`y_norm`, step 8),
+**CUDA fp32**, 24 steps (run `varda-gpu-vscpu`) vs `cpu-fp32-pyg`, `fast-fp32-vs-cpu`: **PASS**, worst 0.50 x (`y_norm`, step 8),
 0 of 96 above.
 
 | step | CPU y | CPU y_norm | CPU window_norm | CUDA fp32 y | CUDA fp32 y_norm | CUDA fp32 window_norm | tol y | tol y_norm | tol window_norm |
@@ -257,9 +252,9 @@ roll semantics: worst 0.29 x, 0 of 32 above; its 8 steps are bitwise the first 8
 
 Step 0 of the CPU run is the one-step parity case (`in.x` of the golden data): `y` 1.52e-7, `y_norm` 1.64e-6.
 For information, CUDA fp32 vs the reference's own `cuda-fp32-triton` rollout: `y` <= 9.0e-7, `y_norm` <= 1.7e-5 over
-24 steps (job 283471).
+24 steps (run `varda-gpu-fp32`).
 
-**CUDA fp16**, 24 steps (job 283673): **PASS** against both references, with no step needing an allowance.
+**CUDA fp16**, 24 steps (run `varda-gpu-vscpu`): **PASS** against both references, with no step needing an allowance.
 
 | step | y vs CPU | tol | y_norm vs CPU | tol | window_norm vs CPU | tol | y vs ref fp16 | tol | y_norm vs ref fp16 | tol | window_norm vs ref fp16 | tol |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -280,44 +275,44 @@ For information, CUDA fp32 vs the reference's own `cuda-fp32-triton` rollout: `y
 - vs the reference's fp16 rollout (`fast-fp16-vs-ref-fp16`): worst 0.84 x (`window_norm`, step 5), 0 of 96 above; means
   0.53, 0.50, 0.54, 0.55.
 
-Unlike dev (1 h steps, 24 h), the 6-hourly Varda fp16 rollout does not decorrelate from the references
+Unlike the dev model (1 h steps, 24 h), the 6-hourly Varda fp16 rollout does not decorrelate from the references
 within 6 days: the error vs CPU grows only from 3e-5 to 1.6e-4 in `y` and stays at 2-7e-3 in `y_norm`.
 
 **Forcings and self-checks**: dates 23 of 23 equal (6 h steps from 2024-06-01T00 to 2024-06-07T00, across a month);
 computed forcings bitwise equal to the recorded ones, 0 of 23 x 1 688 650 x 5 = 194 194 750 elements differ (checked in
 every run against each reference's recorded array); the forcing columns of every window fed to the model bitwise equal
 to them (steps 1-23); computed vs replayed forcings: `y` bitwise equal at every step and windows equal
-(CUDA fp32 and fp16 24 steps, jobs 283471, 283540; CPU 8 steps, job 283606; the constant-source change below
+(CUDA fp32 and fp16 24 steps, runs `varda-gpu-fp32`, `varda-gpu-fp16`; CPU 8 steps, run `varda-cpu-verify`; the constant-source change below
 leaves all of these bitwise unchanged); device loop vs host-level `Rollout` on the
-same backend: `y` bitwise equal at all 24 steps and windows equal (fp32 job 283471, fp16 job 283540).
+same backend: `y` bitwise equal at all 24 steps and windows equal (fp32 run `varda-gpu-fp32`, fp16 run `varda-gpu-fp16`).
 
 ### Constant inputs: in place (9505dd0) vs roll (eaeb36fa)
 
 The rollout first used eaeb36fa's `roll(-1)` (committed as 83e6205); the default is now 9505dd0's in-place
 `advance_map` (§1), with the roll kept as `ConstantSource::Oldest`. Verification of the change:
 
-- `test_rollout` (CPU, job 284016 and the login node): for T = 2, 3, 4, 5 and both sources, three consecutive updates
+- `test_rollout` (CPU, run `const-cpu` and the login node): for T = 2, 3, 4, 5 and both sources, three consecutive updates
   bitwise equal to the literal upstream definitions executed on whole slots (the `inin` / `outin` lists built from the
   formula and applied in order, or `roll(-1)` then `outin`), on windows whose values differ between slots; explicit
   per-slot expectations (slot `t` <- old slot `t+1`; constants keep the newest slot's value in place, take the oldest
   slot's with the roll; after a second update in place they are still the newest slot's original values); with
   constants equal in all slots, both sources give the same window; the default is `Newest`.
-- `test_rollout_cuda` (job 284015): the device kernel equals the host update for both sources (T = 2, 3, 4), and the
+- `test_rollout_cuda` (run `const-gpu`): the device kernel equals the host update for both sources (T = 2, 3, 4), and the
   two sources really differ on those windows (so the flag reaches the kernel).
-- Are the references' constants equal across slots? Yes: in every recorded window of every reference (dev
+- Are the references' constants equal across slots? Yes: in every recorded window of every reference (the dev model's
   `cpu-fp32-pyg`, `cuda-fp32-triton`, `cuda-fp16-triton`, made with eaeb36fa; Varda `cpu-fp32-pyg`,
   `cuda-fp16-triton`, made with 9505dd0) and of every one of our runs, the 8 constant inputs are bitwise equal in both
   slots, at all 24 steps (`constants_across_slots` in the reports). So both semantics give the same rollout here.
 - Rollouts with the other source (`--verify-constants`): `y` bitwise equal at all 24 steps and windows equal, for
-  dev CUDA fp16 and CPU fp32 and Varda CUDA fp16 (jobs 284015, 284016); device vs host still bitwise equal
-  (dev and Varda fp16, 24 steps, job 284015).
+  the dev model CUDA fp16 and CPU fp32 and Varda CUDA fp16 (runs `const-gpu`, `const-cpu`); device vs host still bitwise
+  equal (the dev model and Varda fp16, 24 steps, run `const-gpu`).
 - Against the committed binary (83e6205 build, roll semantics, the backend before the later review fixes): the
-  24-step `y` files of dev fp16 and Varda fp16 are byte-identical (`cmp`), and every per-step metric in the
-  new reports equals the earlier one (jobs 283466, 283673). The verdicts above stand unchanged.
+  24-step `y` files of the dev model fp16 and Varda fp16 are byte-identical (`cmp`), and every per-step metric in the
+  new reports equals the earlier one (runs `dev-gpu`, `varda-gpu-vscpu`). The verdicts above stand unchanged.
 
 ## 5. Speed
 
-Varda, A100-SXM4-80GB, warm, 24 steps, same protocol (jobs 283471 fp32, 283540 fp16; `bench-*.json`):
+Varda, A100-SXM4-80GB, warm, 24 steps, same protocol (runs `varda-gpu-fp32` and `varda-gpu-fp16`; `bench-*.json`):
 
 | precision | graph | forcings | GPU ms/step | wall ms/step | forward-only ms | step - forward | host-level `Rollout` ms/step |
 |---|---|---|---|---|---|---|---|
@@ -335,13 +330,13 @@ Varda, A100-SXM4-80GB, warm, 24 steps, same protocol (jobs 283471 fp32, 283540 f
   1.4-1.9x faster per step in fp16; in fp32 the forward dominates (2.4%).
 - Device memory: backend weights 0.68 GB (fp16) / 1.18 GB (fp32), backend activations 20.1 / 37.1 GB, rollout buffers
   3.56 GB, pinned host 0.97 GB; `cudaMemGetInfo` used 24.8 / 42.3 GB including the CUDA context.
-- One-step reference (CUDA agent, `docs/cuda.md`): 718 ms fp16, 7.44 s fp32 device-resident, consistent with the
-  forward-only graph here (724.7 ms in this job). The original anemoi-inference runner (`$VARDA_SCRATCH/rollout/jobs/
-  cuda-*-triton/log.out`, warm second run, 24 steps incl. its own forcings and output handling): 42.79 s (1.78 s/step)
+- One-step reference (`docs/cuda.md`): 718 ms fp16, 7.44 s fp32 device-resident, consistent with the
+  forward-only graph here (724.7 ms in this job). The original anemoi-inference runner (the reference runs `cuda-*-triton` of
+  `docs/rollout.md` §3, warm second run, 24 steps incl. its own forcings and output handling): 42.79 s (1.78 s/step)
   fp16 and 204.18 s (8.51 s/step) fp32, i.e. 2.45x / 1.14x slower per step than this loop; that is the reference
   driver's wall time, not a hook-free benchmark.
 
-dev, A100-SXM4-80GB, warm, 24 steps, outputs copied to pinned host memory every step (job 283466,
+Dev model, A100-SXM4-80GB, warm, 24 steps, outputs copied to pinned host memory every step (run `dev-gpu`,
 `bench-*.json`). GPU time per step = CUDA events around each step's graph, median over all steps of the
 timed rollouts (5 in fp16, 3 in fp32, after one warm-up rollout); forward-only = 24 replays of the
 `u = 0` graph (normalise, forward, denormalise: the one-step time on the same buffers).
@@ -359,39 +354,37 @@ timed rollouts (5 in fp16, 3 in fp32, after one warm-up rollout); forward-only =
   time: the loop never stalls on the host. Host forcings: 0.4-0.5 ms per step, fully overlapped.
 - The device loop saves 4-9 ms per fp16 step over the host-level loop (H2D of the window, D2H of `y`, host update,
   synchronous each step): 12-22%.
-- For reference, the Python engine's fast-path rollout on the same model: 35.7 ms/step fp16, 299.1 ms/step fp32
-  (`$IE_ROOT/docs/rollout.md` §5.4, another job); the original anemoi-inference loop 78.3 / 344.5 ms/step. The fp32
-  forward of the C++ backend (329 ms) is slower than the Python fast path's (299 ms): a backend matter, not the loop's.
+- For reference, the original anemoi-inference loop on the same model: 78.3 / 344.5 ms/step fp16 / fp32 (another
+  job).
 
 ## 6. Files
 
 Rollout file (`varda_rollout` = "1"), written by `python/reference/export_rollout.py` (Varda) and
-`python/export_rollout.py` (dev), read by `apps/varda-rollout`: `x0` [2, G, V_in], `y` [N, G, V_out],
+`python/export_rollout.py` (the dev model), read by `apps/varda-rollout`: `x0` [2, G, V_in], `y` [N, G, V_out],
 `window` [N, 2, G, V_in] (the window step s sees), `forcings` [N-1, G, F] (forcing s: valid date of output s),
 `forcing_index`, `prog_in`, `prog_out`, `kept_in` (I64), `mul_in`, `add_in`, `mul_out`, `add_out`; metadata
 `tag`, `steps`, `start_date`, `dates`, `forcing_vars`, `in_vars`, `out_vars`, `kept_vars`, `run` (JSON), and
 (`python/export_rollout.py`) `checkpoint_uuid`. The app refuses a file whose variables, grid size or recorded
 uuid differ from the model's, and reorders replayed forcings by name into the config's `forcings.dynamic` order.
 
-Jobs (`$VARDA_SCRATCH/jobs/rollout-<name>/`: `job.sh`, `bin/` (the exact binaries), `log.txt`, `exit_code`,
-JSON reports):
+Runs (one job each; each kept its job script, the exact binaries, the log, the exit code and the JSON reports). GPU
+runs on an A100-SXM4-80GB, CPU runs on an EPYC 7713 node:
 
-| job | name | what |
-|---|---|---|
-| 283445 | `rollout-export-sz` | `python/export_rollout.py --verify` of the three dev references |
-| 283447, 283448 | `rollout-sz-cpu-smoke`, `rollout-sz-gpu-smoke` | first 3-4 step runs, `test_rollout`, `test_rollout_cuda` |
-| 283467 | `rollout-sz-cpu-full` | dev CPU fp32, 24 steps, compare, forcings, replay |
-| 283466 | `rollout-sz-gpu-full` | dev CUDA fp32 + fp16, 24 steps, all checks; benchmarks |
-| 283471 | `rollout-ar-gpu-fp32` | Varda CUDA fp32 vs cuda-fp32-triton, forcings, replay, host; benchmark |
-| 283540 | `rollout-ar-gpu-fp16` | Varda CUDA fp16 vs cuda-fp16/fp32-triton, forcings, replay, host; benchmarks |
-| 283606 | `rollout-ar-cpu-verify` | Varda CPU fp32, 8 steps, forcings, computed vs replayed |
-| 283673 | `rollout-ar-gpu-vscpu` | Varda CUDA fp16 + fp32 vs cpu-fp32-pyg (and the triton references) |
-| 283674 | `rollout-ar-cpu-vscpu` | Varda CPU fp32, 8 steps vs cpu-fp32-pyg (roll semantics) |
-| 284015 | `rollout-const-gpu` | constants in place (9505dd0): `test_rollout_cuda`; dev and Varda fp16 24 steps with `--verify-host --verify-constants`; byte comparison with the committed binary |
-| 284016 | `rollout-const-cpu` | `test_rollout`; dev CPU 24 steps `--verify-constants`; Varda CPU fp32 24 steps vs cpu-fp32-pyg |
+| run | what |
+|---|---|
+| `dev-export` | `python/export_rollout.py --verify` of the dev model's three references |
+| `dev-smoke` (CPU and GPU) | first 3-4 step runs, `test_rollout`, `test_rollout_cuda` |
+| `dev-cpu` | dev model CPU fp32, 24 steps, compare, forcings, replay |
+| `dev-gpu` | dev model CUDA fp32 + fp16, 24 steps, all checks; benchmarks |
+| `varda-gpu-fp32` | Varda CUDA fp32 vs cuda-fp32-triton, forcings, replay, host; benchmark |
+| `varda-gpu-fp16` | Varda CUDA fp16 vs cuda-fp16/fp32-triton, forcings, replay, host; benchmarks |
+| `varda-cpu-verify` | Varda CPU fp32, 8 steps, forcings, computed vs replayed |
+| `varda-gpu-vscpu` | Varda CUDA fp16 + fp32 vs cpu-fp32-pyg (and the triton references) |
+| `varda-cpu-roll` | Varda CPU fp32, 8 steps vs cpu-fp32-pyg (roll semantics) |
+| `const-gpu` | constants in place (9505dd0): `test_rollout_cuda`; the dev model and Varda fp16 24 steps with `--verify-host --verify-constants`; byte comparison with the committed binary |
+| `const-cpu` | `test_rollout`; the dev model CPU 24 steps `--verify-constants`; Varda CPU fp32 24 steps vs cpu-fp32-pyg |
 
-Every binary was built from the committed CUDA backend (20f47b2) plus this work's files. Submit helper:
-`$VARDA_SCRATCH/jobs/rollout-tools/submit.sh NAME "sbatch options" < body`.
+Every binary was built from the committed CUDA backend (20f47b2) plus this work's files.
 
 ## 7. Lessons
 

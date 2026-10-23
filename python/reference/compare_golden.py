@@ -1,13 +1,11 @@
-"""Copied from $IE_ROOT (the Python project) at commit aada999, then adapted for varda.cpp (unchanged logic: the
-metric and checkpoint_identity are what run_rollout.py imports; paths in the text below are the Python project's).
-
-Compare golden dumps: two contract `activations.pt` files key by key, or two legacy run_reference.py dirs.
+"""Compare golden dumps: two contract `activations.pt` files key by key, or two legacy run_reference.py dirs.
+The metric and checkpoint_identity are what run_rollout.py imports.
 
 Usage:
-    python reference/compare_golden.py REF OTHER [--json out.json] [--fail-above X]
+    python python/reference/compare_golden.py REF OTHER [--json out.json] [--fail-above X]
 
-REF / OTHER are either an `activations.pt` file (docs/contracts.md §2), a golden directory containing one
-(e.g. $SCRATCH/the Python project/golden/cpu-fp32-pyg), or a legacy run_reference.py directory
+REF / OTHER are either an `activations.pt` file (docs/format.md §2), a golden directory containing one
+(e.g. $REF_SCRATCH/golden/cpu-fp32-pyg), or a legacy run_reference.py directory
 (with input.pt, output.pt, activations/*.pt; old per-file mode, kept for the cross-device comparisons).
 
 Metric (contract mode), per key, computed in float64 on CPU; trivial to re-implement in the engine tests:
@@ -24,9 +22,9 @@ present); keys missing in one dict, shape or dtype mismatches are reported. --fa
 any common key has rel_absmax > X (or NaN), or a shape mismatch; use --fail-above 0 for a bitwise check. Only
 needs torch (runs in either venv).
 
-Shared with reference/dump_golden.py: contract_keys / required_keys / legacy_map / contract_order and
-checkpoint_identity are MIRRORS of engine/compare.py and engine/checkpoint.py (reference/ can't import engine/);
-tests/test_contract.py checks that the two copies agree. Change both together.
+contract_keys / required_keys / legacy_map / contract_order and checkpoint_identity are self-contained (this
+directory runs in the reference venvs and imports nothing from python/); checkpoint_identity returns the same
+fields as python/checkpoint.py's. Change both together.
 """
 
 import argparse
@@ -40,7 +38,7 @@ from pathlib import Path
 
 import torch
 
-# ------------------------------------------------- mirror of engine/compare.py (keys) and engine/checkpoint.py
+# ------------------------------------------------- contract keys (docs/format.md §2) and checkpoint identity
 
 _HEAD = ["in.x", "in.x_norm", "enc.x_src", "enc.x_dst", "enc.emb_src", "enc.emb_dst", "enc.out"]
 _TAIL = ["latent", "dec.emb_dst", "dec.block_out", "dec.out", "out.pre_bound", "out.norm", "out.y"]
@@ -50,12 +48,12 @@ _PROC = re.compile(r"^proc\.(\d+)\.out$")
 
 
 def contract_keys(n_proc: int) -> list[str]:
-    """Every docs/contracts.md §2 key, in table order, for a model with ``n_proc`` processor blocks."""
+    """Every docs/format.md §2 key, in table order, for a model with ``n_proc`` processor blocks."""
     return _HEAD + [f"proc.{i}.out" for i in range(n_proc)] + _TAIL
 
 
 def required_keys(n_proc: int) -> list[str]:
-    """The keys marked "yes" in docs/contracts.md §2 (the others are best effort)."""
+    """The required keys of docs/format.md §2 (the others are best effort)."""
     return _REQUIRED_HEAD + [f"proc.{i}.out" for i in range(n_proc)] + _REQUIRED_TAIL
 
 
@@ -91,7 +89,7 @@ def contract_order(keys) -> list[str]:
 
 
 def checkpoint_identity(path, sha256=True):
-    """{path, uuid, run_id, size_bytes, sha256} of a checkpoint (mirror of engine.checkpoint.checkpoint_identity)."""
+    """{path, uuid, run_id, size_bytes, sha256} of a checkpoint (as python/checkpoint.py's checkpoint_identity)."""
     path = Path(path)
     with zipfile.ZipFile(path) as z:
         member = next((n for n in z.namelist() if n.endswith("anemoi-metadata/anemoi.json")), None)
@@ -131,7 +129,7 @@ def load_activations(path: Path) -> dict[str, torch.Tensor]:
     path = Path(path)
     if path.is_dir():
         path = path / "activations.pt"
-    return torch.load(path, map_location="cpu", weights_only=True, mmap=True)  # varda sets are 40 GB
+    return torch.load(path, map_location="cpu", weights_only=True, mmap=True)  # Varda sets are 40 GB
 
 
 def compare_activations(ref: dict, other: dict) -> dict:

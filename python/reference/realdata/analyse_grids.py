@@ -23,7 +23,7 @@ import yaml  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from safetensors_io import read_safetensors  # noqa: E402
 
-VARDA_SCRATCH = os.environ.get("VARDA_SCRATCH", "$VARDA_SCRATCH")
+VARDA_SCRATCH = os.environ.get("VARDA_SCRATCH") or sys.exit("VARDA_SCRATCH is not set: source tools/env.sh")
 HF = Path(VARDA_SCRATCH) / "hf" / "varda-forecaster-det-sgm"
 
 

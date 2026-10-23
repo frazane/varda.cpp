@@ -1,5 +1,5 @@
 {
- "method": "Per rollout step s (0-based; step s is the s-th model call), contract metric rel_absmax = max|a-r|/max|r| (float64) of: y (the step's physical output (1,1,1,G,72)), y_norm (y*mul_out+add_out in float64: every variable O(1)), window (the physical (1,2,G,84) window step s sees) and window_norm. The references are anemoi-inference rollouts of the original model (reference/run_rollout.py, identical input and forcings): cpu-fp32-pyg (ground truth), cuda-fp32-triton (runner precision '32'), cuda-fp16-triton (runner precision from the checkpoint: fp16 autocast, production). Error grows with the step, so tolerances are per step, with the one-step method of bench/calibrate_tolerances.py: fast-fp32-vs-cpu = max(1e-5, 3 x ref cuda-fp32 vs cpu) (window at step 0 = the input: 1e-6); fast-fp16-vs-cpu = 1.75 x ref cuda-fp16 vs cpu; fast-fp16-vs-ref-fp16 = 2 x ref cuda-fp16 vs ref cuda-fp32 (two independent roundings add); floors 1e-6; rounded up to 2 significant digits. v2 (fp16 keys; v1 kept under 'v1'): one fp16 reference trajectory is not a noise floor for a chaotic rollout (its error vs CPU fluctuates by ~2x from step to step and between equally valid runs). The fp16 tolerances are calibrated on an ensemble of mathematically neutral perturbations of the reference fp16 rollout (listed under 'fp16_ensemble': ANEMOI_INFERENCE_NUM_CHUNKS_* summation grouping, the pyg attention backend, 1-ulp random-sign perturbations of the input): fast-fp16-vs-cpu = 1.75 x max over {reference fp16} + ensemble of rel vs cpu (per step, per key); fast-fp16-vs-ref-fp16 = max(v1 value, 1.75 x max over the ensemble of rel vs the reference fp16 rollout), step 0 kept at the v1 one-step value. A per-step max over a handful of chaotic trajectories is heavy-tailed: valid reference runs exceed the 1.75x envelope of the OTHER runs by up to fp16_leave_one_out's worst ratio, so steps >= 1 allow that factor (fp16_allowance), and the mean over steps (a stable statistic) must stay within 1.75 x the members' largest mean (fp16_mean_tolerance). See fp16_criterion and docs/rollout.md \u00a75.",
+ "method": "Per rollout step s (0-based; step s is the s-th model call), contract metric rel_absmax = max|a-r|/max|r| (float64) of: y (the step's physical output (1,1,1,G,72)), y_norm (y*mul_out+add_out in float64: every variable O(1)), window (the physical (1,2,G,84) window step s sees) and window_norm. The references are anemoi-inference rollouts of the original model (anemoi-inference eaeb36fa's own loop, identical input and forcings): cpu-fp32-pyg (ground truth), cuda-fp32-triton (runner precision '32'), cuda-fp16-triton (runner precision from the checkpoint: fp16 autocast, production). Error grows with the step, so tolerances are per step, with the one-step method of tolerances/<model>.json: fast-fp32-vs-cpu = max(1e-5, 3 x ref cuda-fp32 vs cpu) (window at step 0 = the input: 1e-6); fast-fp16-vs-cpu = 1.75 x ref cuda-fp16 vs cpu; fast-fp16-vs-ref-fp16 = 2 x ref cuda-fp16 vs ref cuda-fp32 (two independent roundings add); floors 1e-6; rounded up to 2 significant digits. v2 (fp16 keys; v1 kept under 'v1'): one fp16 reference trajectory is not a noise floor for a chaotic rollout (its error vs CPU fluctuates by ~2x from step to step and between equally valid runs). The fp16 tolerances are calibrated on an ensemble of mathematically neutral perturbations of the reference fp16 rollout (listed under 'fp16_ensemble': ANEMOI_INFERENCE_NUM_CHUNKS_* summation grouping, the pyg attention backend, 1-ulp random-sign perturbations of the input): fast-fp16-vs-cpu = 1.75 x max over {reference fp16} + ensemble of rel vs cpu (per step, per key); fast-fp16-vs-ref-fp16 = max(v1 value, 1.75 x max over the ensemble of rel vs the reference fp16 rollout), step 0 kept at the v1 one-step value. A per-step max over a handful of chaotic trajectories is heavy-tailed: valid reference runs exceed the 1.75x envelope of the OTHER runs by up to fp16_leave_one_out's worst ratio, so steps >= 1 allow that factor (fp16_allowance), and the mean over steps (a stable statistic) must stay within 1.75 x the members' largest mean (fp16_mean_tolerance). See fp16_criterion and docs/rollout.md \u00a74.",
  "model": "dev",
  "checkpoint": {
   "uuid": "66575e03-027c-4cca-9921-ddb22e81573b",
@@ -548,10 +548,10 @@
   }
  },
  "fp16_ensemble": [
-  "$SCRATCH/the Python project/rollout/v2/ensemble/chunks-mapper-8",
-  "$SCRATCH/the Python project/rollout/v2/ensemble/ulp-seed1",
-  "$SCRATCH/the Python project/rollout/v2/ensemble/ulp-seed2",
-  "$SCRATCH/the Python project/rollout/v2/ensemble/pyg-backend"
+  "$REF_SCRATCH/rollout/v2/ensemble/chunks-mapper-8",
+  "$REF_SCRATCH/rollout/v2/ensemble/ulp-seed1",
+  "$REF_SCRATCH/rollout/v2/ensemble/ulp-seed2",
+  "$REF_SCRATCH/rollout/v2/ensemble/pyg-backend"
  ],
  "fp16_allowance": {
   "fast-fp16-vs-cpu": 1.7,
@@ -578,44 +578,44 @@
     "key": "y",
     "step": 7
    },
-   "$SCRATCH/the Python project/rollout/v2/ensemble/chunks-mapper-8": {
+   "$REF_SCRATCH/rollout/v2/ensemble/chunks-mapper-8": {
     "worst_ratio": 1.340123604673368,
     "key": "y_norm",
     "step": 9
    },
-   "$SCRATCH/the Python project/rollout/v2/ensemble/ulp-seed1": {
+   "$REF_SCRATCH/rollout/v2/ensemble/ulp-seed1": {
     "worst_ratio": 1.6199925400969786,
     "key": "y",
     "step": 18
    },
-   "$SCRATCH/the Python project/rollout/v2/ensemble/ulp-seed2": {
+   "$REF_SCRATCH/rollout/v2/ensemble/ulp-seed2": {
     "worst_ratio": 0.9769951718261858,
     "key": "y",
     "step": 5
    },
-   "$SCRATCH/the Python project/rollout/v2/ensemble/pyg-backend": {
+   "$REF_SCRATCH/rollout/v2/ensemble/pyg-backend": {
     "worst_ratio": 0.8991826920688081,
     "key": "y_norm",
     "step": 19
    }
   },
   "fast-fp16-vs-ref-fp16": {
-   "$SCRATCH/the Python project/rollout/v2/ensemble/chunks-mapper-8": {
+   "$REF_SCRATCH/rollout/v2/ensemble/chunks-mapper-8": {
     "worst_ratio": 1.3907666208815328,
     "key": "y_norm",
     "step": 9
    },
-   "$SCRATCH/the Python project/rollout/v2/ensemble/ulp-seed1": {
+   "$REF_SCRATCH/rollout/v2/ensemble/ulp-seed1": {
     "worst_ratio": 1.8224127372933252,
     "key": "y",
     "step": 18
    },
-   "$SCRATCH/the Python project/rollout/v2/ensemble/ulp-seed2": {
+   "$REF_SCRATCH/rollout/v2/ensemble/ulp-seed2": {
     "worst_ratio": 0.6997034735612092,
     "key": "y_norm",
     "step": 16
    },
-   "$SCRATCH/the Python project/rollout/v2/ensemble/pyg-backend": {
+   "$REF_SCRATCH/rollout/v2/ensemble/pyg-backend": {
     "worst_ratio": 0.7594443786597762,
     "key": "window_norm",
     "step": 8
@@ -624,7 +624,7 @@
  },
  "fp16_criterion": "fp16 checks (v2): step 0: rel <= the per-step tolerance (= the v1 one-step value); steps >= 1: rel <= fp16_allowance x the per-step tolerance; and per key, the mean over steps of rel <= fp16_mean_tolerance. Entries above the per-step tolerance alone are reported (valid runs have them too, see fp16_leave_one_out).",
  "fp16_ensemble_dropped_identical": [
-  "$SCRATCH/the Python project/rollout/v2/ensemble/chunks-processor-4"
+  "$REF_SCRATCH/rollout/v2/ensemble/chunks-processor-4"
  ],
  "reference": {
   "cuda-fp32-vs-cpu": {
@@ -2387,7 +2387,7 @@
   }
  },
  "ensemble": {
-  "$SCRATCH/the Python project/rollout/v2/ensemble/chunks-mapper-8": {
+  "$REF_SCRATCH/rollout/v2/ensemble/chunks-mapper-8": {
    "vs-cpu": {
     "y": [
      6.879960909856883e-06,
@@ -2601,7 +2601,7 @@
     ]
    }
   },
-  "$SCRATCH/the Python project/rollout/v2/ensemble/ulp-seed1": {
+  "$REF_SCRATCH/rollout/v2/ensemble/ulp-seed1": {
    "vs-cpu": {
     "y": [
      6.132139071828961e-06,
@@ -2815,7 +2815,7 @@
     ]
    }
   },
-  "$SCRATCH/the Python project/rollout/v2/ensemble/ulp-seed2": {
+  "$REF_SCRATCH/rollout/v2/ensemble/ulp-seed2": {
    "vs-cpu": {
     "y": [
      7.47821838027922e-06,
@@ -3029,7 +3029,7 @@
     ]
    }
   },
-  "$SCRATCH/the Python project/rollout/v2/ensemble/pyg-backend": {
+  "$REF_SCRATCH/rollout/v2/ensemble/pyg-backend": {
    "vs-cpu": {
     "y": [
      7.1790896450680515e-06,
@@ -3245,8 +3245,8 @@
   }
  },
  "sources": {
-  "cpu-fp32-pyg": "$SCRATCH/the Python project/rollout/ref/cpu-fp32-pyg/rollout.pt",
-  "cuda-fp32-triton": "$SCRATCH/the Python project/rollout/v2/ref/cuda-fp32-triton/rollout.pt",
-  "cuda-fp16-triton": "$SCRATCH/the Python project/rollout/v2/ref/cuda-fp16-triton/rollout.pt"
+  "cpu-fp32-pyg": "$REF_SCRATCH/rollout/ref/cpu-fp32-pyg/rollout.pt",
+  "cuda-fp32-triton": "$REF_SCRATCH/rollout/v2/ref/cuda-fp32-triton/rollout.pt",
+  "cuda-fp16-triton": "$REF_SCRATCH/rollout/v2/ref/cuda-fp16-triton/rollout.pt"
  }
 }

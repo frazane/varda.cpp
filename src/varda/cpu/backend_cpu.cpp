@@ -1,6 +1,6 @@
 // CPU fp32 backend: the readable oracle (docs/cpu.md).
 //
-// predict_step, per docs/format.md §2 and $IE_ROOT/docs/spec-{interface,model}.md:
+// predict_step, per docs/format.md §2 and anemoi's GraphTransformer (docs/cpu.md):
 //   xn     = x * mul[norm_input] + add[norm_input]          two fp32 roundings
 //   x_src  = [xn[t0] | xn[t1] | ... | data attr]             (G, T*V_in + A)
 //   z      = encoder(x_src, hidden attr)                     (H, C)

@@ -1,11 +1,11 @@
 """Reference dynamic forcings from anemoi's own code, for tests/test_forcings.cpp (docs/forcings.md).
 
-    PY=$IE_SCRATCH/venv-ref-varda/bin/python
+    PY=$REF_VENV/bin/python
     $PY -I python/reference/make_forcings_fixture.py [--out $VARDA_SCRATCH/forcings]
 
 Runs `anemoi.inference.forcings.ComputedForcings.load_forcings_array` (anemoi-inference 9505dd0, imported
 from the read-only clone in $VARDA_SCRATCH/src without installing anything) on top of the earthkit-data /
-earthkit-meteo / anemoi-transform installed in the varda reference venv, with the latitudes /
+earthkit-meteo / anemoi-transform installed in the Varda reference venv ($REF_VENV), with the latitudes /
 longitudes anemoi-inference reads from the checkpoint (`load_metadata(..., supporting_arrays=True)`,
 dataset "data"). One file per model: `<out>/<model>.safetensors`, tensor `forcings/<YYYY-MM-DDTHH:MM:SS>`
 F32 [G, 5] (columns in `names` order), metadata `names`, `dates`, `versions`, `checkpoint`. `lat` / `lon`
@@ -23,7 +23,7 @@ import types
 
 import numpy as np
 
-SCRATCH = os.environ.get("VARDA_SCRATCH", "$VARDA_SCRATCH")
+SCRATCH = os.environ.get("VARDA_SCRATCH") or sys.exit("VARDA_SCRATCH is not set: source tools/env.sh")
 AI_SRC = os.path.join(SCRATCH, "src", "anemoi-inference", "src")  # read-only clone at 9505dd0
 sys.path.insert(0, AI_SRC)
 _v = types.ModuleType("anemoi.inference._version")  # generated at install time; absent in a bare clone
@@ -35,8 +35,8 @@ from anemoi.utils.checkpoints import load_metadata  # noqa: E402
 
 NAMES = ["cos_julian_day", "cos_local_time", "insolation", "sin_julian_day", "sin_local_time"]
 MODELS = {
-    "varda": os.path.join(SCRATCH, "hf/varda-forecaster-det-sgm/model.ckpt"),
-    "dev": "$VARDA_DEV_CKPT",
+    "varda": "VARDA_CKPT",  # model name -> environment variable with its checkpoint (tools/env.sh)
+    "dev": "VARDA_DEV_CKPT",
 }
 
 
@@ -49,7 +49,7 @@ def dates_list():
     ]
     t0 = datetime.datetime(2024, 6, 1)
     d += [(t0 + datetime.timedelta(hours=6 * k)).isoformat() for k in range(1, 9)]  # 6-hourly rollout steps
-    d += [(t0 + datetime.timedelta(hours=k)).isoformat() for k in (1, 2, 3)]  # hourly (dev timestep)
+    d += [(t0 + datetime.timedelta(hours=k)).isoformat() for k in (1, 2, 3)]  # hourly (dev-model timestep)
     return list(dict.fromkeys(d))
 
 
@@ -94,7 +94,7 @@ def main():
     print(versions)
     dates = dates_list()
     for model in args.models:
-        ckpt = MODELS[model]
+        ckpt = os.environ.get(MODELS[model]) or sys.exit(f"{MODELS[model]} is not set: source tools/env.sh")
         _, arrays = load_metadata(ckpt, supporting_arrays=True)  # what anemoi-inference's Checkpoint does
         lat, lon = arrays["data"]["latitudes"], arrays["data"]["longitudes"]
         assert lat.dtype == np.float64 and lon.dtype == np.float64 and lat.shape == lon.shape

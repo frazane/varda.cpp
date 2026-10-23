@@ -1,26 +1,26 @@
-# Source this file: toolchain for building and running varda.cpp on this cluster.
+# Source this file: toolchain and paths for building and running varda.cpp.
 #   source tools/env.sh
-# The `module` command does not work in non-interactive shells here, so paths are explicit.
+# Machine-specific values live in tools/env.local.sh (untracked; template: tools/env.local.example.sh),
+# sourced first; this file derives the rest.
 
-_SPACK=/path/to/spack
-export VARDA_GCC=$_SPACK/gcc-11.3.0/gcc-12.3.0-kxhppfcdnri5lftlprcqey5t64bwrd2a
-export CUDA_HOME=$_SPACK/gcc-12.3.0/cuda-12.3.0-ihzk4gm66og3lpwzblphemuxxk7h7a3e
-export OPENBLAS_HOME=$_SPACK/gcc-12.3.0/openblas-0.3.26-qdrpysrppslf56jkquizbvlers2xttal
+_VARDA_ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+if [ ! -f "$_VARDA_ENV_DIR/env.local.sh" ]; then
+    echo "tools/env.sh: $_VARDA_ENV_DIR/env.local.sh is missing: copy tools/env.local.example.sh to" \
+         "tools/env.local.sh and fill in this machine's paths" >&2
+    unset _VARDA_ENV_DIR
+    return 1 2>/dev/null || exit 1
+fi
+# shellcheck disable=SC1091
+. "$_VARDA_ENV_DIR/env.local.sh"
+unset _VARDA_ENV_DIR
 
-export PATH=$CUDA_HOME/bin:$VARDA_GCC/bin:$PATH
-export CC=$VARDA_GCC/bin/gcc
-export CXX=$VARDA_GCC/bin/g++
-export CUDAHOSTCXX=$CXX
-export CMAKE_PREFIX_PATH=$OPENBLAS_HOME${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}
-
-# Large artefacts live on scratch, never in the repository.
-export VARDA_SCRATCH=$VARDA_SCRATCH
-# Python engine project (read-only here): golden data, reference venvs, its own engine.
-export IE_ROOT=$HOME/projects/the Python project
-export IE_SCRATCH=$SCRATCH/the Python project
-# ecCodes for the GRIB layer: the eccodeslib/eckitlib wheels of the reference env
-# (python/reference/realdata), copied so a venv rebuild cannot change them, plus the COSMO
-# definitions that KENDA-CH1 GRIB needs (same as the reference's ECCODES_DEFINITION_PATH).
-export ECCODES_HOME=$VARDA_SCRATCH/deps/eccodes-2.47.3.21
-export VARDA_COSMO_DEFINITIONS=$VARDA_SCRATCH/deps/eccodes-cosmo-resources-2.44.0.1/definitions
-unset _SPACK
+if [ -n "${CUDA_HOME:-}" ]; then export PATH="$CUDA_HOME/bin:$PATH"; fi
+if [ -n "${VARDA_GCC:-}" ]; then
+    export PATH="$VARDA_GCC/bin:$PATH"
+    export CC="$VARDA_GCC/bin/gcc"
+    export CXX="$VARDA_GCC/bin/g++"
+    export CUDAHOSTCXX="$CXX"
+fi
+if [ -n "${OPENBLAS_HOME:-}" ]; then
+    export CMAKE_PREFIX_PATH="$OPENBLAS_HOME${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+fi

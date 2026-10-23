@@ -11,14 +11,14 @@
 
 namespace varda::cuda {
 
-// ---------------------------------------------------------------- normaliser (spec-interface §2.3)
+// ---------------------------------------------------------------- normaliser
 
 // xn[i] = (x[i] * mul[v]) + add[v], two separately rounded fp32 ops; v = i % V.
 void normalise(const float* x, const float* mul, const float* add, float* xn, int64_t n, int V, cudaStream_t s);
 // y[i] = (yn[i] - add[v]) / mul[v], separately rounded (IEEE division); v = i % V.
 void denormalise(const float* yn, const float* add, const float* mul, float* y, int64_t n, int V, cudaStream_t s);
 
-// ---------------------------------------------------------------- input assembly (spec-model §1.1)
+// ---------------------------------------------------------------- input assembly
 
 // out[g, t*V + v] = xn[t, g, v]; out[g, T*V + a] = attr[g, a]; out[g, F..ld) = 0, F = T*V + A.
 template <class T>
@@ -52,7 +52,7 @@ void add_layernorm(const T* y, const T* r1, T* out1, const T* r2, T* out2, const
 template <class T>
 void gelu_inplace(T* x, int64_t n, bool tanh_approx, cudaStream_t s);
 
-// ---------------------------------------------------------------- graph attention (spec-model §3)
+// ---------------------------------------------------------------- graph attention
 
 // Destination-sorted graph on the device. edges[slot] = {a0, a1, a2, bitcast(src)} for CSR slot
 // `slot` (graph.h order), attributes zero-padded to 3.
@@ -83,7 +83,7 @@ struct AttentionArgs {
 template <class T>
 void attention(const AttentionArgs& a, cudaStream_t s, int vpl = 1);
 
-// ---------------------------------------------------------------- output (spec-interface §4)
+// ---------------------------------------------------------------- output
 
 struct BoundingDev {
     int type = 0;           // 0 relu, 1 hardtanh, 2 fraction

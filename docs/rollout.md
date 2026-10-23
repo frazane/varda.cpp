@@ -1,23 +1,22 @@
 # Rollout: reference runs of the original model (Varda), tolerances, exported files
 
-What the C++ rollout loop is verified against. Semantics of anemoi-inference's loop, the verification setup and the
-fp16 ensemble tolerance method (v2) are specified in the Python project: `$IE_ROOT/docs/rollout.md` (§1 semantics,
-§4 setup, §5.3 method). This file records only what is specific to Varda (= the `varda` checkpoint, 1 688 650
-data nodes, 79 inputs, 67 outputs, 66 prognostic, 6-hourly) and to this repository.
+What the C++ rollout loop is verified against: the original model driven by anemoi-inference's own loop. Semantics of
+the loop: `docs/rollout-engine.md` §1; fp16 ensemble tolerance method (v2): §4 here and the `method` field of the
+tolerance file. Varda = the Hugging Face forecaster checkpoint (1 688 650 data nodes, 79 inputs, 67 outputs, 66 prognostic,
+6-hourly).
 
-Scripts (copied from `$IE_ROOT` at commit `aada999`, then adapted): `python/reference/run_rollout.py`,
-`run_reference.py`, `compare_golden.py`; new: `export_rollout.py`. Lock: `python/reference/requirements-ref-varda.lock.txt`.
+Scripts: `python/reference/run_rollout.py`, `run_reference.py`, `compare_golden.py`, `export_rollout.py`. Lock: `python/reference/requirements-ref-varda.lock.txt`.
 Everything runs in `$VARDA_SCRATCH/venv-ref-varda`; outputs are under `$VARDA_SCRATCH/rollout/` (`ref/`, `ensemble/`,
-`forcings/`, `jobs/` with job scripts, logs and `exit_code` files).
+`forcings/`, and the job scripts, logs and `exit_code` files).
 
 ## 1. Environment
 
 Recipe (also in the header of `python/reference/run_reference.py`):
 
-1. `uv venv --python ~/.local/bin/python3.12 $VARDA_SCRATCH/venv-ref-varda`.
+1. `uv venv --python <python3.12> $VARDA_SCRATCH/venv-ref-varda`.
 2. `torch==2.10.0+cu130` and `torchvision==0.25.0+cu130` from `https://download.pytorch.org/whl/cu130` alone
    (`--index-url`, never combined with a PyPI extra index).
-3. The rest of the Python project's varda lock (`$IE_ROOT/reference/requirements-ref-varda.lock.txt` minus
+3. The rest of the Varda reference lock (`$REF_LOCK`, the lock of the reference venv `$REF_VENV`, minus
    the two torch lines) from PyPI and the lock's git pins, with a constraints file keeping torch fixed. `uv pip freeze`
    afterwards is **identical** to that lock (diff empty).
 4. anemoi-inference at `9505dd0926ec3c5dea9308813cc7859bfdad755a` (the commit the Hugging Face release pins in
@@ -35,16 +34,15 @@ Freeze diff (before step 4 -> after), complete:
 | added | - | anytree 2.13.0, astropy 8.0.2, astropy-iers-data, healpy 1.20.1, peekle 0.0.5, pydantic-settings 2.16.1, pyerfa 2.0.1.5, termcolor 3.3.0, tzdata 2026.5, wcwidth 0.9.3 | new dependencies of inference and transform |
 
 torch (2.10.0+cu130), torchvision, triton 3.6.0, numpy, torch_geometric, anemoi-models/graphs/training/datasets
-(the varda pins `3c5fc21` / `00396bb4`) did not change. `uv pip check`: compatible. Attempt 1 (everything
+(the reference lock's pins `3c5fc21` / `00396bb4`) did not change. `uv pip check`: compatible. Attempt 1 (everything
 pinned) fails to resolve on anemoi-utils; attempt 2 (only anemoi-utils free) installs but fails at the first call, hence
 the third pin set above. The model forward does not import anything that moved: the 2-step CPU smoke run reproduces
-the Python project's golden one-step output bitwise (§3).
+the reference golden one-step output bitwise (§3).
 
-## 2. anemoi-inference 9505dd09 against eaeb36fa (the Python project's pin)
+## 2. anemoi-inference 9505dd09 against eaeb36fa (the version of the dev model's reference rollouts)
 
 `eaeb36fa` is an ancestor of `9505dd09` (36 commits; clones in `$VARDA_SCRATCH/src/anemoi-inference` at 9505dd09
-and `$VARDA_SCRATCH/src/ai-eaeb36fa`; `git diff eaeb36fa 9505dd09 -- src`). In the files the Python
-project's `docs/rollout.md` §1 cites:
+and `$VARDA_SCRATCH/src/ai-eaeb36fa`; `git diff eaeb36fa 9505dd09 -- src`). In the files that define the loop:
 
 - **`runner.py` forecast loop.**
   - The lead time is now `ceil(lead_time / checkpoint.rollout_shift)` steps (before: `timestep * multi_step_output`).
@@ -78,11 +76,11 @@ project's `docs/rollout.md` §1 cites:
   (6 h steps). Dates follow the runner: the forcings are for `start + 6 h, start + 12 h, ...` (23 dates for 24 steps).
 
 No difference in the numerics of the loop was found for this model. The check is empirical too: step 0 of our CPU run
-is bitwise the Python project's golden `output.pt` (§3).
+is bitwise the reference golden `output.pt` (§3).
 
 ## 3. Reference rollouts
 
-Input: the Python project's golden one-step input (`$IE_SCRATCH/golden/varda/cpu_float32_pyg/input.pt`, shape
+Input: the reference golden one-step input (anemoi, read-only: `$REF_GOLDEN/cpu_float32_pyg/input.pt`, shape
 `(1, 2, 1688650, 79)`), the newest slot dated 2024-06-01T00:00:00 UTC, 24 steps (6 days, outputs dated
 06-01T06:00 .. 06-07T00:00). A step is one model call; step 0 sees the input.
 
@@ -94,34 +92,33 @@ starts and takes 94 minutes. Every real run **replays** them and, at each call, 
 ComputedForcings"; 23 calls on CPU, 46 with `--runs 2`). So the CPU run and every GPU run saw identical forcings
 and these are the runner's own.
 
-| tag (dir) | steps | device / precision / backend | runtime | job id |
+| tag (dir) | steps | device / precision / backend | runtime | node |
 |---|---|---|---|---|
-| `ref/cpu-fp32-pyg` | 24 | CPU (EPYC node <node>), 64 threads, fp32 (runner precision "32": autocast disabled), pyg | 5362 s rollout (223 s/step), 5535 s with load; peak RSS 104 GB | 283398 (cpu-long, 300G) |
-| `ref/cuda-fp32-triton` | 24 x 2 runs | A100-SXM4-80G, fp32 (TF32 off), triton | 223.7 s and 204.2 s (9.3 / 8.5 s per step); peak RSS 98 GB; CUDA peak 36.2 GB | 283399 |
-| `ref/cuda-fp16-triton` | 24 x 2 runs | A100, runner precision = checkpoint = "16-mixed" (fp16 autocast), triton | 48.1 s and 42.8 s (2.0 / 1.8 s per step); RSS 98 GB; CUDA 23.4 GB | 283400 |
-| `ensemble/chunks-mapper-8` | 24 | A100, fp16, triton, `ANEMOI_INFERENCE_NUM_CHUNKS_MAPPER=8` | 47.8 s | 283401 |
-| `ensemble/chunks-processor-4` | 24 | same, `..._PROCESSOR=4` | 63.7 s | 283402 |
-| `ensemble/ulp-seed1` | 24 | fp16 triton, input moved by 1 fp32 ulp, random signs, seed 1 | 46.6 s | 283403 |
-| `ensemble/ulp-seed2` | 24 | same, seed 2 | 47.1 s | 283404 |
-| `ensemble/pyg-backend` | 24 | fp16, **pyg** backend on the GPU (scatter atomics) | 76.0 s; CUDA 41.6 GB | 283405 |
+| `ref/cpu-fp32-pyg` | 24 | CPU (EPYC 7713), 64 threads, fp32 (runner precision "32": autocast disabled), pyg | 5362 s rollout (223 s/step), 5535 s with load; peak RSS 104 GB | CPU node, 300 GB |
+| `ref/cuda-fp32-triton` | 24 x 2 runs | A100-SXM4-80G, fp32 (TF32 off), triton | 223.7 s and 204.2 s (9.3 / 8.5 s per step); peak RSS 98 GB; CUDA peak 36.2 GB | GPU node |
+| `ref/cuda-fp16-triton` | 24 x 2 runs | A100, runner precision = checkpoint = "16-mixed" (fp16 autocast), triton | 48.1 s and 42.8 s (2.0 / 1.8 s per step); RSS 98 GB; CUDA 23.4 GB | GPU node |
+| `ensemble/chunks-mapper-8` | 24 | A100, fp16, triton, `ANEMOI_INFERENCE_NUM_CHUNKS_MAPPER=8` | 47.8 s | GPU node |
+| `ensemble/chunks-processor-4` | 24 | same, `..._PROCESSOR=4` | 63.7 s | GPU node |
+| `ensemble/ulp-seed1` | 24 | fp16 triton, input moved by 1 fp32 ulp, random signs, seed 1 | 46.6 s | GPU node |
+| `ensemble/ulp-seed2` | 24 | same, seed 2 | 47.1 s | GPU node |
+| `ensemble/pyg-backend` | 24 | fp16, **pyg** backend on the GPU (scatter atomics) | 76.0 s; CUDA 41.6 GB | GPU node |
 
 The `ensemble/` rollouts (357 GB) were deleted on 2026-10-23 after calibration; the tolerances derived from them are
 committed (`tolerances/rollout/varda.json`, method below), and the commands above regenerate them.
 
-GPU jobs: `-p gpu-short --gres=gpu:1 -c 16 --mem=200G` (peak RSS 98 GB with `--runs 2`, 64 GB with one run: the hooks
-keep the 24 windows, 25.6 GB, and the outputs, 10.9 GB, on the host). Smoke tests first: 2 steps CPU (job 283286, 252 s/step)
-and 2 steps fp16 GPU with `--runs 2` (283287). Logs, `exit_code` files and the job scripts are in
-`$VARDA_SCRATCH/rollout/jobs/<name>/`; every job exited 0.
+Each run is one job. GPU jobs: `--gres=gpu:1 -c 16 --mem=200G` (peak RSS 98 GB with `--runs 2`, 64 GB with one run: the hooks
+keep the 24 windows, 25.6 GB, and the outputs, 10.9 GB, on the host). Smoke tests first: 2 steps CPU (252 s/step)
+and 2 steps fp16 GPU with `--runs 2`. Every job exited 0.
 
 **Checks.**
-- Step 0 `y` of the CPU run is **bitwise** equal to the Python project's golden `cpu_float32_pyg/output.pt`
+- Step 0 `y` of the CPU run is **bitwise** equal to the reference golden `cpu_float32_pyg/output.pt`
   (max_abs 0; smoke run, 2 steps) and `window[0]` equals the input bitwise: the new venv (anemoi-utils/transform/pandas
   moved, anemoi-inference 9505dd09) reproduces the old golden data.
 - `--runs 2` bitwise: **yes** for `cuda-fp32-triton` (y and window, all 24 steps) and `cuda-fp16-triton` (y and window,
   all 24 steps). Asserted in the script.
 - The two chunk-env fp16 runs (mapper 8, processor 4) are **bitwise identical** to the reference fp16 run, hence not
-  perturbations; dropped from the ensemble (recorded in `fp16_ensemble_dropped_identical`), as for dev's
-  processor-4 run. (On dev the mapper-8 run differed; on Varda it does not. No explanation was investigated.)
+  perturbations; dropped from the ensemble (recorded in `fp16_ensemble_dropped_identical`), as for the dev model's
+  processor-4 run. (On the dev model the mapper-8 run differed; on Varda it does not. No explanation was investigated.)
 - All outputs finite.
 
 ### Per-step spreads (`rel_absmax`, contract metric `max|a-r|/max|r|` in float64, reference = `ref/cpu-fp32-pyg`)
@@ -149,20 +146,20 @@ ulp-seed1 0.0039 / 0.0035 / 0.0052 / 0.0038 / 0.0029 / 0.0067; ulp-seed2 0.0029 
 0.0060; pyg-backend 0.0028 / 0.0031 / 0.0030 / 0.0039 / 0.0032 / 0.0071. `y` at step 23: 1.59e-4, 1.68e-4, 1.64e-4.
 Against the reference fp16 run (`y_norm`): 0.0031-0.0080 at step 4..23. So independent fp16 runs decorrelate to the level of
 the fp16-vs-CPU distance already at step 0: the fp16 trajectories do not track each other bit-closely, as found on
-dev, but over 24 six-hourly steps Varda's growth is slow (y_norm roughly doubles, 3.5e-3 -> 8.7e-3 for the reference fp16 run).
+the dev model, but over 24 six-hourly steps Varda's growth is slow (y_norm roughly doubles, 3.5e-3 -> 8.7e-3 for the reference fp16 run).
 
 ## 4. Tolerances: `tolerances/rollout/varda.json`
 
 Written by `run_rollout.py --calibrate ref/cpu-fp32-pyg ref/cuda-fp32-triton ref/cuda-fp16-triton --fp16-ensemble
-ensemble/{chunks-mapper-8,chunks-processor-4,ulp-seed1,ulp-seed2,pyg-backend}` (job 283660, `jobs/calib/`), keyed by the
+ensemble/{chunks-mapper-8,chunks-processor-4,ulp-seed1,ulp-seed2,pyg-backend}` (one CPU job), keyed by the
 checkpoint identity (uuid `e8c577ed-806e-47c5-b257-72c5edcf4cb5`, run id `98d4e297...`, sha256 `1ad7a7a6...a9c7d8`, taken from
-the HF file; the varda file has the same sha256). Method exactly as `$IE_ROOT/docs/rollout.md` §5.3: 24 steps, keys
+the HF file). Method (the file's `method`, as for the dev model): 24 steps, keys
 `y, y_norm, window, window_norm`, tables `fast-fp32-vs-cpu`, `fast-fp16-vs-cpu`, `fast-fp16-vs-ref-fp16`,
 `fp16_allowance`, `fp16_mean_tolerance`, `fp16_leave_one_out`, `fp16_criterion`; floors 1e-6 (exact) and 1e-5 (fp32);
 the fp16 ones are 1.75 x the envelope of {reference fp16 + members}; step 0 is the strict one-step value. Differences
-from dev's file: (a) the ensemble has **3** members, not 4 (the two chunk-env runs are bitwise the reference);
+from the dev model's file: (a) the ensemble has **3** members, not 4 (the two chunk-env runs are bitwise the reference);
 (b) the leave-one-out worst ratio is 0.74-0.96 (< 1) for both families, so `fp16_allowance` is the floor **1.0** for both
-(no leniency was needed; dev had 1.7 / 1.9) and `fp16_mean_tolerance` is the per-key mean bound
+(no leniency was needed; the dev model had 1.7 / 1.9) and `fp16_mean_tolerance` is the per-key mean bound
 (vs CPU: y 1.8e-4, y_norm 8.1e-3, window 1.7e-4, window_norm 7.2e-3). Note the envelope rests on only 4 runs
 (reference + 3) vs CPU and 3 vs the reference fp16, so it is thin: treat the factor 1.75 as the only safety margin.
 
@@ -179,12 +176,12 @@ Selected values (steps 0 / 1 / 4 / 8 / 12 / 16 / 20 / 23):
 
 `--check`: `run_rollout.py --calibrate ... --check tolerances/rollout/varda.json` recomputes into a temporary file
 (`$VARDA_SCRATCH/rollout/ref/tolerances-check-varda.json`) and exits 1 unless `steps, keys, fast-fp32-vs-cpu, fast-fp16-vs-cpu, fast-fp16-vs-ref-fp16,
-fp16_allowance, fp16_mean_tolerance` are equal. Result (job 283660): **reproduces the committed file exactly** (exit 0), all 24 steps. (The original script compared the file with itself when
+fp16_allowance, fp16_mean_tolerance` are equal. Result (the calibration job): **reproduces the committed file exactly** (exit 0), all 24 steps. (An earlier version compared the file with itself when
 `--check` was given without `--tolerances`; fixed.)
 
 ## 5. Files
 
-Per reference rollout directory `D` (`ref/<tag>` or `ensemble/<tag>`): `rollout.pt` (torch; as the Python project's),
+Per reference rollout directory `D` (`ref/<tag>` or `ensemble/<tag>`): `rollout.pt` (torch),
 `manifest.json` (command, job id, device, versions, determinism, timings), `rollout.safetensors` (below). `forcings/forcings.pt`
 holds the 23 forcing arrays. All are float32 unless stated.
 
@@ -217,8 +214,8 @@ a single reference trajectory without the ensemble tolerance.
 ## 6. Surprising / to know
 
 - 223 s per CPU step (the brief's ~200 s). The 24-step CPU reference fits in 94 min, so tolerances cover all 24 steps.
-- `anemoi-inference` at the HF pin does not run with the varda lock: anemoi-utils, anemoi-transform and pandas
+- `anemoi-inference` at the HF pin does not run with the Varda reference lock: anemoi-utils, anemoi-transform and pandas
   must move (§1). The anemoi-inference pin alone says `anemoi-transform>0.1.13`, which is wrong in practice.
 - The fp32 GPU rollout's `y_norm` spread (up to 2.8e-5) is above the 1e-5 one-step number: the tolerance table has it
-  (3 x spread), as for dev.
+  (3 x spread), as for the dev model.
 - The fp16 ensemble tolerance needed no leniency here (allowance 1.0); with 3 members its margin is statistical, not proven.

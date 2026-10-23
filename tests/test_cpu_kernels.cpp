@@ -145,7 +145,7 @@ void test_gelu() {
     }
 }
 
-// Naive double-precision attention over the stored edge list (no CSR), per docs/spec-model.md §3.
+// Naive double-precision attention over the stored edge list (no CSR).
 std::vector<double> naive_attention(const std::vector<int64_t>& src, const std::vector<int64_t>& dst,
                                     const std::vector<float>& attr, int64_t A, int64_t n_dst,
                                     const std::vector<float>& q, const std::vector<float>& k,

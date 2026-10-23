@@ -1,9 +1,9 @@
 # Design
 
 varda.cpp re-implements the inference of an anemoi GraphTransformer encoder–processor–decoder
-(the Varda forecaster; dev as a smaller sibling) in C++17/CUDA, from the checkpoint
-alone, following the methodology of the Python project (`$IE_ROOT/docs/methodology.md`). This
-file is the map; each part has its own document with the details and numbers.
+(the Varda forecaster; and the *dev model*, a smaller, non-public checkpoint of the same
+architecture used for fast iteration, for which any small anemoi GraphTransformer checkpoint
+serves) in C++17/CUDA, from the checkpoint alone, verified against the original anemoi model at every stage. This file is the map; each part has its own document with the details and numbers.
 
 ## 1. Pipeline
 
@@ -11,7 +11,7 @@ file is the map; each part has its own document with the details and numbers.
 model.ckpt (pickled anemoi interface, HF)
    │  python/convert.py: restricted unpickler, strict accounting, no foreign code runs
    ▼
-model.safetensors  ── weights (bitwise = Python engine's weights.pt) + config JSON
+model.safetensors  ── weights (bitwise = reference weights.pt) + config JSON
    │                  + grid.latitudes/longitudes (F64) + forcings section     docs/format.md
    │  Model::load: mmap, strict take() of every tensor, Config validation
    ▼
@@ -42,8 +42,8 @@ Tests: `docs/testing.md`.
 
 - **One file, a standard container.** safetensors, with the config embedded as metadata, so
   the file is readable by other tools and mmap-able with no parser beyond a JSON header.
-  Tensor names, shapes and bytes equal the Python engine's converted weights, which made the
-  converter verifiable by `sha256` and let the C++ work start before the converter existed.
+  Tensor names, shapes and bytes equal an independent export of the weights (`weights.pt`),
+  which made the converter verifiable by `sha256` and let the C++ work start before the converter existed.
 - **Everything from the config.** Sizes, index lists, eps, GELU variant, bounding, residual
   step, forcing sets and timestep are read from the checkpoint by the converter; the engine
   holds no model literal and rejects unknown kinds at load. Strict loading (every tensor
@@ -51,9 +51,9 @@ Tests: `docs/testing.md`.
   checkpoints' dimension envelope, against an independent float64 reference) guards this.
 - **CPU path = readable oracle.** pyg-exact op order (max subtraction, `+1e-16`, CSR order of
   sums), double moments in LayerNorm, fixed GEMM tiles so the bits do not depend on the thread
-  count. Varda takes 60 s on 64 cores, against ~200 s for the original as measured by the Python
-  project (same node type, not the same job).
-- **CUDA path = fast path, same contract.** Fused `[q|k|v|self]` GEMMs, the static edge
+  count. Varda takes 60 s on 64 cores, against ~200 s for the original (same node type, measured
+  separately, not the same job).
+- **CUDA path = the fast one, same contract.** Fused `[q|k|v|self]` GEMMs, the static edge
   projection folded into the attention (no per-edge tensor), fp32 online softmax, residuals
   fused into the next LayerNorm while keeping the reference's separate fp16 roundings,
   decoder destination chunks, all buffers planned at load, one cuBLASLt plan per shape, one
@@ -69,7 +69,7 @@ Tests: `docs/testing.md`.
 
 | what | reference | criterion |
 |---|---|---|
-| converter | Python engine's `weights.pt`/`config.json` | bitwise |
+| converter | independent weight export (`weights.pt`/`config.json`) | bitwise |
 | one step, 30 activations | original anemoi model's golden dumps (CPU fp32 pyg, CUDA fp32/fp16 triton) | calibrated tolerances, `tolerances/<model>.json` |
 | generality | float64 numpy reference on 6 synthetic models | 1e-5 (fp32), 3e-3 (fp16) |
 | forcings | anemoi-inference's own `ComputedForcings` and the forcings recorded in reference rollouts | bitwise |
@@ -79,18 +79,17 @@ Tests: `docs/testing.md`.
 | real-data rollout | the original driven by anemoi-inference, fp16 and fp32 | per-step tolerances (fp16 `fast-fp16-vs-ref-fp16`), fp32 reported |
 | internal | hook vs no hook, graph vs eager, device loop vs host loop, computed vs replayed forcings, thread counts | bitwise |
 
-## 4. Methodology additions (from porting to C++/CUDA)
+## 4. Methodology
 
-Generic lessons this port added to the Python project's playbook. Details and measurements
-are in the linked documents.
+Generic lessons from this project. Details and measurements are in the linked documents.
 
 **Process**
-- **Reuse the previous port's artefacts by identity, not by name.** Hashing the Hugging Face
-  checkpoint showed it was byte-identical to a model already studied, which turned weeks of
-  ground-truth work (golden dumps, tolerances, reference venvs) into a lookup. Pair every
-  artefact by checkpoint uuid, and refuse unpaired comparisons.
-- **Bootstrap the new format from the old engine's converted weights.** A 30-line repack gave
-  both C++ backends real files on day one. The real converter then had a bitwise target.
+- **Pair artefacts by identity, not by name.** Hashing the Hugging Face checkpoint showed it
+  byte-identical to a checkpoint for which reference data already existed, so that data
+  (golden dumps, tolerances, reference venvs) applies unchanged. Pair every artefact by
+  checkpoint uuid, and refuse unpaired comparisons.
+- **Bootstrap the format from an existing weight export.** A 30-line repack of `weights.pt`
+  gave both C++ backends real files on day one. The real converter then had a bitwise target.
 - **Fix the contracts and write the harness before spawning parallel work.** The format, the
   public API, the activation keys and a parity harness that only uses the public API let the
   CPU and GPU backends be built and verified independently, against the same golden files.
@@ -102,7 +101,7 @@ are in the linked documents.
   wrong shapes.
 
 **CPU**
-- **Know your BLAS.** The cluster's OpenBLAS was a serial build that silently ignores thread
+- **Know your BLAS.** The site-provided OpenBLAS was a serial build that silently ignores thread
   settings. All parallelism had to come from OpenMP over GEMM tiles.
 - **A GEMM's bits depend on its call shape.** Fixed tiles make an oracle bitwise invariant to
   the thread count, which turns "is this difference a bug?" into a yes/no question.

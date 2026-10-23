@@ -1,4 +1,4 @@
-# uv pip freeze of $VARDA_SCRATCH/venv-ref-varda. = the varda lock ($IE_ROOT/reference/requirements-ref-varda.lock.txt) + anemoi-inference 9505dd09.
+# uv pip freeze of $VARDA_SCRATCH/venv-ref-varda. = the Varda reference lock ($REF_LOCK) + anemoi-inference 9505dd09.
 # Moved vs that lock: anemoi-utils 0.5.1->0.5.14 (inference needs >=0.5.13), anemoi-transform 0.1.26->0.4.2 (Variable.units, HF pin >=0.4.2), pandas 3.0.6->2.3.3 (transform<->pandas<3).
 # Added: anemoi-inference, anytree, astropy, astropy-iers-data, healpy, peekle, pydantic-settings, pyerfa, termcolor, tzdata, wcwidth. torch 2.10.0+cu130 unchanged.
 aiohappyeyeballs==2.7.1

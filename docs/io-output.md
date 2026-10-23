@@ -115,11 +115,11 @@ The reference run (`docs/realdata-reference.md`, `$VARDA_SCRATCH/realdata/202610
 (`accumulate_into` + `rescale` on the dumped state) bitwise equal to the reference's processed tp (C3). The
 output is compared with `varda-grib-compare OUT/outputs REF/outputs --require-bytes`.
 
-| job | what | result |
+| run | what | result |
 |---|---|---|
-| 285346 (cpu-short, 32 cores, 200 G) | `ref-fp16` dumps -> `realdata/20261022T15/cpp-encoder-ref-fp16/outputs` vs `ref-fp16/outputs` | 10 files, 676 messages (70 + 4 x 67, lam and global), 0 failing; **message bytes equal 676 / 676, values bitwise 676 / 676, key mismatches 0**; tp C3 checks bitwise at steps 1-4, `y == state.pre` bitwise; 72 s total, 3.2 s per step (both files) |
-| 285350 (cpu-short) | the same for `ref-fp32` | 10 files, 676 messages, **bytes equal 676 / 676**, values bitwise 676 / 676, 0 key mismatches; C3 bitwise |
-| 285350 | negative control: encoder output of the fp16 dumps vs the `ref-fp32` outputs | exit 1 as it must: step 0 files identical (140 messages), the 536 step messages differ (6395 key mismatches, mostly the value statistics `average`/`kurtosis`), worst `max_abs` 14.06, `rel_absmax` 1.09e-2 |
+| CPU node, 32 cores, 200 GB | `ref-fp16` dumps -> `realdata/20261022T15/cpp-encoder-ref-fp16/outputs` vs `ref-fp16/outputs` | 10 files, 676 messages (70 + 4 x 67, lam and global), 0 failing; **message bytes equal 676 / 676, values bitwise 676 / 676, key mismatches 0**; tp C3 checks bitwise at steps 1-4, `y == state.pre` bitwise; 72 s total, 3.2 s per step (both files) |
+| same configuration, separate run | the same for `ref-fp32` | 10 files, 676 messages, **bytes equal 676 / 676**, values bitwise 676 / 676, 0 key mismatches; C3 bitwise |
+| same run as the `ref-fp32` row | negative control: encoder output of the fp16 dumps vs the `ref-fp32` outputs | exit 1 as it must: step 0 files identical (140 messages), the 536 step messages differ (6395 key mismatches, mostly the value statistics `average`/`kurtosis`), worst `max_abs` 14.06, `rel_absmax` 1.09e-2 |
 
 The encoder outputs `realdata/20261022T15/cpp-encoder-ref-{fp16,fp32}/` were deleted on 2026-10-23; `varda-grib-write`
 regenerates them in about a minute (command above).
@@ -145,8 +145,9 @@ source tools/env.sh
 cmake -S . -B build-out && cmake --build build-out -j 32
 $VARDA_SCRATCH/ref-oper/.venv/bin/python -I python/export_io_config.py
 build-out/test_io_output
-sbatch $VARDA_SCRATCH/jobs/io-output-encoder/run.sh ref-fp16      # binaries are copied to bin/ first
 ```
+Then the encoder-only run of section 4 on a compute node (`srun $VARDA_SLURM_CPU`; a job copies the binaries first):
+`varda-grib-write` and `varda-grib-compare --require-bytes` as in `docs/testing.md` section 5.3.
 
 ## 6. Requests to the integrator
 

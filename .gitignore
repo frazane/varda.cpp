@@ -3,3 +3,7 @@ build*/
 __pycache__/
 *.pyc
 varda-out/
+tools/env.local.sh
+CLAUDE.local.md
+.claude/
+local/

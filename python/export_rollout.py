@@ -1,4 +1,4 @@
-"""Export a reference rollout of the Python project ($IE_ROOT: reference/run_rollout.py, rollout.pt +
+"""Export a dev-model reference rollout (anemoi-inference, read-only under $REF_SCRATCH/rollout: rollout.pt +
 manifest.json [+ forcings.pt]) to the varda.cpp rollout file read by apps/varda-rollout.
 
     .venv/bin/python -I python/export_rollout.py ROLLOUT_DIR OUT.safetensors --model CONVERTED.safetensors [--verify]
@@ -11,7 +11,7 @@ Layout: the same as python/reference/export_rollout.py (the Varda references), s
     __metadata__: varda_rollout "1", tag, steps, start_date (date of the newest input slot x0[1]), timestep,
     dates (JSON), forcing_vars, in_vars, out_vars, kept_vars (JSON), run (JSON), plus checkpoint_uuid.
 
-The Python project's rollout.pt has no variable names; they come from the converted model's config (--model; the
+The reference rollout.pt has no variable names; they come from the converted model's config (--model; the
 manifest's checkpoint must be the one the model was converted from: compared by path and, through the tolerances, by
 uuid). If ROLLOUT_DIR has a forcings.pt (the recorded ComputedForcings), it must equal rollout.pt's forcings bitwise.
 Needs torch + numpy (.venv). Output written atomically (python/safetensors_io.py).
@@ -81,7 +81,7 @@ def main() -> int:
         "tag": a.tag or d.name,
         "steps": str(n),
         "start_date": man["start_date"],
-        "timestep": "",  # not recorded by the Python project; the model's forcings.timestep_hours applies
+        "timestep": "",  # not recorded by the reference; the model's forcings.timestep_hours applies
         "dates": json.dumps(dates),
         "forcing_vars": json.dumps(list(r["forcing_vars"])),
         "in_vars": json.dumps(in_vars),

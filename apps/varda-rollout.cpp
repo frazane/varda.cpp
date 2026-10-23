@@ -21,7 +21,7 @@
 //
 // --compare REF (file, or a directory holding rollout.safetensors): per step s, the contract metric
 // (docs/format.md §2) of y (the step's physical output), y_norm (y * mul_out + add_out, float64), window
-// (the window step s sees) and window_norm, as in $IE_ROOT/tests/test_rollout_gpu.py. The table of the
+// (the window step s sees) and window_norm (docs/rollout-engine.md §4). The table of the
 // rollout tolerance file (tolerances/rollout/<model>.json, found by checkpoint uuid, or --tolerances) is
 // chosen from the reference tag and this run's precision:
 //     cpu-fp32-*   fp32: fast-fp32-vs-cpu     fp16: fast-fp16-vs-cpu

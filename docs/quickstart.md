@@ -1,6 +1,6 @@
 # Quick start: a Varda forecast from real data
 
-Three commands, on this cluster:
+Three commands, on a Slurm GPU cluster once `tools/env.local.sh` is set up (section 4):
 
 ```
 source tools/env.sh                 # optional: ./varda sources it itself
@@ -28,20 +28,20 @@ before it leaves the open-data servers).
 ## 1. What each command does
 
 **`./varda setup`**
-1. Builds `build/` with CMake (CUDA and GRIB on; about a minute on the login node), unless `build/varda-forecast` exists
+1. Builds `build/` with CMake (CUDA and GRIB on; about a minute on a login node), unless `build/varda-forecast` exists
    (`./varda setup --rebuild` forces it). The log is `build/varda-build.log`.
 2. Checks the assets bundle against its manifest (sha256 of every file, about a minute). If there is no bundle, it
-   assembles one from the verified files already on this cluster (`tools/make_assets.py link`: hard links, each
-   file's sha256 checked against its source, a few minutes); elsewhere it says how to build one from scratch
+   assembles one from the verified files already under `$VARDA_SCRATCH` (`tools/make_assets.py link`: hard links,
+   each file's sha256 checked against its source, a few minutes); without them it says how to build one from scratch
    (section 4).
 
 **`./varda forecast DATE`**
-1. On the current node (the login node has network): finds the date's input directory in the input cache, or
+1. On the current node (on a cluster, the login node usually has network): finds the date's input directory in the input cache, or
    downloads it (`python/fetch_inputs.py`, section 2). `latest` asks the STAC API which date that is.
 2. Copies `build/varda-forecast` to a private directory (`$VARDA_SCRATCH/jobs/varda-forecast-<date>-XXXXXX/`,
    removed afterwards), so a rebuild during the run cannot change the binary that runs.
-3. Runs it on a GPU node: through `srun` when not inside a Slurm allocation (default
-   `-p debug -A $ACCOUNT --gres=gpu:1 -c 32 --mem=200G --time=00:30:00`; `VARDA_SRUN_ARGS` replaces it), directly inside
+3. Runs it on a GPU node: through `srun` when not inside a Slurm allocation (arguments `$VARDA_SLURM_GPU` from
+   `tools/env.local.sh`, `$VARDA_SLURM_CPU` with `--device cpu`; `VARDA_SRUN_ARGS` replaces them), directly inside
    an allocation (`salloc`, `sbatch`). It runs `varda-forecast --assets BUNDLE --realdata INPUTDIR --out DIR`.
 4. Prints the summary from `forecast.json`: files, sizes, the IFS runs used, timings.
 
@@ -98,30 +98,33 @@ pins.json                                                              the choic
 
 ## 3. How long it takes
 
-Measured on this cluster on 2026-10-23 (section 6):
+Measured on 2026-10-23 on a Slurm cluster with A100-SXM4-80GB GPU nodes and EPYC 7713 CPU nodes (section 6):
 
 | step | time |
 |---|---|
 | `./varda setup` the first time: build + bundle check | 1 min 57 s (about 1 min each) |
 | `make_assets.py link` (bundle creation, hard links, sha256 of every file) | 3 min 6 s |
-| fetch of one date (2.50 GB, login node) | 22 s |
-| `srun -p debug` allocation | seconds when the partition is free (it was here) |
-| forecast, 24 h fp16 on an A100 | now 8.3-8.7 s on a node where the files are not cached yet, 7.8 s warm (job 286500, `docs/results.md` section 5). Historical (commit a9dcc66): 20-21 s cold, 14 s of it loading the weights, about 10.5 s warm |
-| `./varda forecast latest` from the login node, all of it | 50 s (fetch 22 s, forecast 21 s, the rest srun and the summary; measured with the previous binary, the forecast part is now about 8.5 s cold) |
+| fetch of one date (2.50 GB, from the login node) | 22 s |
+| `srun $VARDA_SLURM_GPU` allocation | seconds when a GPU is free (it was on that day) |
+| forecast, 24 h fp16 on an A100 (32 CPUs, graph on) | now about 13 s for the first run in a fresh allocation (12.9 and 13.6 s, `docs/results.md` section 5); 8.3-8.7 s once the shared libraries are cached, with the file caches of the model and the inputs dropped; 7.8 s warm (`docs/results.md` section 5). Historical (commit a9dcc66): 20-21 s cold, 14 s of it loading the weights, about 10.5 s warm |
+| `./varda forecast latest` from the login node, all of it | 50 s (fetch 22 s, forecast 21 s, the rest srun and the summary; measured with the previous binary, the forecast part is now about 13 s in a fresh allocation) |
 
-## 4. Another machine
+## 4. Setting up a machine
 
-What is specific to this cluster, and how to replace it:
+Everything machine-specific is in `tools/env.local.sh` (untracked; copy `tools/env.local.example.sh` and fill it in),
+which `tools/env.sh` sources and `./varda` sources through it:
 
-| | here | elsewhere |
+| | variable (in `tools/env.local.sh`) | notes |
 |---|---|---|
-| toolchain | `tools/env.sh` (gcc 12.3, CUDA 12.3, OpenBLAS, `ECCODES_HOME`) sourced by `./varda` | write your own env file and set `VARDA_ENV=/path/env.sh`, or `VARDA_ENV=none` with the variables already exported. The build needs CMake >= 3.24, a C++17 compiler, OpenMP, OpenBLAS (`OPENBLAS_HOME`), CUDA (optional) and ecCodes (`ECCODES_HOME` with `eccodeslib/` and `eckitlib/`, e.g. the `eccodeslib` and `eckitlib` wheels' contents) |
-| GPU | A100, `CMAKE_CUDA_ARCHITECTURES=80` | other GPUs: build with `cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=<arch>` before `./varda setup` |
-| data root | `VARDA_SCRATCH=$VARDA_SCRATCH` (from `tools/env.sh`) | without `VARDA_SCRATCH`: `~/.cache/varda/`; or set `VARDA_ASSETS`, `VARDA_INPUTS` |
-| compute | `srun` with defaults `-p debug -A $ACCOUNT --gres=gpu:1 -c 32 --mem=200G --time=00:30:00` (`--device cpu`: `-p cpu-short -A $ACCOUNT -c 64 --mem=200G --time=01:00:00`) | other Slurm: set `VARDA_SRUN_ARGS`; no Slurm, on a GPU machine: `VARDA_SRUN=0` |
-| python | `.venv/bin/python` | any python >= 3.9 (`VARDA_PYTHON`); `fetch_inputs.py` and `make_assets.py check/link` use only the standard library |
-| assets | `make_assets.py link` from the files verified here | `make_assets.py build` (below), or copy a bundle (rsync the directory; `make_assets.py check` verifies it) |
-| network | login node | the fetch step runs where `./varda` is started; it needs `data.geo.admin.ch` and `storage.googleapis.com` (`fetch_inputs.py --source aws\|ecmwf` for another ECMWF mirror) |
+| toolchain | `VARDA_GCC`, `CUDA_HOME`, `OPENBLAS_HOME`, `ECCODES_HOME` | the build needs CMake >= 3.24, a C++17 compiler, OpenMP, OpenBLAS, CUDA (optional) and ecCodes (`ECCODES_HOME` with `eccodeslib/` and `eckitlib/`, e.g. the `eccodeslib` and `eckitlib` wheels' contents). Instead of `tools/env.sh`: `VARDA_ENV=/path/env.sh`, or `VARDA_ENV=none` with the variables already exported |
+| COSMO definitions | `VARDA_COSMO_DEFINITIONS` | the `definitions/` of eccodes-cosmo-resources 2.44.0.1 (KENDA-CH1 short names) |
+| data root | `VARDA_SCRATCH` | assets, input cache, job directories; without it: `~/.cache/varda/`; or set `VARDA_ASSETS`, `VARDA_INPUTS` |
+| checkpoint | `VARDA_CKPT` | the Hugging Face `varda-forecaster-det-sgm/model.ckpt` (only for building the assets) |
+| compute | `VARDA_SLURM_GPU`, `VARDA_SLURM_CPU` | the srun/sbatch arguments for one GPU job and one CPU job (partition, account, `--gres=gpu:1 -c 32 --mem=200G`, time limit). `VARDA_SRUN_ARGS` overrides them for one call; no Slurm, on a GPU machine: `VARDA_SRUN=0` |
+| GPU | | built for A100 (`CMAKE_CUDA_ARCHITECTURES=80`); other GPUs: build with `cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=<arch>` before `./varda setup` |
+| python | `VARDA_PYTHON` | default `.venv/bin/python`; any python >= 3.9 works for `fetch_inputs.py` and `make_assets.py check/link`, which use only the standard library |
+| assets | | `make_assets.py link` from files already verified under `$VARDA_SCRATCH`; otherwise `make_assets.py build` (below), or copy a bundle (rsync the directory; `make_assets.py check` verifies it) |
+| network | | the fetch step runs where `./varda` is started; it needs `data.geo.admin.ch` and `storage.googleapis.com` (`fetch_inputs.py --source aws\|ecmwf` for another ECMWF mirror) |
 
 ### Assets from scratch
 
@@ -138,7 +141,7 @@ huggingface-cli download MeteoSwiss/Varda-single-1.0 --include 'varda-forecaster
 # 3. an IFS 0.25 deg open-data file for the source geometry of the regrid: any input directory has some
 ./varda fetch latest
 # 4. on a compute node (the converter reads the 1.5 GB checkpoint; 3 GB peak)
-srun -p cpu-short -A $ACCOUNT -c 16 --mem=32G --time=00:30:00 .venv/bin/python -I tools/make_assets.py build \
+srun $VARDA_SLURM_CPU .venv/bin/python -I tools/make_assets.py build \
     --hf $VARDA_SCRATCH/hf --dest DIR --grib $VARDA_INPUTS/<date>/cache/ecmwf/files/<file>.subset.grib2 \
     [--py .venv/bin/python] [--ref-py $VARDA_SCRATCH/ref-oper/.venv/bin/python]
 ```
@@ -146,7 +149,7 @@ srun -p cpu-short -A $ACCOUNT -c 16 --mem=32G --time=00:30:00 .venv/bin/python -
 It runs `python/convert.py`, `python/export_io_config.py`, one MIR call on one open-data message (which writes MIR's
 interpolation matrix into a private MIR cache) and `python/export_regrid_matrix.py` on that cache, then copies
 `templates/` and the definitions of the reference env's `eccodes-cosmo-resources`, and writes the manifest. It took
-2 min 24 s on a cpu-short node; the result equals the bundle here (section 6).
+2 min 24 s on a CPU node (EPYC 7713); the result equals the bundle assembled from the verified files (section 6).
 
 ## 5. Troubleshooting
 
@@ -161,14 +164,13 @@ interpolation matrix into a private MIR cache) and `python/export_regrid_matrix.
 | `no assets bundle` / `bundle is incomplete or altered` | `./varda setup`; for a damaged bundle move the directory away first |
 | `has pins.json but misses N file(s)` | an input directory was changed by hand: remove it and fetch again (if the date is still published) |
 | `NaN in ...` from varda-forecast | an input field has NaN; the reference allows it (`-- --allow-nans`) |
-| `srun: error: ...` | partition, account or limits: set `VARDA_SRUN_ARGS` (e.g. `-p gpu-normal -A <acct> --gres=gpu:1 -c 32 --mem=200G`) |
+| `srun: error: ...` | partition, account or limits: fix `VARDA_SLURM_GPU` in `tools/env.local.sh`, or set `VARDA_SRUN_ARGS` (e.g. `-p <partition> -A <account> --gres=gpu:1 -c 32 --mem=200G`) |
 
 ## 6. Verification
 
-Recorded on 2026-10-23; jobs, logs and outputs under `$VARDA_SCRATCH/jobs/quickstart-verify/`. All GPU runs:
-A100-SXM4-80GB, `-c 32`, fp16, device rollout, CUDA graph on, 4 steps.
+Recorded on 2026-10-23. All GPU runs: A100-SXM4-80GB, `-c 32`, fp16, device rollout, CUDA graph on, 4 steps.
 
-**Frozen date 2026-10-22T15** (job 285865, <node>; `VARDA_INPUTS=$VARDA_SCRATCH/realdata`, so the input directory
+**Frozen date 2026-10-22T15** (one GPU job; `VARDA_INPUTS=$VARDA_SCRATCH/realdata`, so the input directory
 is the frozen reference cache, read only):
 
 | run | what | total |
@@ -192,19 +194,19 @@ is the frozen reference cache, read only):
     time);
   - the constants from 00z+0h, the same file as t−6h (its subset holds 66 + 4 = 70 messages).
 - **Download.** 2.50 GB in 22.4 s: KENDA 2.23 GB, constants 0.21 GB, IFS 62 MB of messages out of 198 MB of files.
-- **Forecast.** srun job 285866 (debug, <node>): 21.0 s in all; ready after 17.2 s (input 17.2 s, weights
+- **Forecast.** One srun job on a GPU node: 21.0 s in all; ready after 17.2 s (input 17.2 s, weights
   13.7 s cold); rollout 3.1 s (726, 714, 715, 714 ms per step); 0.7 s of writing after the last step. 10 files,
   1.28 GB. Whole command: 50.4 s.
-- **x0 from subsets = x0 from full files** (job 285867): with the two full IFS files downloaded next to the same
+- **x0 from subsets = x0 from full files** (a separate GPU job): with the two full IFS files downloaded next to the same
   KENDA files, `varda-prepare` gives x0 fnv1a `82e28fa24c047b13` (initial state `2850bf749f92fb44`) in both cases.
-- **Reruns are bitwise.** The same date rerun inside job 285867 (cached inputs, no download) gives byte-identical files
-  (10/10, 16.2 s). A 12 h rerun from the login node (srun job 285868) gives 6 files byte-identical to the first run's
+- **Reruns are bitwise.** The same date rerun inside that job (cached inputs, no download) gives byte-identical files
+  (10/10, 16.2 s). A 12 h rerun from the login node (through srun) gives 6 files byte-identical to the first run's
   steps 0-12.
 - **No parity claim.** As for any date other than 2026-10-22T15 (`docs/forecast.md` section 5), there is no
   anemoi-inference run to compare with.
 
 **Final script, end to end** (after the last edits to `./varda` and `fetch_inputs.py`): `./varda forecast 2026-10-22T15`
-from the login node through srun (job 285942, <node>, 21.0 s, exit 0) gives 10 files byte-identical to run B above.
+from the login node through srun (separate job, 21.0 s, exit 0) gives 10 files byte-identical to run B above.
 A fresh fetch of 2026-10-23T06 into another root (ECMWF latest pinned to the same 00z) gives 28 GRIB and index files
 byte-identical to the first download (2.50 GB, 22 s).
 
@@ -216,11 +218,11 @@ downloaded for the x0 check.
 
 **Error paths** (login node): an expired date (2026-10-21T15: "nothing is published for it"), a non-3-hourly hour, a
 malformed date, a bad option and a missing bundle all fail before anything is downloaded or created. Inside a CPU
-allocation (cpu-short, job 285872), `./varda forecast` stops with "no GPU visible on <node>" before fetching.
+allocation, `./varda forecast` stops with "no GPU visible on <node>" before fetching.
 
-**ctest executables** of `build/` (job 285867, copied to the job directory): 11/11 exit 0.
+**ctest executables** of `build/` (in the x0 check's job, copied to the job directory): 11/11 exit 0.
 
-**Assets from scratch** (job 285919, cpu-short, <node>: `make_assets.py build --hf $VARDA_SCRATCH/hf --grib
+**Assets from scratch** (CPU node, EPYC 7713: `make_assets.py build --hf $VARDA_SCRATCH/hf --grib
 <frozen 12z+3h file>`, 2 min 24 s, 3.0 GB peak), compared with the bundle assembled from the verified files:
 
 | file | from scratch vs bundle |

@@ -2,8 +2,8 @@
 
     .venv/bin/python -I python/convert.py CKPT OUT.safetensors
 
-Port of the Python project's engine/convert.py (docs/contracts.md section 1 there): same mapping, same
-strict accounting, same config; only the container differs (safetensors, config JSON in __metadata__).
+Strict accounting, config as docs/format.md section 1.2; the container is safetensors with the config JSON in
+__metadata__.
 
 The checkpoint is read only through `checkpoint.py` (restricted unpickler); the zip's
 `anemoi-metadata/anemoi.json` is read with `zipfile` for provenance fields (uuid, run_id, commit)
@@ -13,7 +13,7 @@ tensors. Every tensor reachable in the checkpoint (deduplicated by identity) is 
 
 Supported limits (one dataset named "data", one output step, the model / component / block / residual /
 bounding classes in the tables below) are checked up front by `check_supported`, which fails with a pointer
-to the Python project's docs/new-checkpoint.md §2 and §5.
+to docs/tools.md ("What is checked").
 """
 
 import datetime
@@ -38,7 +38,7 @@ import safetensors_io as st_io  # noqa: E402
 # --------------------------------------------------------------------------------------------
 
 DATASET = "data"  # dataset key used throughout the checkpoint paths (checked by check_supported)
-SUPPORTED_DOC = "$IE_ROOT/docs/new-checkpoint.md §2 (what is supported) and §5 (adding a component kind)"
+SUPPORTED_DOC = "docs/tools.md (\"What is checked\": what is supported)"
 
 # Plain tensors: contract name -> checkpoint path.
 TENSORS = {
@@ -141,9 +141,9 @@ RESIDUAL_TYPES = {"anemoi.models.layers.residual.SkipConnection": "skip"}
 MAPPERS = {"enc": "model.encoder.data", "dec": "model.decoder.data"}
 NORMALIZER = "pre_processors.data.processors.normalizer"
 FORMAT_VERSION = 3  # v2 = v1 + "mappers"; v3 = v2 + "architecture", "blocks", "absent", source.sha256,
-#                      dims.n_output_steps (docs/contracts.md §1 "Versions")
+#                      dims.n_output_steps (docs/format.md §1.2)
 
-# The raw `statistics` are not necessarily the ones folded into the normaliser buffers (varda: the
+# The raw `statistics` are not necessarily the ones folded into the normaliser buffers (Varda: the
 # buffers were kept from the forked run, `update_ds_stats_on_ckpt_load.states: false`). check_statistics()
 # picks the reason; the forward pass only ever reads the buffers.
 STATS_FOLDED_REASON = "raw dataset statistics (fp64); norm.mul/norm.add are already derived from them"
@@ -557,7 +557,7 @@ def build_config(root, acc, weights, absent, blocks, n_layers, graph_nodes, ckpt
         check(n >= 1, f"{path}.num_chunks = {n}")
         mappers[g] = {"num_chunks": n}
 
-    # Provenance and identity (uuid, run_id, size, sha256: docs/contracts.md §1)
+    # Provenance and identity (uuid, run_id, size, sha256: docs/format.md §1.2 "source")
     meta = ck.anemoi_metadata(ckpt_path)
     ident = ck.checkpoint_identity(ckpt_path)
     commit = meta["provenance_training"]["git_versions"]["anemoi.models"]["git"]["sha1"]

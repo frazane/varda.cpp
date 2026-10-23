@@ -35,7 +35,7 @@ from opendata import (  # noqa: E402
     HF_REPO, atomic_write_json, download, get_json, icon_collection, pick_latest_kenda, resolve, stac_items,
 )
 
-VARDA_SCRATCH = os.environ.get("VARDA_SCRATCH", "$VARDA_SCRATCH")
+VARDA_SCRATCH = os.environ.get("VARDA_SCRATCH") or sys.exit("VARDA_SCRATCH is not set: source tools/env.sh")
 
 
 def root(date: datetime) -> str:

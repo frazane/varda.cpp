@@ -164,19 +164,19 @@ What `--compare` prints:
 The exit status is 1 if anything differs. The program also prints an FNV-1a hash of `x0` and of the
 step-0 fields, for determinism checks.
 
-## 5. Verification (2026-10-23, AMD EPYC 7713, cpu-short)
+## 5. Verification (2026-10-23, AMD EPYC 7713, CPU node)
 
-The reference runs are by the reference agent, with dumps under
+The reference runs are those of `docs/realdata-reference.md`, with dumps under
 `$VARDA_SCRATCH/realdata/20261022T15/<run>/dumps`. All three pre-processed on EPYC 7713 with numpy
 dispatch X86_V3 (AVX2, FMA3, no AVX-512):
 
-| run | job | node | type |
-|---|---|---|---|
-| `ref-fp16` | 285290 | <node> | GPU node |
-| `ref-fp32` | 285290 | <node> | GPU node |
-| `stub-offline` | 285288 | <node> | cpu-short |
+| run | node |
+|---|---|
+| `ref-fp16` | GPU node (host CPU EPYC 7713) |
+| `ref-fp32` | the same GPU node, same job as `ref-fp16` |
+| `stub-offline` | CPU node (EPYC 7713) |
 
-### `logf_np`, exhaustive (job 285295)
+### `logf_np`, exhaustive (CPU node, EPYC 7713)
 
 numpy 2.5.4 in the reference env streamed `np.log` over every positive finite float32
 (`0x00000001 .. 0x7f7fffff`) into `test_io_numpy_log --stdin`.
@@ -193,7 +193,7 @@ numpy 2.5.4 in the reference env streamed `np.log` over every positive finite fl
 - **`test_io_input` real-data part:** MIR's `regrid.1` input messages through our regridder decode
   bitwise like MIR's outputs.
 
-### Real data, 2026-10-22T15 (jobs 285351, 285354)
+### Real data, 2026-10-22T15 (CPU node, EPYC 7713; two jobs)
 
 `varda-prepare --realdata ... --compare <run>/dumps`. The numbers are identical for each of the three
 reference runs:
@@ -216,11 +216,11 @@ reference runs:
 - **C1a** was run against `ref-fp16`'s `.mat`. Its sha256 is `1e5fac3b…aed533`, the same as both
   cache files of the run.
 - **Thread count.** `x0` and the step-0 fields are bitwise equal at 1, 16 and 64 OpenMP threads
-  (identical FNV-1a hashes, job 285354).
+  (identical FNV-1a hashes, second of the two jobs).
 
 ### Timing
 
-Job 285354, cpu-short, 64 cores, warm file cache, `--out` without stage dumps:
+The second job of the previous section, CPU node, 64 cores, warm file cache, `--out` without stage dumps:
 
 | threads | build_input | of which KENDA / IFS / merge / x0 | wall incl. writing x0 (1.07 GB) | peak RSS |
 |---|---|---|---|---|
@@ -250,7 +250,8 @@ run's whole `execute` takes 244 s (`ref-fp16` manifest).
 
 ## 7. Concurrency (eb7f17b)
 
-The cold input went from 13.9-14.6 s to 3.7-3.9 s (job 286500, `docs/results.md` section 5, last subsection). What runs in parallel:
+The cold input went from 13.9-14.6 s to 3.7-3.9 s (A100 node, 32 CPUs, cold file caches, three runs per binary alternated in the same job, 2026-10-23;
+`docs/results.md` section 5, last subsection). What runs in parallel:
 - The KENDA and IFS branches run concurrently; their log lines are joined in the original order. The IFS branch has its own
   OpenMP team (`VARDA_INPUT_IFS_THREADS`, default a quarter of the threads, clamped to 4..16).
 - `GribPrefetch` reads the input GRIB files ahead: `VARDA_INPUT_IO_THREADS` (default 16) reader threads do parallel chunked
@@ -261,7 +262,7 @@ The cold input went from 13.9-14.6 s to 3.7-3.9 s (job 286500, `docs/results.md`
 - The model grid tensors and the regrid matrix are read with parallel `pread`s before mapping (`model_grid`).
 
 Why results stay bitwise: only copies and integer counts are parallelised, and every per-field computation keeps its
-order. `varda-prepare --compare` on 2026-10-22T15: every stage bitwise against the ref-fp16 and ref-fp32 dumps (job 286496);
+order. `varda-prepare --compare` on 2026-10-22T15: every stage bitwise against the ref-fp16 and ref-fp32 dumps (2026-10-23, binary eb7f17b);
 `x0` hash b840f06bc289bc1f and step-0 state 099fe37f726f2874, the same as before at 1, 16 and 64 threads.
 
 `VARDA_INPUT_TRACE` adds per-file and per-branch timelines to the input log. New `input_stages` keys (also in

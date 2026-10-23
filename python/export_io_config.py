@@ -28,7 +28,7 @@ from pathlib import Path
 import yaml
 
 SCHEMA = "varda-io/1"
-VARDA_SCRATCH = os.environ.get("VARDA_SCRATCH", "$VARDA_SCRATCH")
+VARDA_SCRATCH = os.environ.get("VARDA_SCRATCH", "")  # only for the defaults of --hf / --out
 
 # Top-level keys of the inference config this tool understands.
 KNOWN_TOP = {
@@ -184,8 +184,10 @@ def load_index(hf: Path, rel: str) -> tuple[list, dict]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--hf", default=f"{VARDA_SCRATCH}/hf")
-    ap.add_argument("--out", default=f"{VARDA_SCRATCH}/realdata/assets/varda-io.json")
+    ap.add_argument("--hf", default=f"{VARDA_SCRATCH}/hf" if VARDA_SCRATCH else None,
+                    required=not VARDA_SCRATCH)
+    ap.add_argument("--out", default=f"{VARDA_SCRATCH}/realdata/assets/varda-io.json" if VARDA_SCRATCH else None,
+                    required=not VARDA_SCRATCH)
     a = ap.parse_args()
     hf = Path(a.hf)
     cfg_path = hf / "varda-forecaster-det-sgm/configs/inference/inference_opendata.yaml"

@@ -5,7 +5,7 @@ model, run by anemoi-inference itself with the Hugging Face config `inference_op
 copy of the open data. Every intermediate stage is dumped. All of it can be rerun offline.
 
 Code (tools only, never the engine): `python/reference/realdata/` and `python/export_regrid_matrix.py`.
-Artefacts: `$VARDA_SCRATCH/realdata/` (`$VARDA_SCRATCH` = `$VARDA_SCRATCH`).
+Artefacts: `$VARDA_SCRATCH/realdata/` (`$VARDA_SCRATCH`: `tools/env.local.sh`).
 
 ## 1. Results at a glance
 
@@ -13,7 +13,7 @@ Artefacts: `$VARDA_SCRATCH/realdata/` (`$VARDA_SCRATCH` = `$VARDA_SCRATCH`).
 |---|---|
 | initial date | **t = 2026-10-22T15:00Z**, the notebook's rule (the latest KENDA-CH1 analysis with t.hour % 3 == 0 and t−6h published), picked at 07:25Z on 2026-10-23 |
 | offline replay vs real downloads | online stub run == offline stub run, **bitwise**, for all 56 dumps and all 10 GRIB files (`compare-stub-offline-vs-online.json`) |
-| pre-processing, CPU node vs GPU-node host | stub run (<node>) == fp16 run (<node>), bitwise, for all 25 input-side dumps (`compare-stub-vs-fp16-inputs.json`) |
+| pre-processing, CPU node vs GPU-node host | stub run (CPU node) == fp16 run (GPU node), bitwise, for all 25 input-side dumps (`compare-stub-vs-fp16-inputs.json`) |
 | fp16 vs fp32 runs | input side and step-0 GRIB files identical; outputs differ by rel_absmax ≤ 3.7e-3 at step 0 and ≤ 5.6e-3 at step 3 (worst variables q_925, v_300) |
 | precision the runner picks | checkpoint `precision: 16-mixed` → `torch.autocast(cuda, float16)`. The model output `y` is **float32** |
 | MIR regrid as a matrix | `y = W x` in double, rows summed in stored order: **bitwise equal** to MIR's own output before the 16-bit encode, on all 140 regridded real fields. After the 16-bit re-encode through ecCodes, bitwise equal to the run's values (140/140) |
@@ -98,11 +98,11 @@ and `write_initial_state: true`, both from the config.
 ```
 PY=$VARDA_SCRATCH/ref-oper/.venv/bin/python; R=$VARDA_SCRATCH/realdata/20261022T15
 # reference runs (GPU; job_reference.sh copies the code to $VARDA_SCRATCH/jobs/<NAME>/code-<jobid> first)
-NAME=realdata-ref-gpu sbatch -p gpu-normal -A $ACCOUNT --gres=gpu:1 -c 16 --mem=200G --time=03:00:00 \
+NAME=realdata-ref-gpu sbatch $VARDA_SLURM_GPU --time=03:00:00 \
   -o $VARDA_SCRATCH/jobs/realdata-ref-gpu/slurm-%j.out python/reference/realdata/job_reference.sh \
   "--device cuda --precision checkpoint --out $R/ref-fp16" "--device cuda --precision 32 --out $R/ref-fp32"
 # replay check: stub model (zeros), CPU node, offline and online, then compare (expects bitwise)
-NAME=realdata-stub-offline sbatch -p cpu-short -A $ACCOUNT -c 32 --mem=200G --time=01:00:00 ... \
+NAME=realdata-stub-offline sbatch $VARDA_SLURM_CPU --time=01:00:00 ... \
   python/reference/realdata/job_reference.sh "--device cpu --stub-model --out $R/stub-offline"
 $PY -I python/reference/realdata/compare_runs.py $R/stub-offline $R/stub-online --expect-equal
 # post-processing (compute node)
@@ -115,15 +115,13 @@ $PY -I python/reference/realdata/make_manifest.py --date 2026-10-22T15    # froz
 A new date: `fetch_realdata.py pick`, then `kenda --date D` and `ecmwf --date D` (and `templates` once) on the
 login node within ~24 h. The order matters: KENDA first, it expires first.
 
-**Jobs** (logs, exit codes: `$VARDA_SCRATCH/jobs/<name>/`):
+**Runs** (2026-10-23, one job each; the job's logs and exit codes go to `$VARDA_SCRATCH/jobs/<NAME>/`):
 
-| job | name | what | result |
-|---|---|---|---|
-| 285290 | realdata-ref-gpu | run 1: fp16 (checkpoint precision); run 2: fp32. <node>, A100-SXM4-80GB | exit 0, 0 |
-| 285288 | realdata-stub-offline | stub model, offline, CPU, <node> | exit 0 |
-| 285289 | realdata-stub-online | stub model, online (real downloads, ECMWF pin only), <node> | exit 0 |
-
-Post-processing logs: `jobs/realdata-post/`.
+| name | what | result |
+|---|---|---|
+| realdata-ref-gpu | run 1: fp16 (checkpoint precision); run 2: fp32. GPU node, A100-SXM4-80GB, host CPU EPYC 7713 | exit 0, 0 |
+| realdata-stub-offline | stub model, offline, CPU node (EPYC 7713) | exit 0 |
+| realdata-stub-online | stub model, online (real downloads, ECMWF pin only), the same CPU node | exit 0 |
 
 ## 5. Runs
 
@@ -148,7 +146,7 @@ Settings shared by every run:
 Each run dir holds `outputs/` (the GRIB files), `dumps/`, `stages.safetensors` (the fp16 and fp32 runs only),
 `manifest.json`, `config.yaml` (resolved config + overrides), and `cache/ecmwf/` (earthkit cache + MIR weights).
 
-The fp16-vs-fp32 numbers (`jobs/realdata-post/y16v32.log`) are per variable, `rel_absmax = max|y16 − y32| /
+The fp16-vs-fp32 numbers (post-processing step, from `ref-fp16/dumps` and `ref-fp32/dumps`) are per variable, `rel_absmax = max|y16 − y32| /
 max|y32|`. Worst per step: 3.7e-3 (q_925), 3.8e-3 (q_100), 4.1e-3 (q_925), 5.6e-3 (v_300). Median: 1.4e-3 to
 1.8e-3.
 
@@ -198,7 +196,7 @@ Metadata `stages` (JSON) has:
 - `in_vars`, `out_vars`, `forcing_vars`, `dates`, `forcing_dates`, `dates_out`;
 - the checks: `x0_equals_input_tensor`, `in_vars_equal_engine_input_order`, `out_vars_equal_engine_output_order`,
   `x0_columns_equal_merged_sources` (70/70 bitwise, using `grid.{lam_0,global}.cutout_mask` of
-  `converted/varda-v2`), `y.<s>_state_equals_model_output`. All are true in both runs.
+  `converted/varda`), `y.<s>_state_equals_model_output`. All are true in both runs.
 
 C4 and C5 data are `dumps/grib.{lam,global}.<k>` and `outputs/*.grib`.
 
@@ -291,8 +289,7 @@ global-202610221500_0.grib  _6  _12  _18  _24    global, IFS templates, ECMWF sh
 ## 10. Answers to the open questions of `docs/spec-io.md` §6
 
 1. **CPU of the pre-processing.**
-   - Both nodes were AMD EPYC 7713: <node> (CPU partition; stub runs) and <node> (GPU node; fp16/fp32
-     runs).
+   - Both nodes were AMD EPYC 7713: a CPU node (stub runs) and a GPU node (fp16/fp32 runs).
    - numpy reports the baseline X86_V2 and dispatch targets X86_V3, X86_V4, AVX512_ICL and AVX512_SPR. Features
      on: AVX, AVX2, FMA3, F16C, BMI/BMI2, … X86_V3. No AVX-512, so the X86_V3 (AVX2+FMA3) float32 log path is
      taken.

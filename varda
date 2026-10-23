@@ -17,7 +17,7 @@
 #   VARDA_BUILD      build directory (default: build/ of this repo)
 #   VARDA_PYTHON     python >= 3.9 for the fetch and assets tools (default: .venv/bin/python, else python3)
 #   VARDA_SRUN_ARGS  srun options when not inside a Slurm allocation
-#                    (default GPU: -p debug -A $ACCOUNT --gres=gpu:1 -c 32 --mem=200G --time=00:30:00)
+#                    (default: $VARDA_SLURM_GPU, or $VARDA_SLURM_CPU with --device cpu; set in tools/env.local.sh)
 #   VARDA_SRUN       0: never use srun, run on this node
 set -euo pipefail
 
@@ -164,8 +164,11 @@ cmd_forecast() {
     if [[ -z "${SLURM_JOB_ID:-}" && "${VARDA_SRUN:-1}" != 0 ]]; then
         command -v srun >/dev/null ||
             die "not in a Slurm allocation and no srun: run on a GPU machine with VARDA_SRUN=0"
-        local def="-p debug -A $ACCOUNT --gres=gpu:1 -c 32 --mem=200G --time=00:30:00"
-        [[ "$device" == cpu ]] && def="-p cpu-short -A $ACCOUNT -c 64 --mem=200G --time=01:00:00"
+        local def="${VARDA_SLURM_GPU:-}"
+        [[ "$device" == cpu ]] && def="${VARDA_SLURM_CPU:-}"
+        [[ -n "${VARDA_SRUN_ARGS:-$def}" ]] ||
+            die "not in a Slurm allocation and no srun options: set VARDA_SRUN_ARGS, or VARDA_SLURM_GPU /" \
+                "VARDA_SLURM_CPU in tools/env.local.sh, or run on a GPU machine with VARDA_SRUN=0"
         # shellcheck disable=SC2206
         launch=(srun ${VARDA_SRUN_ARGS:-$def} --job-name=varda-forecast)
     elif [[ "$device" == cuda ]]; then

@@ -81,7 +81,7 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "python"))
 from safetensors_io import write_safetensors  # noqa: E402
 
-VARDA_SCRATCH = os.environ.get("VARDA_SCRATCH", "$VARDA_SCRATCH")
+VARDA_SCRATCH = os.environ.get("VARDA_SCRATCH") or sys.exit("VARDA_SCRATCH is not set: source tools/env.sh")
 HF = Path(VARDA_SCRATCH) / "hf"
 HF_CONFIG = HF / "varda-forecaster-det-sgm" / "configs" / "inference" / "inference_opendata.yaml"
 GOOGLE = "https://storage.googleapis.com/ecmwf-open-data/"

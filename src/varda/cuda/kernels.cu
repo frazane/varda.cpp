@@ -419,7 +419,7 @@ __global__ void output_kernel(OutputArgs a) {
         if (a.pre_bound) a.pre_bound[g * a.V_out + v] = val;
     }
     __syncwarp();
-    // Boundings in config order, normalised space, in place (spec-interface §4.3). Lane 0 applies them
+    // Boundings in config order, normalised space, in place. Lane 0 applies them
     // sequentially; index lists are short.
     if (lane != 0) return;
     for (int bi = 0; bi < a.n_bounds; ++bi) {

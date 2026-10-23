@@ -3,16 +3,17 @@
 # (CLAUDE.md: a running job never executes files someone may edit), then runs one or more configurations
 # sequentially; logs and exit codes go to $VARDA_SCRATCH/jobs/<name>/.
 #
-#   NAME=realdata-ref-gpu sbatch -p gpu-normal -A $ACCOUNT --gres=gpu:1 -c 16 --mem=200G --time=02:00:00 \
+#   source tools/env.sh   # from the repository root (the submit directory is the repository)
+#   NAME=realdata-ref-gpu sbatch $VARDA_SLURM_GPU --time=02:00:00 \
 #       -o $VARDA_SCRATCH/jobs/realdata-ref-gpu/slurm-%j.out python/reference/realdata/job_reference.sh \
 #       "--device cuda --precision checkpoint --out $R/ref-fp16" "--device cuda --precision 32 --out $R/ref-fp32"
 #
 # Each positional argument is one run's extra arguments (DATE defaults to 2026-10-22T15).
 set -u
-VARDA_SCRATCH=${VARDA_SCRATCH:-$VARDA_SCRATCH}
+VARDA_SCRATCH=${VARDA_SCRATCH:?set VARDA_SCRATCH (source tools/env.sh)}
 NAME=${NAME:?set NAME}
 DATE=${DATE:-2026-10-22T15}
-REPO=${REPO:-$VARDA_ROOT}
+REPO=${REPO:-${SLURM_SUBMIT_DIR:?set REPO to the repository}}
 JOB=$VARDA_SCRATCH/jobs/$NAME
 PY=$VARDA_SCRATCH/ref-oper/.venv/bin/python
 mkdir -p "$JOB"

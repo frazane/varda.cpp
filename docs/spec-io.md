@@ -5,7 +5,7 @@ This document specifies, op by op, what anemoi-inference does with the Hugging F
 KENDA-CH1 and ECMWF open-data GRIB files to the model input window, and from the model outputs to the
 two GRIB output files. The C++ (`libvarda` + ecCodes C API) implements this so that it can feed
 `Rollout` (`docs/rollout-engine.md`) from real data and write the same GRIB files. The model maths is
-not covered here (`$IE_ROOT/docs/spec-model.md`, `spec-interface.md`), and neither is the window
+not covered here (`docs/cpu.md`, `docs/format.md`), and neither is the window
 update (`docs/rollout-engine.md` §1) or the dynamic forcings (`docs/forcings.md`).
 
 Every rule below was read from the source; the file:line next to it is where. Behaviours marked
@@ -595,7 +595,7 @@ and the global output (§4.3) use them. `source{0,1}/*` are not needed: they equ
    - every field has shape `(2, G)`;
    - an infinity raises;
    - with `allow_nans: true`, NaNs are only reported (`:230-240`). There is no imputer, and
-     `predict_step` never checks (`$IE_ROOT/docs/spec-interface.md` §1, "NaNs"). **A NaN in any input point
+     `predict_step` never checks. **A NaN in any input point
      spreads through the graph:** see the NaN rule below.
 4. **Tensor**: `np.full((2, 79, G), NaN, float32)`, then `tensor[:, idx(var), :] = field` for every state
    field (`:143-167`). Every one of the 79 inputs must be set, otherwise an error is raised (`:169-172`).

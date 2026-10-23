@@ -6,8 +6,8 @@
 //     ($VARDA_SCRATCH/converted/<model>/model.safetensors);
 //  3. thread-count invariance.
 // Reports max abs difference, number of elements that are not bitwise equal, and the max ulp distance.
-// Environment: VARDA_SCRATCH (default $VARDA_SCRATCH), VARDA_FORCINGS_DIR (fixtures),
-// VARDA_FORCINGS_DUMP=<file.safetensors> writes the varda forcings for 24 six-hourly dates from
+// Environment: VARDA_SCRATCH (tools/env.sh; unset: the data part is skipped), VARDA_FORCINGS_DIR (fixtures),
+// VARDA_FORCINGS_DUMP=<file.safetensors> writes the Varda forcings for 24 six-hourly dates from
 // 2024-06-01T06:00 (tensor "values" F32 [23, G, 5]) for python/reference/compare_forcings_recorded.py.
 // Fixtures missing: the data part is skipped with a message (exit 0).
 #include <omp.h>
@@ -202,10 +202,13 @@ void test_model(const std::string& model, const std::string& scratch, const std:
 
 int main() {
     test_dates();
-    const std::string scratch = env_or("VARDA_SCRATCH", "$VARDA_SCRATCH");
+    const std::string scratch = env_or("VARDA_SCRATCH", "");
     const std::string fixdir = env_or("VARDA_FORCINGS_DIR", scratch + "/forcings");
     const bool dump = !env_or("VARDA_FORCINGS_DUMP", "").empty();
-    for (const char* m : {"dev", "varda"}) test_model(m, scratch, fixdir, dump);
+    if (scratch.empty())
+        std::printf("data part SKIPPED: VARDA_SCRATCH is not set (source tools/env.sh)\n");
+    else
+        for (const char* m : {"dev", "varda"}) test_model(m, scratch, fixdir, dump);
     std::printf(failures ? "test_forcings: %d FAILURE(S)\n" : "test_forcings: all ok (failures %d)\n", failures);
     return failures ? 1 : 0;
 }

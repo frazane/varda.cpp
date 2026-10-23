@@ -1,4 +1,4 @@
-"""Export a golden directory of the Python project to one safetensors file (docs/format.md §3).
+"""Export a reference golden directory (anemoi, $REF_SCRATCH/golden) to one safetensors file (docs/format.md §3).
 
     python -I python/export_golden.py GOLDEN_DIR OUT.safetensors [--tag TAG]
 

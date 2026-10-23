@@ -4,7 +4,7 @@
         .venv/bin/python -I python/tests/test_convert.py
 
 VARDA_CONVERTED may list several files separated by ':'. VARDA_WEIGHTS_PT (same count, same order, or
-unset) enables the bitwise comparison with the Python engine's weights.pt, and config.json next to it
+unset) enables the bitwise comparison with the independent weight export weights.pt, and config.json next to it
 is compared too. VARDA_CKPTS (same count/order) enables the check of grid.* against the zip members. Without VARDA_CONVERTED the tests are skipped. The restricted-unpickler tests need no files.
 """
 
@@ -27,7 +27,7 @@ WEIGHTS = [p for p in os.environ.get("VARDA_WEIGHTS_PT", "").split(":") if p]
 
 
 def expected_names(cfg):
-    """Tensor names of the contract table (docs/format.md 1.1; $IE_ROOT/docs/contracts.md 1) from the config."""
+    """Tensor names of the contract table (docs/format.md 1.1) from the config."""
     names = {"norm.mul", "norm.add", "nodes.data.attr", "nodes.hidden.attr"}
     for g in ("enc", "proc", "dec"):
         names |= {f"graph.{g}.edge_index", f"graph.{g}.edge_attr"}

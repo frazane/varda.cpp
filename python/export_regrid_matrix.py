@@ -49,8 +49,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from safetensors_io import write_safetensors  # noqa: E402
 
-VARDA_SCRATCH = os.environ.get("VARDA_SCRATCH", "$VARDA_SCRATCH")
-OUT = Path(VARDA_SCRATCH) / "realdata" / "assets" / "regrid-ifs0p25-n320.safetensors"
+VARDA_SCRATCH = os.environ.get("VARDA_SCRATCH", "")  # only for the default of --out
+OUT = Path(VARDA_SCRATCH) / "realdata" / "assets" / "regrid-ifs0p25-n320.safetensors" if VARDA_SCRATCH else None
 GEOMETRY_KEYS = ("gridType", "Ni", "Nj", "latitudeOfFirstGridPointInDegrees", "longitudeOfFirstGridPointInDegrees",
                  "latitudeOfLastGridPointInDegrees", "longitudeOfLastGridPointInDegrees", "iDirectionIncrementInDegrees",
                  "jDirectionIncrementInDegrees", "iScansNegatively", "jScansPositively", "jPointsAreConsecutive",
@@ -218,7 +218,7 @@ def main() -> None:
     ap.add_argument("--run", required=True, help="reference run dir (its cache/ecmwf/mir holds the matrix)")
     ap.add_argument("--grib", required=True, help="a real open-data file: source geometry")
     ap.add_argument("--verify", action="store_true")
-    ap.add_argument("--out", default=str(OUT))
+    ap.add_argument("--out", default=str(OUT) if OUT else None, required=OUT is None)
     args = ap.parse_args()
     run = Path(args.run)
 

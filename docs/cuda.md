@@ -1,10 +1,9 @@
 # CUDA backend
 
-`varda::make_cuda_backend` (`src/varda/cuda/`): the fast path of varda.cpp on NVIDIA GPUs
+`varda::make_cuda_backend` (`src/varda/cuda/`): the fast backend of varda.cpp on NVIDIA GPUs
 (A100, sm_80), fp32 and fp16 (autocast-faithful), with CUDA-graph replay and a device-level
-entry point for the autoregressive rollout. Same maths as the CPU oracle and the Python
-engine's fast path (`$IE_ROOT/engine/fast.py`), checked against the golden activations with
-the tolerances of `tolerances/<model>.json` (`docs/format.md` §2-4).
+entry point for the autoregressive rollout. Same maths as the CPU oracle, checked against the
+golden activations with the tolerances of `tolerances/<model>.json` (`docs/format.md` §2-4).
 
 Files:
 
@@ -21,9 +20,8 @@ Files:
 ## 1. Design
 
 One `Engine<T>` per loaded model. Everything is sized and allocated at load time from the
-`Config` (no model-specific literal anywhere; Varda and dev run the same code); a
-forward pass only enqueues kernels and cuBLASLt calls on a stream. The sequence (spec-model
-§1-8, spec-interface §2-4):
+`Config` (no model-specific literal anywhere; Varda and the dev model run the same code); a
+forward pass only enqueues kernels and cuBLASLt calls on a stream. The sequence:
 
 ```
 normalise          xn = (x * mul_in) + add_in                       fp32, two rounded ops
@@ -51,12 +49,11 @@ destination. Each graph is uploaded as `row_ptr` and one 16-byte record per edge
 `{a0, a1, a2, bitcast(src)}` (attributes zero-padded to 3; `edge_attr_dim` 1..3 supported), so an
 edge costs one broadcast load.
 
-Ideas carried over from `engine/fast.py`: the edge projection folded into the attention (no
-`(E, C)` edge tensor, no K = 3 GEMMs), destination-sorted layouts, fused `[q|k|v|self]` /
-`[q|self]` / `[k|v]` GEMMs, explicit casts reproducing autocast, destination chunking of the
-decoder, one CUDA graph over static buffers. What is different: no padded degree buckets (a
-warp walks a destination's CSR row, any degree, 0 included), the residual adds are fused with the
-LayerNorm that follows them, the attention writes the projection's input `T(T(a) + x_r)`
+Choices: the edge projection folded into the attention (no `(E, C)` edge tensor, no K = 3
+GEMMs), destination-sorted layouts, fused `[q|k|v|self]` / `[q|self]` / `[k|v]` GEMMs, explicit
+casts reproducing autocast, destination chunking of the decoder, one CUDA graph over static
+buffers; no padded degree buckets (a warp walks a destination's CSR row, any degree, 0
+included), the residual adds are fused with the LayerNorm that follows them, the attention writes the projection's input `T(T(a) + x_r)`
 directly, and nothing is compiled at run time (first call = one eager forward).
 
 ## 2. Precision plan
@@ -65,14 +62,14 @@ fp32 (`Precision::FP32`): every tensor fp32; GEMMs are cuBLASLt `CUBLAS_COMPUTE_
 fp32 FMA, no TF32); the reference is `cpu-fp32-pyg` and the table `cuda-fp32`.
 
 fp16 (`Precision::FP16`) reproduces `torch.autocast("cuda", float16)` around the reference's
-`predict_step` with the triton attention (spec-model §9, `fast.py`'s cast placement):
+`predict_step` with the triton attention:
 
 | op | reference under autocast | here |
 |---|---|---|
 | normaliser, input assembly | fp32 | fp32; `x_data` stored fp16 (the Linear's input cast) |
 | every Linear | fp16 in, fp16 weights and bias, fp32 accumulation, fp16 out | cuBLASLt fp16 GEMM, `COMPUTE_32F`, bias epilogue in fp32, one rounding |
 | LayerNorm | fp32 (input upcast), fp32 out, cast to fp16 by the next Linear | fp32 statistics and affine, output rounded to fp16 (same value as the cast) |
-| edge Linear | fp16 attr and weights, fp16 output `e` | attr, `W_e`, `b_e` rounded to fp16 at load; folded (the fp16 rounding of `e` itself is not reproduced, as in `fast.py`) |
+| edge Linear | fp16 attr and weights, fp16 output `e` | attr, `W_e`, `b_e` rounded to fp16 at load; folded (the fp16 rounding of `e` itself is not reproduced) |
 | attention | triton: q, k, v, e upcast, fp32 online softmax, output cast to fp16 | the same in one kernel; output rounded to fp16, then `+ x_r` in fp32 and rounded again |
 | residual adds, GELU | fp16 tensors: fp32 opmath, rounded to fp16 | the same, each add rounded separately (fused kernels keep the roundings) |
 | mapper output / residual stream | fp16 | fp16 |
@@ -87,7 +84,7 @@ reference's `x_data` is fp32), `enc.x_dst` is the file's own buffer.
 
 | kernel | what | notes |
 |---|---|---|
-| `normalise`, `denormalise` | spec-interface §2.3 | `__fmul_rn`/`__fadd_rn`, `__fsub_rn`/`__fdiv_rn`: bitwise the reference's two ops |
+| `normalise`, `denormalise` | `x*mul + add`, `(y - add)/mul` | `__fmul_rn`/`__fadd_rn`, `__fsub_rn`/`__fdiv_rn`: bitwise the reference's two ops |
 | `assemble_x_data` | `[xn t0 | xn t1 | attr | 0]` | time-major features, zero padding to the GEMM's K |
 | `layernorm` | warp per row, two-pass fp32 statistics in registers | in place allowed; any C that is a multiple of 256 up to 2048 (256, 512, ..., 2048; checked at load), as for every kernel |
 | `add_layernorm` | `out1 = T(y + r1)`, optional `out2 = T(out1 + r2)`, then LN | residual + next LN in one pass; the latent skip uses `r2` |
@@ -126,7 +123,7 @@ reference), so the output is `x_r`. All arithmetic uses explicit `__fmaf_rn`/`__
 `__fadd_rn`, so the bits do not depend on the compiler's contraction of each template instance
 (the unit test checks `vpl` 1, 2, 4 bitwise equal).
 
-Two things mattered (dev fp16, per forward):
+Two things mattered (dev model fp16, per forward):
 - one warp per destination holding all 1024 channels took 216 registers (8 warps/SM): 6.6 ms; four
   warps of 256 channels, 73 registers: 5.1 ms;
 - `W_e` stored channel-major `[C, 3]`: the per-lane scalar loads had a 96-byte stride and made
@@ -150,7 +147,7 @@ The encoder's source side (`emb_src` with its LayerNorm in place, then `[k|v]` o
 nodes) and the decoder's destination chunks never live at the same time, so they share R1. The
 decoder chunk size is what fits in R1 (at least 2^18 rows, a multiple of 128 rows so that every
 row offset stays 256-byte aligned; `VARDA_DEC_CHUNK_ROWS` overrides): Varda gets 4 chunks of
-422 272 rows, dev one chunk. A destination's edges are never split (the attention takes
+422 272 rows, the dev model one chunk. A destination's edges are never split (the attention takes
 a destination range `[lo, lo + n)` of the global CSR), so chunking changes no result except
 through GEMM row counts. Varda: fp16 20.1 GB of buffers + 0.7 GB weights and graphs; fp32 37.1 + 1.2 GB.
 
@@ -178,8 +175,8 @@ stacked into `[q|k|v|self]`, `[q|self]`, `[k|v]`; a mismatch fails at load.
 
 ## 5. Profile
 
-Varda (varda), A100-SXM4-80GB, nsys kernel sums per forward (eager launches, job 283468,
-`run-283468/prof-varda-{fp16,fp32}*`):
+Varda, A100-SXM4-80GB, nsys kernel sums per forward (eager launches, the job of the results
+in §8):
 
 | kernels | fp16 ms | fp32 ms |
 |---|---|---|
@@ -197,11 +194,10 @@ are memory- or latency-bound: per processor block attention 3.0 ms (ncu: 34% of 
 72% L2 hit rate, 36% occupancy, latency-bound; the hidden-node order already gives 6.8 uses per
 gathered k/v row within a 10k-destination window), GELU 1.9 ms and add+LN 2 x 0.9 ms at ~1.9
 TB/s (bandwidth-bound). The encoder attention (2.85M edges from 1.69M data nodes, no reuse) runs at
-75% of DRAM bandwidth. Against the Python fast path (GEMMs 532 ms, attention 207, pointwise 88,
-LayerNorm 42 ms): same GEMM time, attention 3x faster, pointwise/LN fused into fewer passes.
+75% of DRAM bandwidth.
 
-fp32 is SGEMM-bound (95% of the time in `ampere_sgemm_128x64_tn` at 97.6% of peak): matching the
-Python path is the ceiling without TF32, which the 1e-5 tables exclude.
+fp32 is SGEMM-bound (95% of the time in `ampere_sgemm_128x64_tn` at 97.6% of peak): the ceiling
+without TF32, which the 1e-5 tables exclude.
 
 ## 6. Device-level entry point (rollout)
 
@@ -253,29 +249,30 @@ time (H2D + forward + D2H), peak device memory (cudaMemGetInfo). It checks bitwi
 eager, split entry points == fused, host == device, first call == warm; `--determinism` hashes
 every activation of two hooked runs of one instance and one of a second instance.
 
-### Results (job 283468, <node>, NVIDIA A100-SXM4-80GB, same job for all rows)
+### Results (NVIDIA A100-SXM4-80GB, same job for all rows)
 
-Warm, hook-free, median of 10 (Varda) / 20 (dev) forwards after 3 warm-up, CUDA
+Warm, hook-free, median of 10 (Varda) / 20 (dev model) forwards after 3 warm-up, CUDA
 events, device-resident input/output (`predict_step_device`: normalise, forward, residual,
-bounding, denormalise). Baselines: coordinator's job 283323 (A100-SXM4-80GB, warm, hook-free).
+bounding, denormalise). Baselines: the original model in a separate job (A100-SXM4-80GB, warm, hook-free); the same-job comparison
+is `docs/results.md` section 3.
 
-| model | precision | CUDA graph | varda.cpp ms | Python fast path ms | original (triton) ms | speedup vs Python / original |
-|---|---|---|---|---|---|---|
-| Varda | fp16 | on | **718.2** | 868 | 1321 | 1.21x / 1.84x |
-| Varda | fp16 | off | 718.1 | | | |
-| Varda | fp32 | on | **7439.1** | 7592 | 8089 | 1.02x / 1.09x |
-| Varda | fp32 | off | 7440.3 | | | |
-| dev | fp16 | on | **31.56** | 38.0 | 79.9 | 1.20x / 2.53x |
-| dev | fp16 | off | 31.82 | | | |
-| dev | fp32 | on | **329.1** | 332.9 | 378.5 | 1.01x / 1.15x |
-| dev | fp32 | off | 329.3 | | | |
+| model | precision | CUDA graph | varda.cpp ms | original (triton) ms | speedup vs original |
+|---|---|---|---|---|---|
+| Varda | fp16 | on | **718.2** | 1321 | 1.84x |
+| Varda | fp16 | off | 718.1 | | |
+| Varda | fp32 | on | **7439.1** | 8089 | 1.09x |
+| Varda | fp32 | off | 7440.3 | | |
+| dev model | fp16 | on | **31.56** | 79.9 | 2.53x |
+| dev model | fp16 | off | 31.82 | | |
+| dev model | fp32 | on | **329.1** | 378.5 | 1.15x |
+| dev model | fp32 | off | 329.3 | | |
 
 | model | precision | load s | first call s (eager, host API) | host `predict_step` ms (incl. H2D/D2H, graph on) | peak device memory GB (incl. 0.45 context, 3.49 / 0.09 bench buffers) |
 |---|---|---|---|---|---|
-| Varda | fp16 | 1.2 (12.7 cold file cache; 1.9-2.7 cold since the parallel prefetch, `Model::load`, job 286500) | 0.89 | 891 | 24.74 |
+| Varda | fp16 | 1.2 (12.7 cold file cache; 1.9-2.7 cold since the parallel prefetch, `Model::load`, `docs/results.md` section 5) | 0.89 | 891 | 24.74 |
 | Varda | fp32 | 1.1 | 7.59 | 7624 | 42.24 |
-| dev | fp16 | 0.7 | 0.08 | 36.5 | 2.43 |
-| dev | fp32 | 0.9 | 0.34 | 334.4 | 4.16 |
+| dev model | fp16 | 0.7 | 0.08 | 36.5 | 2.43 |
+| dev model | fp32 | 0.9 | 0.34 | 334.4 | 4.16 |
 
 The graph makes no difference at these sizes (~400 kernels of milliseconds each). Every run
 checked bitwise: graph replay == eager, `forward_normalised` split == fused, host == device,
@@ -283,9 +280,9 @@ first call == warm; with `--determinism` (graph-on rows) all 30 activations of t
 one instance and of a second instance were bitwise identical. The host-API number includes
 pageable copies of 1.07 GB in and 0.45 GB out (~170 ms on Varda).
 
-### Parity (job 283444, same GPU type; `run-283444/parity-*.{log,json}`)
+### Parity (separate job, same GPU type; `varda-parity --report` JSON per model and precision)
 
-**dev** — rel_absmax (ratio to tolerance); fp32 vs cuda-fp32-triton for information (no table)
+**dev model** — rel_absmax (ratio to tolerance); fp32 vs cuda-fp32-triton for information (no table)
 
 | key | fp32 vs cpu-fp32-pyg (`cuda-fp32`) | fp32 vs cuda-fp32-triton | fp16 vs cpu-fp32-pyg (`cuda-fp16`) | fp16 vs cuda-fp16-triton (`cuda-fp16-vs-ref-fp16`) |
 |---|---|---|---|---|
@@ -323,7 +320,7 @@ pageable copies of 1.07 GB in and 0.45 GB out (~170 ms on Varda).
 
 hook-free == hooked (bitwise): fp32 True, fp16 True; status fp32 pass, fp16 pass
 
-**varda** — rel_absmax (ratio to tolerance); fp32 vs cuda-fp32-triton for information (no table)
+**Varda** — rel_absmax (ratio to tolerance); fp32 vs cuda-fp32-triton for information (no table)
 
 | key | fp32 vs cpu-fp32-pyg (`cuda-fp32`) | fp32 vs cuda-fp32-triton | fp16 vs cpu-fp32-pyg (`cuda-fp16`) | fp16 vs cuda-fp16-triton (`cuda-fp16-vs-ref-fp16`) |
 |---|---|---|---|---|
@@ -372,7 +369,7 @@ hook-free == hooked (bitwise): fp32 True, fp16 True; status fp32 pass, fp16 pass
 | one warp per destination (all 1024 channels in a warp) | 216 registers, 8 warps/SM; replaced by 4 warps x 256 channels (§3.2) |
 | own fp16 tensor-core GEMM (mma.sync m16n8k16, ldmatrix, cp.async, 128x256 tiles) with bias + exact-GELU epilogue, for mlp1 | correct (bitwise equal to cuBLASLt + GELU on small K), but 150 TFLOP/s without the GELU and 72 TFLOP/s with it, vs cuBLASLt 245-251 TFLOP/s + 1.9 ms GELU at [189 809 x 1024] x [1024 x 4096]: removed. A competitive fused kernel needs a CUTLASS-grade pipeline (not a dependency we may add) |
 
-## 10. Lessons (generic, for docs/design.md "Methodology additions")
+## 10. Lessons (generic, for docs/design.md "Methodology")
 
 - **Profile per kernel before optimising, and look at the limiter, not the time.** ncu showed the
   first attention kernel L1-bound (strided scalar loads of a 3-column weight), then latency-bound

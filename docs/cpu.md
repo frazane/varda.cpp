@@ -1,9 +1,8 @@
 # CPU fp32 backend (the oracle)
 
 `varda::make_cpu_backend` (`src/varda/cpu/`): a readable fp32 implementation of
-`predict_step` on OpenMP + OpenBLAS. It mirrors the op sequence of the Python engine's
-plain path (`$IE_ROOT/engine/model.py`, `blocks.py`, `ops.py`), which is bitwise equal to
-anemoi's pyg backend on CPU, and is held to the `cuda-fp32` tolerance table.
+`predict_step` on OpenMP + OpenBLAS. It mirrors the op sequence of anemoi's GraphTransformer
+with the pyg backend on CPU, and is held to the `cuda-fp32` tolerance table.
 
 | file | contents |
 |---|---|
@@ -76,7 +75,7 @@ The channel sum in step 2 uses 8 independent partial sums so that it vectorises 
 
 ## 2. Threading and determinism
 
-The OpenBLAS on this cluster (0.3.26, spack) is a **single-threaded build**: calling
+The OpenBLAS used here (0.3.26, a site-provided build) is a **single-threaded build**: calling
 `cblas_sgemm` from serial code runs on one core (91 GFLOP/s whatever
 `openblas_set_num_threads` says). All parallelism is therefore OpenMP: `cpu::linear` cuts
 the output into fixed 128-row x 512-column tiles, scheduled dynamically, each one
@@ -90,7 +89,7 @@ OpenBLAS's result for an element depends on the shape of the call that computes 
 in the last bit). With a tile grid that depends only on the matrix shape, every element is
 computed by the same call whatever the thread count. Together with the per-destination
 attention and per-row LayerNorm, **results are bitwise independent of the thread count**:
-`out.y` is identical at 7 and 64 threads (dev) and at 64 and 128 threads
+`out.y` is identical at 7 and 64 threads (the dev model) and at 64 and 128 threads
 (Varda), and repeated calls are bitwise equal. The destination chunk size does change GEMM
 row counts but not tile shapes as long as chunks are multiples of 128 rows, so it changes
 nothing either (unit test: a destination sub-range of the attention is bitwise equal).
@@ -120,12 +119,12 @@ extra buffers, freed after reporting; the computation is the same code path, so 
 hook-free output is bitwise equal.
 
 Measured peak RSS (`varda-run`, VmHWM, includes the resident pages of the mapped model
-and input files): **Varda 24.4-24.7 GB**, dev 3.1 GB. `varda-parity` on Varda
+and input files): **Varda 24.4-24.7 GB**, the dev model 3.1 GB. `varda-parity` on Varda
 peaks at 70 GB, most of it the pages of the two 40 GB golden files it compares against.
 
 ## 4. Numbers
 
-cpu-short, AMD EPYC 7713 (2 x 64 cores, SMT 2), gcc 12.3 `-O3 -mavx2 -mfma
+CPU node, AMD EPYC 7713 (2 x 64 cores, SMT 2), gcc 12.3 `-O3 -mavx2 -mfma
 -ffp-contract=off`, OpenBLAS 0.3.26, `OMP_PROC_BIND=close OMP_PLACES=threads` unless noted.
 `-c 64` gives 32 physical cores with both hyperthreads; `-c 128` gives 64 cores.
 All times hook-free, warm unless "first", wall clock of `predict_step`.
@@ -133,32 +132,33 @@ All times hook-free, warm unless "first", wall clock of `predict_step`.
 ### Parity (64 threads, `-c 64`)
 
 Every key is within the `cuda-fp32` table against `cpu-fp32-pyg`; the hooked and hook-free
-outputs are bitwise equal.
+outputs are bitwise equal. One job per model (runs A and C of the speed table).
 
-| model | job | worst ratio to tolerance | worst rel_absmax | vs cuda-fp32-triton (report only), worst key |
-|---|---|---|---|---|
-| dev | 283394 | 0.101 (`proc.1.out`, 1.01e-6) | 1.01e-6 | `dec.block_out` 3.36e-6 |
-| Varda | 283392 | 0.181 (`dec.block_out`, 1.81e-6) | 1.81e-6 | `dec.out` 3.46e-6 |
+| model | worst ratio to tolerance | worst rel_absmax | vs cuda-fp32-triton (report only), worst key |
+|---|---|---|---|
+| dev model | 0.101 (`proc.1.out`, 1.01e-6) | 1.01e-6 | `dec.block_out` 3.36e-6 |
+| Varda | 0.181 (`dec.block_out`, 1.81e-6) | 1.81e-6 | `dec.out` 3.46e-6 |
 
 `in.*`, `enc.x_*` and `enc.emb_dst` (a 4-wide GEMM) are bitwise. The error grows from
 ~2-6e-7 at the embeddings to ~7e-7 through the processor, and peaks in the decoder; it is
 about half the GPU reference's own spread against the CPU reference (`cuda-fp32-triton`
-vs `cpu-fp32-pyg`: 3.6e-6 on both models). Full tables: job logs (below) and
-`report.json` next to them.
+vs `cpu-fp32-pyg`: 3.6e-6 on both models). Full per-key tables: `varda-parity --report`
+(`report.json`), as in `docs/testing.md`.
 
 ### Speed
 
-| model | threads | allocation | first call | warm | job |
+| model | threads | allocation | first call | warm | run |
 |---|---|---|---|---|---|
-| Varda | 64 | `-c 64` (32 cores + SMT), shared node | 106.2 s | 87.8-117.3 s | 283392 |
-| Varda | 128 | `-c 128` (64 cores + SMT) | 63.0 s | **61.7 s** | 283395 |
-| Varda | 64, `OMP_PLACES=cores OMP_PROC_BIND=spread` | `-c 128` (one thread per core) | 60.7 s | **60.2 s** | 283395 |
-| dev | 64 | `-c 64` | 5.3 s | 5.25 s | 283394 |
-| dev | 7 | `-c 64` | 35.2 s | | 283394 |
+| Varda | 64 | `-c 64` (32 cores + SMT), shared node | 106.2 s | 87.8-117.3 s | A |
+| Varda | 128 | `-c 128` (64 cores + SMT) | 63.0 s | **61.7 s** | B |
+| Varda | 64, `OMP_PLACES=cores OMP_PROC_BIND=spread` | `-c 128` (one thread per core) | 60.7 s | **60.2 s** | B |
+| dev model | 64 | `-c 64` | 5.3 s | 5.25 s | C |
+| dev model | 7 | `-c 64` | 35.2 s | | C |
 
-For comparison (`$IE_ROOT/docs/varda.md` §6, CPU fp32, 64 threads): Python engine
-plain path 242 s, original anemoi reference 196-213 s. Load: 3.5-4.2 s for Varda with a cold page cache
-(building the three CSR graphs and faulting in the weights), 0.2-1.2 s for dev.
+Runs A, B and C are separate jobs (same binary); B's two rows are the same job.
+
+For comparison (CPU fp32, 64 threads, measured separately): original anemoi 196-213 s. Load: 3.5-4.2 s for Varda with a cold page cache
+(building the three CSR graphs and faulting in the weights), 0.2-1.2 s for the dev model.
 The `-c 64` timings varied by 30% between calls on nodes shared with I/O-heavy jobs
 (golden export); the `-c 128` run was on a quiet node and its calls agree within 0.1 s.
 
@@ -170,12 +170,10 @@ difference (~4-5 s) is the scalar `erff` of the exact GELU. Levers not taken, to
 oracle simple: a vectorised erf, fusing the q/self and k/v weight pairs into one GEMM,
 NUMA-aware first touch.
 
-Logs: `$VARDA_SCRATCH/jobs/cpu-<name>/log.txt` with `report.json`, the job script
-(`job.sh`) and the exact binaries (`bin/`): `cpu-sz-final2` (283394), `cpu-ar-final2`
-(283392), `cpu-ar-run128b` (283395). Earlier runs of intermediate builds: `cpu-ar1`
-(283289; one row block per thread, per-call allocation: Varda parity pass, worst ratio
-0.163, 103 s hook-free at 64 threads on `-c 64`), `cpu-ar-run128` (283324) and `cpu-ar-final`
-(283371) (fixed tiles, per-call allocation).
+Each job kept its script, log, `report.json` and the exact binaries it ran. Earlier runs of
+intermediate builds: one row block per thread with per-call allocation (Varda parity pass, worst
+ratio 0.163, 103 s hook-free at 64 threads on `-c 64`), then two runs with fixed tiles and
+per-call allocation.
 
 ## 5. Lessons (generic)
 
@@ -186,7 +184,7 @@ Logs: `$VARDA_SCRATCH/jobs/cpu-<name>/log.txt` with `report.json`, the job scrip
   count, chunk size) changes last bits. Fixed tiles make the oracle bitwise reproducible
   across thread counts, which turns "is this difference a bug?" into a yes/no question.
 - **Fault in mmap'd weights at load.** On Lustre the first forward pass paid ~14 s of page
-  faults (18.6 s vs 4.4 s warm on dev); a parallel touch of every weight page at
+  faults (18.6 s vs 4.4 s warm on the dev model); a parallel touch of every weight page at
   load (after `MADV_WILLNEED`) moved this into a ~1 s load.
 - **Keep large activation buffers across calls.** Allocating ~23 GB per call re-faults and
   re-zeroes it every time (system time of the Varda parity run fell from 762 s to 362 s

@@ -9,7 +9,7 @@ need a compute node (CLAUDE.md, "Compute"); a job copies the binaries it runs to
 |---|---|---|---|
 | ctest (`tests/*.cpp\|cu`) | kernels, GEMM wrapper, forcings, rollout state | CPU; GPU for the `.cu` tests; data for part of `test_forcings` | `cd build-<you> && ctest` |
 | Python tests (`python/tests/test_convert.py`) | converted-file contract, restricted unpickler | `.venv`; converted files (env vars) | see below |
-| `varda-parity` on real golden data | engine vs the Python reference, all contract keys | converted model + golden + `tolerances/<model>.json` | see below |
+| `varda-parity` on real golden data | engine vs the anemoi golden data, all contract keys | converted model + golden + `tolerances/<model>.json` | see below |
 | ctest, GRIB layer (`tests/io/*.cpp`) | numpy log, vertical interpolation, input and output building blocks, ecCodes link | ecCodes (`VARDA_GRIB=ON`); data for the real-data parts | `cd build-<you> && ctest` |
 | real-data checks | x0, GRIB bytes and the rollout against anemoi-inference's run of 2026-10-22T15 | frozen reference data, converted model, GPU for the rollout | section 5 |
 | synthetic suite (`tests/run_synthetic.sh`) | generality: models outside the real envelope vs an independent float64 reference | `.venv`, `build-*/varda-parity`; GPU for the CUDA part | `BIN=build-<you> tests/run_synthetic.sh` |
@@ -89,10 +89,11 @@ Files:
 source tools/env.sh
 cmake -S . -B build-synth && cmake --build build-synth -j 32
 # a job copies the binary first:  mkdir -p $VARDA_SCRATCH/jobs/synth/run/bin; cp build-synth/varda-parity $VARDA_SCRATCH/jobs/synth/run/bin
-BIN=$VARDA_SCRATCH/jobs/synth/run/bin srun -p cpu-short -A $ACCOUNT -c 16 --mem=32G tests/run_synthetic.sh cpu
-BIN=$VARDA_SCRATCH/jobs/synth/run/bin srun -p debug -A $ACCOUNT --gres=gpu:1 -c 8 --mem=32G --time=00:20:00 tests/run_synthetic.sh
+BIN=$VARDA_SCRATCH/jobs/synth/run/bin srun $VARDA_SLURM_CPU tests/run_synthetic.sh cpu
+BIN=$VARDA_SCRATCH/jobs/synth/run/bin srun $VARDA_SLURM_GPU tests/run_synthetic.sh
 ```
-Wall time: generation about 10 s (the largest file, e, is 315 MB); the whole suite about 1 minute on a GPU node.
+16 CPUs and 32 GB are enough for either part. Wall time: generation about 10 s (the largest file, e, is 315 MB); the
+whole suite about 1 minute on a GPU node.
 
 ### Configurations
 
@@ -111,9 +112,9 @@ and edge counts per destination from 1 to 9 (encoder), 6 (processor), 4 (decoder
 a-d are the reviewer's, e and f were added. Residual index lists are permuted in a-d (input index != output index), `mappers`
 is present in the config of every model.
 
-### What the reference does (independent of the engine; follows `$IE_ROOT/docs/spec-model.md`, `spec-interface.md`)
+### What the reference does (independent of the engine; follows anemoi's GraphTransformer)
 
-Checked against the specs, point by point: normalisation is two fp32 roundings, `x*mul` then `+add` (spec-interface 2.3;
+Checked against anemoi's maths, point by point: normalisation is two fp32 roundings, `x*mul` then `+add` (as anemoi's normaliser;
 the reviewer's reference used float64 here, so `in.x_norm` differed from the engine at the rounding level; now it is
 bitwise and so are all derived inputs); `x_data = [t0 vars | t1 vars | node attr]`; per block: `x_r = lin_self(LN(xd))`
 added before the projection, residual with the un-normalised `xd`, edge term in both k and v, scale 1/sqrt(head_dim),
@@ -145,9 +146,8 @@ Never loosen these to make a run pass without saying so.
 
 ### Measured results
 
-Worst `rel_absmax` over all contract keys (key of the worst in `$VARDA_SCRATCH/jobs/synth/run2/all/summary.tsv`);
-CPU on the node of job 283664 (EPYC), CUDA on A100 (same job, `debug`); build-synth, CUDA fixes of the other agent
-included as of 2026-10-23. Every run passed, hook-free output bitwise equal to the hooked output.
+Worst `rel_absmax` over all contract keys (the key of the worst is in the run's `summary.tsv`); one job on a GPU node:
+CPU on its host CPU (EPYC 7713), CUDA on its A100; build-synth, with the CUDA fixes as of 2026-10-23. Every run passed, hook-free output bitwise equal to the hooked output.
 
 | model | CPU fp32 1 thr | CPU fp32 8 thr | CPU fp32 chunk 37 | CUDA fp32 | CUDA fp32 dec chunk 128 | CUDA fp16 |
 |---|---|---|---|---|---|---|
@@ -163,9 +163,8 @@ Note that C = 768 (c) passes on CUDA in this build; on an earlier build it faile
 The CUDA decoder chunking (`VARDA_DEC_CHUNK_ROWS=128`, three chunks at 300 nodes) is exercised by every model (a decoder
 chunk of the real size is at least 2^18 rows, so without the variable it never splits here).
 
-Jobs: 283662 (CPU, cpu-short, first full pass after the alignment fix), 283663 (CUDA, debug), 283664 (everything,
-debug, the numbers above); 283661 failed on I64 alignment of the first generator version. Logs under
-`$VARDA_SCRATCH/jobs/synth/run1/` and `run2/`.
+Runs: a CPU-only pass on a CPU node (the first full pass after the alignment fix), a CUDA-only pass, then the whole
+suite in one GPU job (the numbers above). An earlier run failed on I64 alignment of the first generator version.
 
 ### Adding a configuration
 
@@ -189,7 +188,7 @@ Parts that need data skip with a message and exit 0 when their variables are uns
   `VARDA_COSMO_DEFINITIONS`.
 - `test_io_numpy_log`: `logf_np` against numpy's float32 `np.log`: special values and a table recorded with numpy
   2.5.4 on an EPYC 7713 (dispatch X86_V3). With `--stdin` it is the exhaustive check over all 2 139 095 039 positive
-  finite float32 (numpy's output streamed in, command in the file header; 0 differ, job 285295).
+  finite float32 (numpy's output streamed in, command in the file header; 0 differ, CPU node, EPYC 7713).
 - `test_io_vertical`: the vertical interpolation and destaggering (`interpolate_extrapolate`, `destagger_z`) bitwise on 6
   synthetic columns whose values were produced by the plugin in the reference env; every extrapolation branch and the
   top clamp. No data needed.
@@ -207,14 +206,14 @@ Parts that need data skip with a message and exit 0 when their variables are uns
 
 ```
 R=$VARDA_SCRATCH/realdata/20261022T15
-build-out/varda-prepare --model $VARDA_SCRATCH/converted/varda-v2/model.safetensors \
+build-out/varda-prepare --model $VARDA_SCRATCH/converted/varda/model.safetensors \
     --io-config $VARDA_SCRATCH/realdata/assets/varda-io.json \
     --regrid-matrix $VARDA_SCRATCH/realdata/assets/regrid-ifs0p25-n320.safetensors \
     --n320-template $VARDA_SCRATCH/hf/templates/ifs-levtype=sfc.grib --realdata $R --out OUT \
     --compare $R/ref-fp16/dumps [--mir-mat <MIR .mat file>] --threads 64
 ```
 Compares every stage with the reference's dumps (sources, regrid outputs, cutout, `x0` per column, step-0 state) and exits
-1 on any difference; expected: all bitwise (`docs/io-input.md` section 4). Run on a compute node (`cpu-short`, 64 cores;
+1 on any difference; expected: all bitwise (`docs/io-input.md` section 4). Run on a compute node (`srun $VARDA_SLURM_CPU`, 64 cores;
 about 8 s).
 
 ### 5.3 Output side: encoder-only byte identity
@@ -223,13 +222,13 @@ about 8 s).
 loop, then `varda-grib-compare` checks the files against the reference's:
 ```
 build-out/varda-grib-write --io-config $VARDA_SCRATCH/realdata/assets/varda-io.json \
-    --templates $VARDA_SCRATCH/hf/templates --model $VARDA_SCRATCH/converted/varda-v2/model.safetensors \
+    --templates $VARDA_SCRATCH/hf/templates --model $VARDA_SCRATCH/converted/varda/model.safetensors \
     --dumps $R/ref-fp16/dumps --out OUT --date 2026-10-22T15:00:00
 build-out/varda-grib-compare --require-bytes OUT/outputs $R/ref-fp16/outputs     # exit 0: 676/676 messages byte-identical
 ```
 `varda-grib-compare TEST REF` compares messages in file order, every header key, bitmap and values (default
 tolerance 0); `--rel-tol`, `--abs-tol`, `--ignore-key`, `--max-report`, `-q` as in `docs/io-output.md` section 3. Use
-`$R/ref-fp32` for the fp32 states. Jobs 285346, 285350.
+`$R/ref-fp32` for the fp32 states. Results: `docs/io-output.md` section 4.
 
 ### 5.4 Rollout judged against the reference
 
@@ -239,7 +238,7 @@ rollout tolerances (`docs/rollout-engine.md` section 4):
 ```
 .venv/bin/python -I python/reference/realdata/export_rollout_realdata.py $R/ref-fp16 \
     $VARDA_SCRATCH/rollout/ref/cpu-fp32-pyg/rollout.safetensors          # -> $R/ref-fp16/rollout.safetensors
-build-out/varda-rollout --model $VARDA_SCRATCH/converted/varda-v2/model.safetensors \
+build-out/varda-rollout --model $VARDA_SCRATCH/converted/varda/model.safetensors \
     --input $R/ref-fp16/rollout.safetensors --compare $R/ref-fp16/rollout.safetensors \
     --device cuda --precision fp16 --check-forcings --verify-host --json rollout.json
 ```
@@ -255,7 +254,7 @@ build-out/varda-grib-compare --require-bytes -q OUT/outputs $R/ref-fp16/outputs
 Expected: step 0 files (`*_0.grib`) byte-identical (140 messages); step files differ by the model error, so the compare
 reports failures at tolerance 0 (by construction; with `--rel-tol` set to the scale of interest it is a report, not a
 verdict). The verdict on the model output is 5.4; `OUT/y.safetensors` (`--dump-y`) must equal the `y` of
-`varda-rollout --out` bitwise (job 285378). Rerun with the same arguments: the bytes must equal. Jobs copy the
+`varda-rollout --out` bitwise (`docs/results.md` section 5). Rerun with the same arguments: the bytes must equal. Jobs copy the
 binaries first (`$VARDA_SCRATCH/jobs/<name>/bin`).
 
 ## Entrypoint check
@@ -263,5 +262,5 @@ binaries first (`$VARDA_SCRATCH/jobs/<name>/bin`).
 `./varda forecast 2026-10-22T15` with `VARDA_INPUTS` pointing at a directory holding the frozen date (symlink
 `20261022T15 -> $VARDA_SCRATCH/realdata/20261022T15`) must give step-0 files byte-identical to
 `$VARDA_SCRATCH/realdata/20261022T15/ref-fp16/outputs/*_0.grib` and all 10 files byte-identical to `varda-forecast` run
-with explicit flags (jobs 285865, 285942: 10/10). `tools/make_assets.py check` verifies the assets bundle.
+with explicit flags (10/10 in two separate runs, `docs/quickstart.md` section 6). `tools/make_assets.py check` verifies the assets bundle.
 

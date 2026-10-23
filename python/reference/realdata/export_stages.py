@@ -26,6 +26,7 @@ Metadata `stages` (JSON): in_vars, out_vars, dates, forcing_vars, source of each
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -35,7 +36,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from safetensors_io import read_safetensors, write_safetensors  # noqa: E402
 
-CONVERTED = Path("$VARDA_SCRATCH/converted/varda-v2/model.safetensors")  # cutout masks
+CONVERTED = (Path(os.environ["VARDA_SCRATCH"]) / "converted" / "varda" / "model.safetensors"  # cutout masks
+             if os.environ.get("VARDA_SCRATCH") else None)
 
 
 def load(run: Path, name: str):
@@ -95,7 +97,7 @@ def main() -> None:
         x0[0], np.swapaxes(np.asarray(ti["x"]), -2, -1), equal_nan=True))
     info["checks"]["x0_nan"] = int(np.isnan(x0).sum())
     # C1 -> C2: the merged columns of x0 are lam.<var> followed by global.<var>[:, global/cutout_mask]
-    if CONVERTED.exists():
+    if CONVERTED is not None and CONVERTED.exists():
         cmeta, conv = read_safetensors(CONVERTED)
         cvars = json.loads(cmeta["config"])["variables"]
         info["checks"]["in_vars_equal_engine_input_order"] = cvars["input"] == in_vars

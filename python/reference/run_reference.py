@@ -1,26 +1,24 @@
-"""Copied from $IE_ROOT (the Python project) at commit aada999, then adapted for varda.cpp (Varda = varda).
+"""Run the ORIGINAL anemoi model (the Varda forecaster) once on a deterministic synthetic input and dump golden tensors.
 
-Run the ORIGINAL anemoi model once on a deterministic synthetic input and dump golden tensors.
-
-Contract activations (docs/format.md §2) are produced by the Python project's dump_golden.py (not copied here;
-python/export_golden.py converts its output). This script writes the per-file dumps (input.pt, output.pt,
+Contract activations (docs/format.md §2) are in the reference golden directories ($REF_GOLDEN, read-only;
+python/export_golden.py converts them). This script writes the per-file dumps (input.pt, output.pt,
 activations/*.pt) and is the module run_rollout.py imports (model loading, attention backend, variable names).
 
 Runs in $VARDA_SCRATCH/venv-ref-varda only (it unpickles the real anemoi classes). Never import this from src/ or tests/.
 
 Environment: $VARDA_SCRATCH/venv-ref-varda (uv, Python 3.12), lock requirements-ref-varda.lock.txt next to this file.
-Recipe (the Python project's varda recipe, plus anemoi-inference at the commit the Hugging Face release pins):
+Recipe (the Varda reference lock $REF_LOCK, plus anemoi-inference at the commit the Hugging Face release pins):
 
-    export UV_CACHE_DIR=$SCRATCH/.cache/uv; V=$VARDA_SCRATCH/venv-ref-varda
+    export UV_CACHE_DIR=<a uv cache on the scratch file system>; V=$VARDA_SCRATCH/venv-ref-varda
     uv venv --python ~/.local/bin/python3.12 $V
     # torch/torchvision from the cu130 index ALONE (never combined with --extra-index-url pypi)
     uv pip install --python $V/bin/python "torch==2.10.0+cu130" "torchvision==0.25.0+cu130" \
         --index-url https://download.pytorch.org/whl/cu130
     printf 'torch==2.10.0+cu130\ntorchvision==0.25.0+cu130\n' > constraints.txt
-    # the Python project's varda lock minus the two torch lines (PyPI + the git pins inside the lock):
-    grep -vE '^(torch|torchvision)==' $IE_ROOT/reference/requirements-ref-varda.lock.txt > lock-rest.txt
+    # the reference lock minus the two torch lines (PyPI + the git pins inside the lock):
+    grep -vE '^(torch|torchvision)==' $REF_LOCK > lock-rest.txt
     uv pip install --python $V/bin/python -c constraints.txt -r lock-rest.txt
-    uv pip freeze > freeze-before.txt          # identical to the varda lock
+    uv pip freeze > freeze-before.txt          # identical to $REF_LOCK
     # constraints.txt = every installed package pinned (name==version) EXCEPT anemoi-utils, anemoi-transform, pandas
     # (anemoi-inference 9505dd09 needs anemoi-utils>=0.5.13 and, to import, an anemoi-transform whose Variable has
     # `.units` (0.3.0+; the HF release asks >=0.4.2), which needs pandas<3). Nothing else has to move.
@@ -30,13 +28,13 @@ Recipe (the Python project's varda recipe, plus anemoi-inference at the commit t
     # added: anemoi-inference, anytree, astropy, astropy-iers-data, healpy, peekle, pydantic-settings, pyerfa,
     # termcolor, tzdata, wcwidth. torch unchanged (docs/rollout.md).
 
-The pickle is the Hugging Face / varda checkpoint ($VARDA_SCRATCH/hf/varda-forecaster-det-sgm/model.ckpt).
+The pickle is the Hugging Face checkpoint ($VARDA_CKPT = varda-forecaster-det-sgm/model.ckpt).
 
 Usage (compute node; see CLAUDE.md):
 
-    srun -p cpu-short -A $ACCOUNT --time=00:45:00 -c 64 --mem=300G \
+    srun $VARDA_SLURM_CPU --mem=300G \
         $VARDA_SCRATCH/venv-ref-varda/bin/python python/reference/run_reference.py --device cpu --backend pyg \
-        --input $IE_SCRATCH/golden/varda/cpu_float32_pyg/input.pt --out $VARDA_SCRATCH/golden-ref/cpu_float32_pyg
+        --input $REF_GOLDEN/cpu_float32_pyg/input.pt --out $VARDA_SCRATCH/golden-ref/cpu_float32_pyg
 
 Attention backend override: the checkpoint was pickled with graph_attention_backend="triton", i.e. every
 GraphTransformer{Mapper,Processor}Block has `.graph_attention_backend == "triton"` and
@@ -57,14 +55,15 @@ import os
 import platform
 import resource
 import socket
+import sys
 import time
 from pathlib import Path
 
 import torch
 
-VARDA_SCRATCH = os.environ.get("VARDA_SCRATCH", "$VARDA_SCRATCH")
-CKPT = f"{VARDA_SCRATCH}/hf/varda-forecaster-det-sgm/model.ckpt"  # == varda inference-last.ckpt (same sha256)
-OUT_ROOT = f"{VARDA_SCRATCH}/golden-ref"  # one-step dumps; the Python project's golden data is in $IE_SCRATCH/golden/varda
+VARDA_SCRATCH = os.environ.get("VARDA_SCRATCH") or sys.exit("VARDA_SCRATCH is not set: source tools/env.sh")
+CKPT = os.environ.get("VARDA_CKPT") or sys.exit("VARDA_CKPT is not set: source tools/env.sh")  # the HF checkpoint
+OUT_ROOT = f"{VARDA_SCRATCH}/golden-ref"  # one-step dumps; the reference golden data is in $REF_GOLDEN
 DATASET = "data"
 CHUNK_ENV = ("ANEMOI_INFERENCE_NUM_CHUNKS", "ANEMOI_INFERENCE_NUM_CHUNKS_MAPPER", "ANEMOI_INFERENCE_NUM_CHUNKS_PROCESSOR")
 
@@ -105,13 +104,13 @@ def variable_names(model) -> tuple[list[str], list[str]]:
 def make_input(model, seed: int, ckpt: str | None = None) -> tuple[torch.Tensor, dict]:
     """Deterministic synthetic input, shape (batch=1, time=2, grid=G, vars=V_in), physical units.
 
-    G is the model's data-node count (dev 40320, varda 1688650), V_in its input variables.
+    G is the model's data-node count (dev model 40320, Varda 1688650), V_in its input variables.
     Variables with mean-std normalisation: z ~ N(0,1) in normalised space at t=0, t=1 = t=0 + 0.1 N(0,1),
     de-normalised with the model's own pre-processor statistics, then clipped to the dataset [min, max]
     from `model.statistics` (when available) so e.g. q_* stays >= 0. Max-normalised (z, sdor, slor):
     U(0,1) * max. Unnormalised: sin/cos of lat/lon from the real grid; other sin/cos features U(-1,1);
     cloud covers, insolation, lsm U(0,1). Everything except the mean-std variables is identical at t=0, t=1.
-    Caveat: `model.statistics` need not be the statistics folded into the normaliser (varda: global
+    Caveat: `model.statistics` need not be the statistics folded into the normaliser (Varda: global
     normaliser kept from the forked run, `statistics` of the regional dataset); the clipping then uses the
     regional ranges. Harmless for parity: the input only has to be finite and plausible.
     """

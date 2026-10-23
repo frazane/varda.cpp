@@ -183,7 +183,7 @@ def anemoi_metadata(path):
 
 
 def checkpoint_identity(path, sha256=True):
-    """{path, uuid, run_id, size_bytes, sha256} of a checkpoint file (docs/contracts.md §1 "source").
+    """{path, uuid, run_id, size_bytes, sha256} of a checkpoint file (docs/format.md §1.2 "source").
 
     uuid and run_id come from the embedded anemoi.json; sha256 is over the file bytes (skip with
     sha256=False). 

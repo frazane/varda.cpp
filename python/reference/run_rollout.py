@@ -1,14 +1,12 @@
-"""Roll the ORIGINAL model (Varda forecaster = varda) out for N steps with anemoi-inference's own loop; save the steps.
+"""Roll the ORIGINAL model (the Varda forecaster) out for N steps with anemoi-inference's own loop; save the steps.
 
-Copied from $IE_ROOT (the Python project) at commit aada999, then adapted for varda.cpp:
-Varda checkpoint/input/paths, every dev constant removed (variable counts come from the model), the time step
-taken from the checkpoint (Varda: 6 h; lead_time = steps x timestep, dates follow the runner), inference mode only
-(the anemoi-training mode was dropped), a stub-model mode to record the forcings, forcings replay cross-checked
-against the runner's own ComputedForcings, per-run bitwise check without keeping every run in memory.
+Variable counts come from the model, the time step from the checkpoint (Varda: 6 h; lead_time = steps x timestep,
+dates follow the runner); inference mode only; a stub-model mode records the forcings; forcings replay is
+cross-checked against the runner's own ComputedForcings; per-run bitwise check without keeping every run in memory.
 
 Runs in $VARDA_SCRATCH/venv-ref-varda only (it imports anemoi-inference, anemoi-models). Never import this from src/.
 anemoi-inference is pinned to 9505dd0926ec3c5dea9308813cc7859bfdad755a there (recipe: header of run_reference.py;
-lock: requirements-ref-varda.lock.txt; differences to the Python project's eaeb36fa: docs/rollout.md).
+lock: requirements-ref-varda.lock.txt; differences to eaeb36fa: docs/rollout.md).
 
 Inference mode: anemoi-inference's own loop, not a mirror of it: a DefaultRunner(RunConfiguration(checkpoint=...,
 input="dummy", output="none", device, precision)) whose `model` (a cached_property) is replaced by the model loaded as
@@ -28,9 +26,9 @@ Usage (compute nodes; see CLAUDE.md; PY=$VARDA_SCRATCH/venv-ref-varda/bin/python
 
     # forcings of the 24-step rollout (stub model, any node, ~1 min); the other runs replay them
     $PY python/reference/run_rollout.py --forcings-only --steps 24 --out $R/forcings
-    sbatch (cpu-long, -c 64 --mem=300G) $PY python/reference/run_rollout.py --device cpu --backend pyg --precision 32 \
+    sbatch ($VARDA_SLURM_CPU --mem=300G, a partition allowing > 1 h) $PY python/reference/run_rollout.py --device cpu --backend pyg --precision 32 \
         --steps 24 --forcings-from $R/forcings/forcings.pt --out $R/ref/cpu-fp32-pyg
-    sbatch (gpu-short, --gres=gpu:1 -c 16 --mem=200G) $PY python/reference/run_rollout.py --device cuda \
+    sbatch ($VARDA_SLURM_GPU, 1 h) $PY python/reference/run_rollout.py --device cuda \
         --backend triton --precision 32|checkpoint --steps 24 --runs 2 --forcings-from $R/forcings/forcings.pt \
         --out $R/ref/cuda-fp32-triton | cuda-fp16-triton
     # perturbed fp16 ensemble (docs/rollout.md): ANEMOI_INFERENCE_NUM_CHUNKS_MAPPER=8 | _PROCESSOR=4 with
@@ -68,10 +66,10 @@ from compare_golden import checkpoint_identity, diff_metric  # noqa: E402
 
 DS = rr.DATASET
 ROOT = f"{rr.VARDA_SCRATCH}/rollout"
-IE_SCRATCH = os.environ.get("IE_SCRATCH", "$SCRATCH/the Python project")
-INPUT = f"{IE_SCRATCH}/golden/varda/cpu_float32_pyg/input.pt"  # the Python project's golden one-step input (read-only)
+REF_GOLDEN = os.environ.get("REF_GOLDEN") or sys.exit("REF_GOLDEN is not set: source tools/env.sh")  # read-only
+INPUT = f"{REF_GOLDEN}/cpu_float32_pyg/input.pt"  # the reference golden one-step input (read-only)
 DATE = "2024-06-01T00:00:00"  # date of the newest input slot; the forcing dates follow the runner (+ checkpoint timestep)
-MODEL = "varda"  # name of the tolerances file: tolerances/rollout/<MODEL>.json (Varda = varda)
+MODEL = "varda"  # name of the tolerances file: tolerances/rollout/<MODEL>.json
 KEYS = ("y", "y_norm", "window", "window_norm")
 REPO = Path(__file__).resolve().parents[1]
 ROLLOUT_TOLERANCES_DIR = REPO / "tolerances" / "rollout"  # tolerances/rollout/<model>.json, found by checkpoint uuid
@@ -220,7 +218,7 @@ def run_inference(runner, x0: torch.Tensor, n_steps: int, date: datetime.datetim
 
 
 def step_metrics(ref: dict, other: dict, n: int | None = None) -> dict:
-    """Per step, contract metric (docs/contracts.md §2) of y, window and their normalised versions (float64)."""
+    """Per step, contract metric (docs/format.md §2) of y, window and their normalised versions (float64)."""
     n = n or min(ref["y"].shape[0], other["y"].shape[0])
     mo, ao = ref["mul_out"].double(), ref["add_out"].double()
     mi, ai = ref["mul_in"].double(), ref["add_in"].double()
@@ -286,8 +284,8 @@ CHECKED = ("steps", "keys", "fast-fp32-vs-cpu", "fast-fp16-vs-cpu", "fast-fp16-v
 def calibrate(dirs: list[str], out: Path | None, fp16_ensemble: list[str] = (), check: str | None = None) -> dict:
     """dirs: the cpu-fp32-pyg, cuda-fp32-triton and cuda-fp16-triton rollout directories (in this order).
 
-    Writes ``out`` (default: tolerances/rollout/<model>.json in this repository, <model> = the checkpoint's directory
-    name), recording the checkpoint identity of the CPU reference rollout (its manifest's checkpoint) so the tests find
+    Writes ``out`` (default: tolerances/rollout/<model>.json in this repository, <model> = MODEL),
+    recording the checkpoint identity of the CPU reference rollout (its manifest's checkpoint) so the tests find
     the file by uuid. ``check``: exit 1 unless the tables the tests read (CHECKED) equal that file's exactly.
     """
     old = json.loads(Path(check).read_text()) if check else None  # read before anything is written
@@ -367,10 +365,10 @@ def calibrate(dirs: list[str], out: Path | None, fp16_ensemble: list[str] = (), 
             "Per rollout step s (0-based; step s is the s-th model call), contract metric rel_absmax = max|a-r|/max|r| "
             "(float64) of: y (the step's physical output (1,1,1,G,72)), y_norm (y*mul_out+add_out in float64: every "
             "variable O(1)), window (the physical (1,2,G,84) window step s sees) and window_norm. The references are "
-            "anemoi-inference rollouts of the original model (reference/run_rollout.py, identical input and forcings): "
+            "anemoi-inference rollouts of the original model (python/reference/run_rollout.py, identical input and forcings): "
             "cpu-fp32-pyg (ground truth), cuda-fp32-triton (runner precision '32'), cuda-fp16-triton (runner precision "
             "from the checkpoint: fp16 autocast, production). Error grows with the step, so tolerances are per step, "
-            "with the one-step method of bench/calibrate_tolerances.py: fast-fp32-vs-cpu = max(1e-5, 3 x ref cuda-fp32 vs cpu) "
+            "with the one-step method of tolerances/<model>.json: fast-fp32-vs-cpu = max(1e-5, 3 x ref cuda-fp32 vs cpu) "
             "(window at step 0 = the input: 1e-6); fast-fp16-vs-cpu = 1.75 x ref cuda-fp16 vs cpu; "
             "fast-fp16-vs-ref-fp16 = 2 x ref cuda-fp16 vs ref cuda-fp32 (two independent roundings add); floors 1e-6; "
             "rounded up to 2 significant digits."
@@ -385,7 +383,7 @@ def calibrate(dirs: list[str], out: Path | None, fp16_ensemble: list[str] = (), 
                "trajectories is heavy-tailed: valid reference runs exceed the 1.75x envelope of the OTHER runs by up "
                "to fp16_leave_one_out's worst ratio, so steps >= 1 allow that factor (fp16_allowance), and the mean "
                "over steps (a stable statistic) must stay within 1.75 x the members' largest mean "
-               "(fp16_mean_tolerance). See fp16_criterion and docs/rollout.md §5."
+               "(fp16_mean_tolerance). See fp16_criterion and docs/rollout.md §4."
                if fp16_ensemble else "")),
         "model": model,
         "checkpoint": {k: ident.get(k) for k in ("uuid", "run_id", "size_bytes", "sha256", "path")},

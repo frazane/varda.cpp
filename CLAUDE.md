@@ -6,7 +6,7 @@
 
 - `docs/format.md`: the contracts (converted file, activation names, golden files,
   tolerances). Code that produces or consumes any of them follows it exactly.
-- `docs/design.md`: the map: pipeline, decisions, verification, methodology additions.
+- `docs/design.md`: the map: pipeline, decisions, verification, methodology.
 - `docs/cpu.md`, `docs/cuda.md`: the two backends. `docs/rollout-engine.md`: the C++ rollout.
   `docs/forcings.md`: computed forcings. `docs/rollout.md`: reference rollouts and their
   tolerances. `docs/tools.md`: converter. `docs/testing.md`: every test suite and how to run it.
@@ -16,13 +16,10 @@
 - `docs/results.md`: parity and benchmark numbers, each with its full configuration.
 - `docs/quickstart.md`: the user entrypoint (`./varda setup|fetch|forecast`), the assets bundle
   (`tools/make_assets.py`) and the input fetch (`python/fetch_inputs.py`).
-- The maths is specified in the Python project (read-only, `$IE_ROOT` =
-  `$HOME/projects/the Python project`): `docs/spec-model.md` (encoder, processor,
-  decoder), `docs/spec-interface.md` (normaliser, residual, bounding, index spaces),
-  `docs/varda.md` (= Varda: delta, scale, GPU notes), `docs/rollout.md`,
-  `docs/methodology.md` (the playbook; fold generic lessons from this port into our
-  `docs/design.md` §"Methodology additions"). Its engine (`engine/model.py` plain path,
-  `engine/fast.py` GPU path) is the closest prior art: read it before writing a kernel.
+- The maths is anemoi's GraphTransformer (encoder, processor, decoder; normaliser, residual,
+  bounding, index spaces). The CPU backend (`docs/cpu.md`, `src/varda/cpu/`) is its readable
+  op sequence: read it before writing a kernel. Fold generic lessons into
+  `docs/design.md` §"Methodology".
 
 ## Hard rules
 
@@ -39,11 +36,14 @@
 - A parity claim needs numbers: `rel_absmax` and `max_abs` per key, plus device, precision
   and thread count (metric: `docs/format.md` §2). A timing claim names device, precision,
   warm or first call, CUDA graph on/off, and compares like with like in the same job.
-- Read-only, never write there: `$MODELS_DIR/`, `$IE_ROOT`,
-  `$IE_SCRATCH` (`$SCRATCH/the Python project`, the Python project's golden
-  data, venvs and converted models). Our large artefacts go under
-  `$VARDA_SCRATCH` = `$VARDA_SCRATCH/` (converted models, exported
+- Read-only, never write there: the checkpoint files (`$VARDA_CKPT`, `$VARDA_DEV_CKPT`) and
+  their directories, `$REF_ROOT`, `$REF_SCRATCH` (set in `tools/env.local.sh`; the reference
+  data made with anemoi: golden activations, reference rollouts, reference venvs, weight
+  exports). Our large artefacts go under `$VARDA_SCRATCH` (converted models, exported
   golden, job logs), never in the repository.
+- Machine-specific values (paths, toolchain, Slurm arguments) live only in the untracked
+  `tools/env.local.sh` (template: `tools/env.local.example.sh`) and `CLAUDE.local.md`; tracked
+  files use the variables, never the values.
 - One owner per file. Your brief lists the files you may change; everything else is
   read-only to you. Shared headers (`src/varda/varda.h`, `config.h`, `format.h`,
   `backend.h`, `graph.h`) change only via the integrator: ask in your report.
@@ -55,35 +55,32 @@
 ## Build
 
 ```
-source tools/env.sh          # gcc 12.3, CUDA 12.3 (nvcc, cuBLAS), OpenBLAS 0.3.26, paths
+source tools/env.sh          # sources tools/env.local.sh: toolchain (gcc, CUDA, OpenBLAS), paths
 cmake -S . -B build-<you> && cmake --build build-<you> -j 32
 ```
 Use your own build directory (`build-cpu`, `build-cuda`, ...). A running job must never
 execute a binary that someone may rebuild: jobs copy the binaries they run to a job-private
 directory under `$VARDA_SCRATCH/jobs/<name>/` first. `-DVARDA_CUDA=OFF` builds the CPU
-backend only. GPU target: sm_80 (A100-SXM4 96 GB on the GPU nodes).
+backend only. GPU target: sm_80 (A100).
 
-## Compute (Slurm, account `$ACCOUNT`)
+## Compute
 
-- Login node: editing, building, reading metadata. No model runs.
-- CPU work: `srun -p cpu-short -A $ACCOUNT --time=00:30:00 -c 64 --mem=200G ...` (256-core
-  EPYC 7713 nodes, 456 GB, 1 h limit). Varda on CPU needs ~100–150 GB.
-- GPU: `-p debug` (30 min) or `-p gpu-short` (1 h) or `-p gpu-normal`, with
-  `-A $ACCOUNT --gres=gpu:1 -c 16 --mem=200G`. GPU only when needed.
+- Model runs go to compute nodes, not the login node: GPU jobs with `$VARDA_SLURM_GPU`, CPU
+  jobs with `$VARDA_SLURM_CPU` (Slurm arguments, set in `tools/env.local.sh`). Varda on CPU
+  needs ~100–150 GB. GPU only when needed.
 - Long or important runs: `sbatch` (survives the orchestrator), logs and exit codes to files
   under `$VARDA_SCRATCH/jobs/`. Blocking `srun` dies with its parent.
-- `/tmp` is node-local and invisible to jobs.
 - Check your own jobs with `squeue -u $USER` before and after; cancel only jobs you started.
 
 ## Models and data (all paths after `source tools/env.sh`)
 
-| | Varda forecaster (= varda) | dev (dev model) |
+| | Varda forecaster (`varda`) | dev model (`dev`: smaller, same architecture) |
 |---|---|---|
-| checkpoint | `$VARDA_SCRATCH/hf/varda-forecaster-det-sgm/model.ckpt` (HF download; same sha256 as `$VARDA_CKPT`) | `$VARDA_DEV_CKPT` |
-| converted | `$VARDA_SCRATCH/converted/varda-v2/model.safetensors` (adds the cutout masks the GRIB layer needs; every other tensor bitwise equal to `converted/varda/`) | `$VARDA_SCRATCH/converted/dev/model.safetensors` |
-| golden (Python project) | `$IE_SCRATCH/golden/varda/{cpu-fp32-pyg,cuda-fp32-triton,cuda-fp16-triton}/` (~40 GB each) | `$IE_SCRATCH/golden/{cpu-fp32-pyg,cuda-fp32-triton,cuda-fp16-triton}/` (1.4 GB each) |
+| checkpoint | `$VARDA_CKPT` (the Hugging Face file `varda-forecaster-det-sgm/model.ckpt`) | `$VARDA_DEV_CKPT` |
+| converted | `$VARDA_SCRATCH/converted/varda/model.safetensors` | `$VARDA_SCRATCH/converted/dev/model.safetensors` |
+| golden (anemoi, read-only) | `$REF_GOLDEN/{cpu-fp32-pyg,cuda-fp32-triton,cuda-fp16-triton}/` (~40 GB each) | `$REF_GOLDEN_DEV/<same tags>/` (1.4 GB each) |
 | exported golden | `$VARDA_SCRATCH/golden/varda/<tag>.safetensors` | `$VARDA_SCRATCH/golden/dev/<tag>.safetensors` |
 | tolerances | `tolerances/varda.json` | `tolerances/dev.json` |
 | sizes | G 1 688 650, H 189 809, E enc/proc/dec 2.85M / 1.52M / 5.07M, 79 in / 67 out | G 40 320, H 10 242, 84 in / 72 out |
 
-Iterate on dev (seconds per forward), then confirm on Varda.
+Iterate on the dev model (seconds per forward), then confirm on Varda.

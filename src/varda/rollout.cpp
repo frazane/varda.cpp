@@ -101,8 +101,8 @@ void check_rollout_model(const Model& m) {
     require(c.timestep_hours > 0, "the config's forcings section has no timestep_hours");
     require(c.n_output_steps == 1, "only models with one output step are supported");
     require(int64_t(m.latitudes().size()) == c.n_data_nodes && int64_t(m.longitudes().size()) == c.n_data_nodes,
-            "the model file has no grid.latitudes / grid.longitudes (needed for computed forcings); use a file"
-            " from converted-new/");
+            "the model file has no grid.latitudes / grid.longitudes (needed for computed forcings); reconvert"
+            " the checkpoint with python/convert.py");
 }
 
 Rollout::Rollout(Model& model, ConstantSource cs) : m_(model) {

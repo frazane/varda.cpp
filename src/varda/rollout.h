@@ -1,5 +1,5 @@
-// Autoregressive rollout with anemoi-inference's semantics (docs/rollout-engine.md;
-// $IE_ROOT/docs/rollout.md §1): the host-level loop, usable with any backend (CPU, or CUDA
+// Autoregressive rollout with anemoi-inference's semantics (docs/rollout-engine.md §1):
+// the host-level loop, usable with any backend (CPU, or CUDA
 // through Model::predict_step's host copies). This is the readable oracle of the rollout; the
 // device-resident CUDA loop (src/varda/cuda/rollout_cuda.h) is bitwise equal to it on the same
 // backend.
@@ -15,7 +15,7 @@
 //               newest slot, dynamic forcings  <- forcings at the valid date of this step's output;
 //        newest slot, constant inputs: never written, so they keep the NEWEST slot's own values
 //        (ConstantSource::Newest, the default). ConstantSource::Oldest reproduces anemoi-inference
-//        eaeb36fa (the Python project's references), whose roll(-1) brought the OLDEST slot's values
+//        eaeb36fa (the dev-model reference rollouts), whose roll(-1) brought the OLDEST slot's values
 //        round. The two agree whenever the constants are equal in all slots (real inputs).
 //   3. valid date of output s = date0 + (s + 1) * timestep_hours, date0 = the newest input slot's date.
 #pragma once

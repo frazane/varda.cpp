@@ -17,11 +17,11 @@ model because apps/common.h load_tolerances matches one checkpoint.uuid per file
 numpy + stdlib only: run as `.venv/bin/python -I python/tests/synthetic.py --out DIR`.
 Deterministic: every random draw comes from numpy.random.default_rng(seed).
 
-The reference follows $IE_ROOT/docs/spec-model.md and spec-interface.md, implemented
+The reference follows anemoi's GraphTransformer maths, implemented
 independently of the engine (no shared code, different formulation: dense per-destination
 softmax in float64):
   * normalisation: x*mul rounded to fp32, then +add rounded to fp32 (two fp32 ops, no FMA;
-    spec-interface 2.3), so in.x_norm and everything derived are bit-exact inputs for the engine;
+    as anemoi's normaliser), so in.x_norm and everything derived are bit-exact inputs for the engine;
   * x_data = [t0 vars | t1 vars | node attr] (time major, attributes last);
   * pre-norm block: x_r = lin_self(LN(xd)) is added BEFORE the projection, the residual is
     the un-normalised xd; the edge term e is added to BOTH k and v; softmax subtracts the
@@ -343,7 +343,7 @@ def reference(cfg, t, x):
     ni, no = cfg["indices"]["norm_input"], cfg["indices"]["norm_output"]
     mul32, add32 = t["norm.mul"], t["norm.add"]
     X = x
-    xn32 = (X * mul32[ni]).astype(np.float32)  # two separate fp32 roundings (spec-interface 2.3)
+    xn32 = (X * mul32[ni]).astype(np.float32)  # two separate fp32 roundings (anemoi's normaliser)
     xn32 = (xn32 + add32[ni]).astype(np.float32)
     xn = xn32.astype(np.float64)
     T = xn.shape[1]
@@ -405,7 +405,7 @@ def generate(name, out):
     manifest = {
         "tag": f"synthetic/{name}", "contract": "docs/format.md section 2",
         "script": "python/tests/synthetic.py", "generator": "python/tests/synthetic.py",
-        "reference": "independent float64 numpy implementation of spec-model.md / spec-interface.md, "
+        "reference": "independent float64 numpy implementation of anemoi's GraphTransformer forward, "
                      "normalisation in two fp32 roundings, rounded to F32 at export",
         "seed": c["seed"], "config": c, "numpy": np.__version__,
         "checkpoint_identity": {"uuid": uuid_of(name)}, "keys": keys,

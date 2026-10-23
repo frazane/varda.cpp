@@ -11,7 +11,7 @@
 Subcommands:
     make_assets.py check [--dest DIR]           verify DIR against its manifest (exit 1 with what is missing)
     make_assets.py link  [--dest DIR] [--copy]  assemble DIR from existing, verified files (hard links, or copies
-                                                with --copy or across file systems); defaults: this cluster's paths
+                                                with --copy or across file systems); defaults: under $VARDA_SCRATCH
     make_assets.py build --hf HF [--dest DIR] [--grib F] [--py PY] [--ref-py PY]
                                                 from scratch: run the converter (PY: torch env) and the two exporters
                                                 (REF-PY: the reference env with anemoi-inference, mir, eccodes);
@@ -344,7 +344,7 @@ def main() -> None:
     s = os.path.join(SCRATCH or "/nonexistent", "")
     ln = sub.add_parser("link")
     ln.add_argument("--dest", default=default_dest())
-    ln.add_argument("--model", default=f"{s}converted/varda-v2/model.safetensors")
+    ln.add_argument("--model", default=f"{s}converted/varda/model.safetensors")
     ln.add_argument("--io-config", default=f"{s}realdata/assets/varda-io.json")
     ln.add_argument("--regrid-matrix", default=f"{s}realdata/assets/regrid-ifs0p25-n320.safetensors")
     ln.add_argument("--templates", default=f"{s}hf/templates")

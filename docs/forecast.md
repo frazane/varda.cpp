@@ -22,7 +22,7 @@ section 2): `model.safetensors`, `varda-io.json`, `regrid-ifs0p25-n320.safetenso
 
 | input | what | where (verified date) |
 |---|---|---|
-| model | converted file with the cutout masks (`docs/format.md` section 1.1; the converter adds `grid.<source>.cutout_mask`) | `$VARDA_SCRATCH/converted/varda-v2/model.safetensors` |
+| model | converted file with the cutout masks (`docs/format.md` section 1.1; the converter adds `grid.<source>.cutout_mask`) | `$VARDA_SCRATCH/converted/varda/model.safetensors` |
 | io config | `varda-io.json` (schema `varda-io/1`): variables, orders, namer, output paths, lead time, patches. Exported from the HF config by `python/export_io_config.py` | `$VARDA_SCRATCH/realdata/assets/varda-io.json` |
 | regrid matrix | MIR's IFS 0.25 deg -> N320 `linear` interpolation as a sparse matrix (542 080 x 1 038 240, nnz 1 505 824), exported by `python/export_regrid_matrix.py` | `$VARDA_SCRATCH/realdata/assets/regrid-ifs0p25-n320.safetensors` |
 | templates | `templates/` of the HF repo (`ICON` and `IFS` samples; the N320 `ifs-levtype=sfc.grib` also serves as encoding template for the regrid) | `$VARDA_SCRATCH/hf/templates` |
@@ -59,7 +59,7 @@ build-out/varda-forecast --assets $VARDA_SCRATCH/assets/varda-single-1.0 \
 
 `./varda forecast DATE` (`docs/quickstart.md`) runs exactly this, with `--assets`, `--realdata` of the date's input
 directory and `--quiet` (the input log goes to `forecast.json` only). `--assets` gives the same bytes as the
-explicit options (job 285865, `docs/quickstart.md` section 6).
+explicit options (10 / 10 files byte-identical, `docs/quickstart.md` section 6).
 
 It needs a GPU node (or `--device cpu`, ~60 s per step in fp32, `docs/results.md` section 3). `--lead-time-hours`
 defaults to the io config's (24 h, 4 steps of 6 h) and must be a multiple of the model's step. `--no-graph` and
@@ -107,19 +107,25 @@ writer thread   :                                                               
 ## 4. Timings
 
 Start-up (model load, input) was sped up after the tables below were measured (commits 5538fa1, eb7f17b). Current
-expectation, job 286500 (A100-SXM4-80GB, 32 CPUs, fp16, graph on, 4 steps, process wall clock, three runs each):
-**8.3-8.7 s with cold file caches**, 7.8-7.9 s warm; the binary of the tables below, same job: 20.8-26.3 s cold,
-10.5-10.6 s warm. Cold weights load 1.9-2.7 s (was 15-17 s). Table and method: `docs/results.md` section 5, last
-subsection. The tables below, the "10.4 s warm" and the 14 s cold load are historical (commit a9dcc66).
+expectation (A100-SXM4-80GB, 32 CPUs, fp16, graph on, 4 steps, process wall clock):
+- **About 13 s for the first run in a fresh allocation** (12.9 and 13.6 s in two jobs, `docs/results.md` section 5). That
+  first process loses 4.6-5.4 s before its own timer starts; shared libraries (CUDA, cuBLAS, ecCodes) not yet in the
+  page cache are the likely cause (not proven).
+- **8.3-8.7 s once those libraries are cached**, with the file caches of the model and the inputs dropped (three runs,
+  2026-10-23); 7.8-7.9 s warm. The binary of the tables below, alternated with it in the same job: 20.8-26.3 s cold,
+  10.5-10.6 s warm. Cold weights load 1.9-2.7 s (was 15-17 s). Table and method: `docs/results.md` section 5, last
+  subsection.
+
+The tables below, the "10.4 s warm" and the 14 s cold load are historical (commit a9dcc66).
 
 Environment: `VARDA_PREFETCH_THREADS` (weights prefetch threads, default 32, 0 disables; the cold mapping on Lustre was
 faulted in as one serial stream at ~100 MB/s), `VARDA_INPUT_IO_THREADS` (input GRIB reader threads, default 16),
 `VARDA_INPUT_IFS_THREADS` (OpenMP team of the IFS branch, default a quarter of the threads clamped to 4..16),
 `VARDA_INPUT_TRACE` (per-file and per-branch timelines in the input log). None changes a result.
 
-Job 285715, `debug` partition, node <node> (A100-SXM4-80GB, 32 CPUs), `varda-forecast --realdata ... --precision fp16`
-(device rollout, CUDA graph on, 4 steps, write queue 4, 32 OpenMP threads), the same command run three times in one job
-(`$VARDA_SCRATCH/jobs/int-forecast-4/`). Run 1 starts with cold file caches and cold GPU code; runs 2 and 3 are warm.
+One GPU job, A100-SXM4-80GB, 32 CPUs, 2026-10-23, `varda-forecast --realdata ... --precision fp16`
+(device rollout, CUDA graph on, 4 steps, write queue 4, 32 OpenMP threads), the same command run three times in the
+job. Run 1 starts with cold file caches and cold GPU code; runs 2 and 3 are warm.
 
 | seconds | cold (run 1) | warm (run 2) | warm (run 3) |
 |---|---|---|---|
@@ -144,14 +150,18 @@ Reading it:
 - The weights load (2.0 s warm) and the rollout set-up (1.3 s) fit under the input time; the input is the critical path.
 - The writer keeps up: the rollout never waits for it. The 0.56 s the callback spends copying `y` (4 x 0.14 s,
   device -> host -> queue) is on the rollout's critical path and is the remaining cost of the overlap.
-- Before the writer thread and the transpose (job 285381, same node and data, 16 threads): fp16 forecast 14.3 s; the
-  per-step write went from 0.86 s to 0.63-0.69 s (jobs 285651 and 285692, `docs/results.md` section 5). The files are
-  byte-identical to the earlier version's.
-- Cold start (old binary): 20.1 s, 14.0 s of it loading the weights from the file system. Fixed by the prefetch (cold load 1.9-2.7 s, job 286500).
+- Before the writer thread and the transpose (separate run, same node and data, 16 threads): fp16 forecast 14.3 s;
+  the per-step write went from 0.86 s to 0.63-0.69 s (separate runs before and after, `docs/results.md` section 5). The
+  files are byte-identical to the earlier version's.
+- Cold start (old binary): 20.1 s, 14.0 s of it loading the weights from the file system. Fixed by the prefetch (cold
+  load 1.9-2.7 s, `docs/results.md` section 5, last subsection).
 
-Same job, same inputs and node (job 285717, old binary a9dcc66), whole-process wall clock, fp16: anemoi-inference 191 s warm (277 s first
-run), varda.cpp 10.4 s warm (23.4 s first run), 18x warm; fp32 163 s against 41 s (4.0x). Details and configuration:
-`docs/results.md` section 5.
+Against anemoi-inference, current binary (eb7f17b), same jobs and node, same frozen inputs, fp16, every GRIB file
+written, 2026-10-23 (`docs/results.md` section 5): 24 h warm, varda.cpp 8.18 s against 135.8 s (16.6x; anemoi's process
+wall clock 136.6 s minus the 0.8 s sha256 of the outputs that its driver computes); first run in a job 12.9 / 13.6 s
+against 252.7 / 248.2 s (18-20x); 240 h warm 34.2 s against 310.7 s (9.1x). An earlier run with the old binary
+(a9dcc66), same job for both engines: anemoi-inference 191 s warm (277 s first run), varda.cpp 10.4 s warm (23.4 s first
+run); fp32 163 s against 41 s (4.0x), the only fp32 comparison. Details and configuration: `docs/results.md` section 5.
 
 ## 5. Limits
 

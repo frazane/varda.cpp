@@ -1,7 +1,6 @@
 // CPU fp32 kernels of the oracle backend: Linear (cblas_sgemm), LayerNorm, GELU and the
-// GraphTransformer attention. Each mirrors the op sequence of the Python engine's plain path
-// ($IE_ROOT/engine/blocks.py, engine/ops.py), which is bitwise equal to anemoi's pyg backend
-// on CPU. See docs/cpu.md.
+// GraphTransformer attention. Each mirrors the op sequence of anemoi's GraphTransformer blocks
+// with the pyg backend on CPU. See docs/cpu.md.
 //
 // Threading: every kernel parallelises with OpenMP over rows, tiles or destination nodes,
 // using the calling thread's OpenMP thread count. GEMMs are split into fixed tiles, each a

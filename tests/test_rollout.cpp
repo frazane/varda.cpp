@@ -223,7 +223,11 @@ void check_dates() {
 
 void check_real_configs() {
     const char* e = std::getenv("VARDA_SCRATCH");
-    const std::string root = e && *e ? e : "$VARDA_SCRATCH";
+    if (!(e && *e)) {
+        std::printf("skip the converted models: VARDA_SCRATCH is not set (source tools/env.sh)\n");
+        return;
+    }
+    const std::string root = e;
     for (const char* m : {"dev", "varda"}) {
         const std::string p = root + "/converted/" + m + "/model.safetensors";
         if (!std::ifstream(p).good()) {

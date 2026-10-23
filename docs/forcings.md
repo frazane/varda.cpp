@@ -8,18 +8,18 @@ Sources (all read-only):
 - anemoi-inference `9505dd0926ec3c5dea9308813cc7859bfdad755a` (HF release pin; clone in
   `$VARDA_SCRATCH/src/anemoi-inference`, `I/` = `src/anemoi/inference/`);
 - earthkit-data 0.20.0 (`ED/` = `earthkit/data/`), earthkit-meteo 0.6.2, anemoi-transform 0.1.26, anemoi-utils,
-  numpy 2.3.5, all from `$IE_SCRATCH/venv-ref-varda/lib/python3.12/site-packages`.
+  numpy 2.3.5, all from the reference venv `$REF_VENV` (`lib/python3.12/site-packages`).
 
 ## 1. Which forcings, when
 
-- Both models (varda = Varda, dev) have the same 5 *dynamic* forcings, computed (not retrieved):
+- Both models (Varda and the dev model) have the same 5 *dynamic* forcings, computed (not retrieved):
   `cos_julian_day, cos_local_time, insolation, sin_julian_day, sin_local_time`. They are the variables with
   `computed_forcing: true, constant_in_time: false` in the checkpoint's `anemoi-metadata/anemoi.json`
   (`dataset.data.variables_metadata`) and in `$VARDA_SCRATCH/hf/varda-forecaster-det-sgm/metadata.yaml`.
-  Model input indices: varda `[4, 6, 8, 23, 25]` of 79, dev `[4, 6, 9, 26, 28]` of 84.
+  Model input indices: Varda `[4, 6, 8, 23, 25]` of 79, the dev model `[4, 6, 9, 26, 28]` of 84.
   The columns of the output buffer follow the caller's `names` list; the engine takes the order from the config.
 - The other computed forcings (`cos/sin_latitude`, `cos/sin_longitude`) are `constant_in_time: true`; the runner never
-  rewrites them (the roll carries them from the oldest slot, see `$IE_ROOT/docs/rollout.md` §1). The C++ function
+  rewrites them (the roll carries them from the oldest slot, see `docs/rollout-engine.md` §1). The C++ function
   can compute them too (same code path in anemoi, `ED/sources/forcings.py:75-100`); they are not needed in the loop.
 - Step `s` (0-based) of `Runner.forecast`: `valid_dates = start + s*rollout_shift + offset` for each
   `output_offsets` entry, `next_dates = valid_dates` (`I/runner.py:409-415`). For these models
@@ -130,16 +130,16 @@ reads each entry of `anemoi.json["supporting_arrays_paths"]["data"]` with `np.fr
 (`I/tensors.py:121-125`); `ComputedForcings` reads `current_state["latitudes"]` (the state of the previous step is
 passed, `I/runner.py:571-578`). So the coordinates come from the zip members
 `inference-last/anemoi-metadata/data/latitudes.numpy` and `.../longitudes.numpy` (raw little-endian float64 buffers
-without header, no unpickling), degrees, as stored: varda G = 1 688 650, lat in [-89.7849, 89.7849], lon in
-[-0.8171, 359.7188]; dev G = 40 320, lat in [-89.2842, 89.2842], lon in [0, 359.1] (cutout grid
-`lam_0` + `global` for varda; `source{0,1}/…` and `*/cutout_mask` are other supporting arrays, unused here).
+without header, no unpickling), degrees, as stored: Varda G = 1 688 650, lat in [-89.7849, 89.7849], lon in
+[-0.8171, 359.7188]; the dev model G = 40 320, lat in [-89.2842, 89.2842], lon in [0, 359.1] (cutout grid
+`lam_0` + `global` for Varda; `source{0,1}/…` and `*/cutout_mask` are other supporting arrays, unused here).
 The reference runs of this project (`rollout/forcings/forcings.pt`) take the same arrays (bitwise agreement below).
 If a user supplies other coordinates in the input state, anemoi would use those; the engine always uses the file's.
 
 Converted file (format.md §1, extension): `grid.latitudes`, `grid.longitudes`, **F64 [G]**, degrees, exactly the
 zip members (bitwise, tested). `python/convert.py` asserts they agree with `nodes.data.attr` =
-[sin lat, sin lon, cos lat, cos lon] (float32 of the radians; measured max abs difference 2.4e-7 (varda),
-2.5e-7 (dev); threshold 1e-6). All other tensors and the config are unchanged. Until the engine
+[sin lat, sin lon, cos lat, cos lon] (float32 of the radians; measured max abs difference 2.4e-7 (Varda),
+2.5e-7 (the dev model); threshold 1e-6). All other tensors and the config are unchanged. Until the engine
 consumed these two tensors the files were kept apart in `converted-new/`; the files under `converted/` now carry
 them (`converted-new/` was a byte-identical copy and was deleted on 2026-10-23).
 
@@ -159,7 +159,7 @@ count (tested).  One call per step.
 
 ## 7. Verification
 
-Generator: `python/reference/make_forcings_fixture.py` (run in `$IE_SCRATCH/venv-ref-varda` on a cpu-short
+Generator: `python/reference/make_forcings_fixture.py` (run in `$REF_VENV` on a CPU
 node; it calls anemoi's own `ComputedForcings.load_forcings_array` from the 9505dd0 clone, with the lat/lon from
 `anemoi.utils.checkpoints.load_metadata(..., supporting_arrays=True)`). Output
 `$VARDA_SCRATCH/forcings/<model>.safetensors`: 22 dates per model (2024-06-01T06/12, 2024-12-31T18, 2024-02-29T00 and
@@ -173,8 +173,8 @@ equal and max ulp. Results (OpenMP 16 threads, glibc libm, gcc 12.3):
 
 | model | dates | elements compared | not bitwise equal | max abs | max ulp |
 |---|---|---|---|---|---|
-| dev (G = 40 320) | 22 | 4 435 200 | 0 | 0 | 0 |
-| varda (G = 1 688 650) | 22 | 185 751 500 | 0 | 0 | 0 |
+| dev model (G = 40 320) | 22 | 4 435 200 | 0 | 0 | 0 |
+| Varda (G = 1 688 650) | 22 | 185 751 500 | 0 | 0 | 0 |
 
 So the target (bitwise equality in float32) is met. Reason it is attainable: numpy 2.3.5 on these nodes calls the
 same glibc `sin`/`cos` for float64 as C++ (checked: 2 M random arguments, `np.sin`/`np.cos` array and scalar paths are
@@ -183,12 +183,12 @@ holds on the CPU used here (EPYC 7713, AVX2); a numpy build dispatching float64 
 (e.g. AVX-512 SVML) could differ from libm by an ulp in double, which would show as rare 1-ulp float32 differences.
 
 Recorded rollout forcings: `$VARDA_SCRATCH/rollout/forcings/forcings.pt` (23 dates, 2024-06-01T06 + 6 h steps,
-varda grid, recorded inside the real runner loop). `VARDA_FORCINGS_DUMP=f.safetensors ./test_forcings` dumps
+Varda grid, recorded inside the real runner loop). `VARDA_FORCINGS_DUMP=f.safetensors ./test_forcings` dumps
 the C++ values for those dates and `.venv/bin/python -I python/reference/compare_forcings_recorded.py f.safetensors
 forcings.pt` compares: **0 of 194 194 750 elements not bitwise equal** (all five forcings, max abs 0).
 
 Converter verification (`python/tests/test_convert.py`, run with `VARDA_CONVERTED`, `VARDA_WEIGHTS_PT`, `VARDA_CKPTS`):
 10 tests ok, including: names = contract names + `grid.latitudes`/`grid.longitudes`; those two are F64 `[n_data_nodes]`;
 agreement with `nodes.data.attr` < 1e-6; `grid.*` bitwise equal to the zip members read independently; every other
-tensor bitwise equal to the Python engine's `weights.pt` and the config equal to its `config.json`. Additionally all
+tensor bitwise equal to the independent weight export `weights.pt` and the config equal to its `config.json`. Additionally all
 384 old tensors and the metadata of `converted/<model>` were byte-identical to `converted-new/<model>` (that copy since deleted).

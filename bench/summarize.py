@@ -3,8 +3,8 @@
 
     python3 bench/summarize.py JOBDIR [JOBDIR ...]
 
-Reads JOBDIR/meta.json and JOBDIR/results/<model>.<impl>.<precision>.json[l] (impl: original | pyengine |
-varda). Python results are the JSON lines of bench_reference.py / bench.py (median_s, min_s, first_call_s,
+Reads JOBDIR/meta.json and JOBDIR/results/<model>.<impl>.<precision>.json[l] (impl: original |
+varda). Original results are the JSON lines of bench_reference.py (median_s, min_s, first_call_s,
 peak_alloc_*_gb); varda-bench JSON is read leniently (median_ms|median_s, min_ms|min_s, first_call_s|first_call_ms,
 peak_mem_gb|peak_memory_gb|peak_mem_mb|..., or a "times_ms" list). Speedup = original warm median / this median
 (same model, precision, same job).
@@ -14,9 +14,8 @@ import statistics
 import sys
 from pathlib import Path
 
-NAMES = {"original": "original anemoi (triton)", "pyengine": "Python engine fast (compile + CUDA graph)",
-         "varda": "varda.cpp"}
-ORDER = {"original": 0, "pyengine": 1, "varda": 2}
+NAMES = {"original": "original anemoi (triton)", "varda": "varda.cpp"}
+ORDER = {"original": 0, "varda": 1}
 
 
 def first(d, keys, scale=1.0):
@@ -66,6 +65,8 @@ def table(job):
         if len(parts) < 4 or parts[-1] not in ("json", "jsonl"):
             continue
         m, impl, prec = parts[0], parts[1], parts[2]
+        if impl not in NAMES:  # only the implementations this driver runs
+            continue
         try:
             r = load(p)
         except (ValueError, KeyError) as e:

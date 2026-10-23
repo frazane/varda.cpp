@@ -14,9 +14,10 @@ import datetime as dt
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 
-VARDA_SCRATCH = os.environ.get("VARDA_SCRATCH", "$VARDA_SCRATCH")
+VARDA_SCRATCH = os.environ.get("VARDA_SCRATCH") or sys.exit("VARDA_SCRATCH is not set: source tools/env.sh")
 HERE = Path(__file__).resolve().parent
 
 
