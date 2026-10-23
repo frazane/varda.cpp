@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <set>
@@ -726,5 +727,27 @@ InputState build_input(const InputModel& model, const InputFiles& files) {
     st.seconds["total"] = now_s() - t_start;
     return st;
 }
+
+void files_from_realdata(const std::string& dir, InputFiles& f) {
+    std::ifstream in(dir + "/pins.json");
+    if (!in) throw std::runtime_error("cannot read " + dir + "/pins.json");
+    const nlohmann::json pins = nlohmann::json::parse(in);
+    if (f.date.empty()) f.date = pins.at("date").get<std::string>();
+    f.kenda_dir = dir + "/cache/kenda";
+    const std::string files = dir + "/cache/ecmwf/files/";
+    const varda::DateTime t = parse_input_date(f.date);
+    auto file_of = [&](const std::string& init, long step) {
+        const std::string key = init + "+" + std::to_string(step) + "h";
+        return files + pins.at("ecmwf_files").at(key).at("file").get<std::string>();
+    };
+    for (int s = 0; s < 2; ++s) {
+        const varda::DateTime d = varda::add_hours(t, -6 * (1 - s));
+        const nlohmann::json& e = pins.at("input_dates").at(varda::format_iso8601_utc(d));
+        (s == 0 ? f.ifs_files_prev : f.ifs_files_t).push_back(file_of(e.at("init"), e.at("step")));
+    }
+    const nlohmann::json& c = pins.at("constant_forcings_run");
+    f.ifs_constant_files.push_back(file_of(c.at("init"), c.at("step")));
+}
+
 
 }  // namespace varda::io

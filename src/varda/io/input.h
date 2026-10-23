@@ -98,6 +98,10 @@ InputState build_input(const Model& model, const InputFiles& files);
 // "YYYY-MM-DDTHH" (and the forms parse_iso8601_utc accepts).
 DateTime parse_input_date(const std::string& s);
 
+// Fills `f` (date unless already set, kenda_dir, the IFS files) from a frozen real-data directory
+// written by python/reference/realdata/fetch_realdata.py: DIR/pins.json and DIR/cache/{kenda,ecmwf/files}.
+void files_from_realdata(const std::string& dir, InputFiles& f);
+
 // The KENDA model_to_pressure_level configuration of inference_opendata.yaml (spec §2.2).
 const std::vector<int>& kenda_interpolate_levels();  // 50 .. 1000 hPa (13)
 const std::vector<int>& kenda_extrapolate_levels();  // 500 600 700 850 925 1000

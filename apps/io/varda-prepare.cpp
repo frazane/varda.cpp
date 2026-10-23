@@ -58,32 +58,6 @@ using namespace varda::io;
     std::exit(2);
 }
 
-std::string compact_date(const varda::DateTime& d) {  // pins.json style "2026-10-22T06:00:00"
-    return varda::format_iso8601_utc(d);
-}
-
-// Fills files from a frozen real-data directory (python/reference/realdata/fetch_realdata.py).
-void from_realdata(const std::string& dir, InputFiles& f) {
-    std::ifstream in(dir + "/pins.json");
-    if (!in) throw std::runtime_error("cannot read " + dir + "/pins.json");
-    const json pins = json::parse(in);
-    if (f.date.empty()) f.date = pins.at("date").get<std::string>();
-    f.kenda_dir = dir + "/cache/kenda";
-    const std::string files = dir + "/cache/ecmwf/files/";
-    const varda::DateTime t = parse_input_date(f.date);
-    auto file_of = [&](const std::string& init, long step) {
-        const std::string key = init + "+" + std::to_string(step) + "h";
-        return files + pins.at("ecmwf_files").at(key).at("file").get<std::string>();
-    };
-    for (int s = 0; s < 2; ++s) {
-        const varda::DateTime d = varda::add_hours(t, -6 * (1 - s));
-        const json& e = pins.at("input_dates").at(compact_date(d));
-        (s == 0 ? f.ifs_files_prev : f.ifs_files_t).push_back(file_of(e.at("init"), e.at("step")));
-    }
-    const json& c = pins.at("constant_forcings_run");
-    f.ifs_constant_files.push_back(file_of(c.at("init"), c.at("step")));
-}
-
 void mkdirs(const std::string& p) {
     std::string cur;
     for (size_t i = 0; i <= p.size(); ++i) {
@@ -395,7 +369,7 @@ int main(int argc, char** argv) {
         usage();
     if (threads > 0) omp_set_num_threads(threads);
     try {
-        if (!realdata.empty()) from_realdata(realdata, files);
+        if (!realdata.empty()) files_from_realdata(realdata, files);
         if (files.date.empty() || files.kenda_dir.empty() || files.ifs_files_prev.empty() || files.ifs_files_t.empty() ||
             files.ifs_constant_files.empty())
             usage();
