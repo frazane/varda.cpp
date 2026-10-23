@@ -651,7 +651,49 @@ def read_grid_coordinates(ckpt_path, node_attr):
     check(err <= 1e-6, f"coordinates disagree with nodes.data.attr: max abs difference {err:.3g} (> 1e-6)")
     print(f"grid coordinates: G={lat.shape[0]}, lat [{float(lat.min()):.4f}, {float(lat.max()):.4f}], "
           f"lon [{float(lon.min()):.4f}, {float(lon.max()):.4f}]; max |trig(coords) - nodes.data.attr| = {err:.3g}")
-    return {"grid.latitudes": lat, "grid.longitudes": lon}
+    grid = {"grid.latitudes": lat, "grid.longitudes": lon}
+    grid.update(read_cutout_masks(ckpt_path, paths[GRID_DATASET], lat, lon))
+    return grid
+
+
+def read_cutout_masks(ckpt_path, entries, lat, lon):
+    """The cutout masks of a multi-source dataset (docs/spec-io.md section 2.6), as U8 0/1 tensors.
+
+    `<source>/cutout_mask` (bool [n_source_points]) selects, per source, the points that the cutout keeps; the
+    data grid is the concatenation of the sources' kept points in source order. The order is not named in the
+    metadata, so it is established here: the supporting arrays `source<i>/latitudes|longitudes` masked with the
+    i-th mask (in `supporting_arrays_paths` order) and concatenated must equal the data grid bitwise. Returns {}
+    for a single-source dataset.
+    """
+    names = [k[: -len("/cutout_mask")] for k in entries if k.endswith("/cutout_mask")]
+    if not names:
+        return {}
+    out, masks = {}, []
+    with zipfile.ZipFile(ckpt_path) as z:
+        def array(key, dtype):
+            e = entries[key]
+            check(set(e) == {"path", "shape", "dtype"} and e["dtype"] == dtype and len(e["shape"]) == 1,
+                  f"{key}: unexpected supporting array entry {e}")
+            raw = z.read(e["path"])
+            a = np.frombuffer(raw, dtype=np.dtype("u1" if dtype == "bool" else "<f8")).reshape(e["shape"])
+            check(a.nbytes == len(raw), f"{key}: size mismatch")
+            return a
+        for i, n in enumerate(names):
+            m = array(f"{n}/cutout_mask", "bool")
+            check(bool(np.isin(m, (0, 1)).all()), f"{n}/cutout_mask: values other than 0/1")
+            for key, ref in (("latitudes", lat), ("longitudes", lon)):
+                check(f"source{i}/{key}" in entries, f"no source{i}/{key} for {n}/cutout_mask")
+                src = array(f"source{i}/{key}", "float64")
+                check(src.shape == m.shape, f"source{i}/{key} {src.shape} != {n}/cutout_mask {m.shape}")
+            masks.append(m)
+            out[f"grid.{n}.cutout_mask"] = torch.from_numpy(m.copy())
+        for key, ref in (("latitudes", lat), ("longitudes", lon)):
+            merged = np.concatenate([array(f"source{i}/{key}", "float64")[m.astype(bool)] for i, m in enumerate(masks)])
+            check(merged.shape == tuple(ref.shape) and merged.tobytes() == ref.numpy().tobytes(),
+                  f"cutout of source{{0..}}/{key} in order {names} is not the data grid")
+    print("cutout: " + ", ".join(f"{n} {int(m.sum())}/{m.size}" for n, m in zip(names, masks))
+          + " points kept; masked sources concatenate to the data grid bitwise")
+    return out
 
 
 def build_forcings(meta, in_names, residual_input_names):
@@ -731,6 +773,9 @@ def convert(ckpt_path, out_path):
     check(len(set(weights)) == len(weights), "duplicate contract names (grid.*)")
 
     meta = {"varda_format": "1", "config": json.dumps(config)}
+    cutout = [k[len("grid."): -len(".cutout_mask")] for k in weights if k.endswith(".cutout_mask")]
+    if cutout:
+        meta["cutout"] = json.dumps(cutout)  # source order of the data grid (read_cutout_masks)
     nbytes = st_io.write_safetensors(out_path, weights, meta)  # temporary name, then rename
     size = out_path.stat().st_size
     assert size == nbytes

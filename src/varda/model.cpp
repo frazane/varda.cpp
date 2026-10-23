@@ -1,5 +1,7 @@
 #include <stdexcept>
 
+#include "nlohmann/json.hpp"
+
 #include "varda/backend.h"
 #include "varda/format.h"
 #include "varda/varda.h"
@@ -24,6 +26,24 @@ std::unique_ptr<Model> Model::load(const std::string& path, const Options& opts)
         const TensorView& lo = m->file_->take("grid.longitudes", DType::F64, shape);
         m->lat_.assign(la.as<double>(), la.as<double>() + la.numel());
         m->lon_.assign(lo.as<double>(), lo.as<double>() + lo.numel());
+    }
+    if (m->file_->metadata().count("cutout")) {
+        int64_t kept = 0;
+        for (const auto& name : nlohmann::json::parse(m->file_->metadata("cutout"))) {
+            Model::CutoutSource src{name.get<std::string>(), {}};
+            const TensorView& t = m->file_->take("grid." + src.name + ".cutout_mask");
+            if (t.dtype != DType::U8 || t.shape.size() != 1)
+                throw std::runtime_error(path + ": grid." + src.name + ".cutout_mask must be U8 [n]");
+            src.mask.assign(t.as<uint8_t>(), t.as<uint8_t>() + t.numel());
+            for (uint8_t v : src.mask) {
+                if (v > 1) throw std::runtime_error(path + ": cutout mask " + src.name + " is not 0/1");
+                kept += v;
+            }
+            m->cutout_.push_back(std::move(src));
+        }
+        if (kept != m->cfg_.n_data_nodes)
+            throw std::runtime_error(path + ": cutout masks keep " + std::to_string(kept) +
+                                     " points, the data grid has " + std::to_string(m->cfg_.n_data_nodes));
     }
 
     if (opts.device == Device::CPU) {

@@ -53,11 +53,21 @@ public:
     const std::vector<double>& latitudes() const { return lat_; }
     const std::vector<double>& longitudes() const { return lon_; }
 
+    // Multi-source (cutout) grids: per source, in data-grid order, the 0/1 mask over that source's
+    // own points (`grid.<name>.cutout_mask`, U8); the data grid is the concatenation of every
+    // source's kept points (docs/format.md §1.1, docs/spec-io.md §2.6). Empty for a single source.
+    struct CutoutSource {
+        std::string name;
+        std::vector<uint8_t> mask;
+    };
+    const std::vector<CutoutSource>& cutout() const { return cutout_; }
+
 private:
     Model() = default;
     Config cfg_;
     Options opts_;
     std::vector<double> lat_, lon_;
+    std::vector<CutoutSource> cutout_;
     std::unique_ptr<SafeTensorsFile> file_;  // outlives backend_ (declared first)
     std::unique_ptr<Backend> backend_;
 };

@@ -44,6 +44,12 @@ In addition (not in `weights.pt`; optional, older files lack them):
 arrays (zip members `*/anemoi-metadata/data/{latitudes,longitudes}.numpy`) that
 anemoi-inference uses to compute forcings, checked against `nodes.data.attr` by the
 converter (`docs/forcings.md`). `Model::load` consumes them; the rollout uses them.
+For a multi-source (cutout) dataset, also `grid.<source>.cutout_mask` U8 0/1 [n_source_points]
+per source (the checkpoint's `<source>/cutout_mask` supporting arrays), with metadata key
+`cutout` = JSON list of the source names in data-grid order (Varda: `["lam_0", "global"]`).
+The data grid is the concatenation of every source's kept points in that order; the converter
+checks this bitwise against `source<i>/latitudes|longitudes` and the data coordinates.
+`Model::cutout()` exposes them; the GRIB layer uses them (`docs/spec-io.md` §2.6, §4.3).
 
 Bit-identity rule: for every converted model, each `weights.pt` tensor in `model.safetensors` is
 bitwise equal (same dtype, shape and bytes) to the tensor of the same name in the Python
