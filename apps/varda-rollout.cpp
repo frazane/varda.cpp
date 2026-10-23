@@ -5,7 +5,8 @@
 //                 [--engine host|device] [--no-cuda-graph]
 //                 [--forcings computed|replay] [--replay-from ROLLOUT]
 //                 [--compare REF]... [--tolerances FILE] [--check-forcings]
-//                 [--verify-replay] [--verify-host] [--bench R] [--forward-iters N]
+//                 [--verify-replay] [--verify-host] [--verify-constants] [--constants newest|oldest]
+//                 [--bench R] [--forward-iters N]
 //                 [--json OUT.json] [--out Y.safetensors]
 //   varda-rollout --judge OLD.json [--tolerances FILE] [--json NEW.json]     (re-judge an earlier report)
 //
@@ -35,7 +36,11 @@
 //   --check-forcings compute_forcings(valid date s) bitwise == the replay source's forcings[s], every s;
 //                    with --compare, also the newest-slot forcing columns of the window each step sees;
 //   --verify-replay  a second rollout with the other forcing mode: y and windows bitwise equal;
-//   --verify-host    (device engine) the host-level Rollout on the same model: y and windows bitwise equal.
+//   --verify-host    (device engine) the host-level Rollout on the same model: y and windows bitwise equal;
+//   --verify-constants a second rollout with the other constant source: y and windows bitwise equal (holds
+//                    when the constant inputs are equal in every slot, reported as constants_across_slots).
+// --constants: where the newest slot's constant-in-time inputs come from (src/varda/rollout.h): `newest`
+// (default; kept in place, anemoi-inference 9505dd0's advance_map) or `oldest` (roll(-1), eaeb36fa).
 // --bench R: after the checked run, R more rollouts of N steps (no window copies, no compare): per-step
 // GPU time (CUDA events around each step graph), wall time per step; plus --forward-iters replays of the
 // forward-only graph (normalise -> forward -> denormalise) for the like-for-like one-step time.
@@ -74,7 +79,8 @@ namespace {
                  "usage: varda-rollout --model M --input IN [--key K] [--date ISO] [--steps N] [--device cpu|cuda]\n"
                  "         [--precision fp32|fp16] [--threads N] [--cuda-device I] [--engine host|device]\n"
                  "         [--no-cuda-graph] [--forcings computed|replay] [--replay-from ROLLOUT] [--compare REF]...\n"
-                 "         [--tolerances FILE] [--check-forcings] [--verify-replay] [--verify-host] [--bench R]\n"
+                 "         [--tolerances FILE] [--check-forcings] [--verify-replay] [--verify-host] [--verify-constants]\n"
+                 "         [--constants newest|oldest] [--bench R]\n"
                  "         [--forward-iters N] [--json OUT] [--out Y.safetensors]\n"
                  "       varda-rollout --judge OLD.json [--tolerances FILE] [--json NEW.json]\n");
     std::exit(2);
@@ -259,6 +265,7 @@ struct Comparison {
     std::string table;  // tolerance table, or "" (report only)
     std::vector<std::array<Metric, 4>> m;
     int64_t forcing_cols_bad = 0;  // newest-slot forcing columns of the window != ref forcings (s >= 1)
+    int const_unequal_steps = 0;   // reference windows whose constant inputs differ between slots
     double forcing_cols_maxabs = 0;
 };
 
@@ -379,7 +386,7 @@ int rejudge(const std::string& path, const std::string& tol_path, const std::str
         std::printf("re-judging %s (%s %s, %d steps) with %s\n", path.c_str(), rep["device"].get<std::string>().c_str(),
                     rep["precision"].get<std::string>().c_str(), n, used.empty() ? "NO tolerance file" : used.c_str());
         if (tols.is_null()) ok = false;
-        for (const char* k : {"verify_replay", "verify_host"})
+        for (const char* k : {"verify_replay", "verify_host", "verify_constants"})
             if (rep.contains(k) && !rep[k].value("pass", false)) ok = false;
         if (rep.contains("forcings_check") && rep["forcings_check"].value("not_bitwise_equal", 1) != 0) ok = false;
         for (auto& d : rep.value("dates_check", json::array())) if (d.value("mismatches", 1) != 0) ok = false;
@@ -435,7 +442,8 @@ int main(int argc, char** argv) {
         out_path, judge_path;
     std::vector<std::string> compare_paths;
     int steps = 0, bench = 0, forward_iters = 0;
-    bool check_forcings = false, verify_replay = false, verify_host = false;
+    bool check_forcings = false, verify_replay = false, verify_host = false, verify_constants = false;
+    varda::ConstantSource csrc = varda::ConstantSource::Newest;
     varda::Options opts;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -457,6 +465,12 @@ int main(int argc, char** argv) {
         else if (a == "--tolerances") tol_path = next();
         else if (a == "--check-forcings") check_forcings = true;
         else if (a == "--verify-replay") verify_replay = true;
+        else if (a == "--verify-constants") verify_constants = true;
+        else if (a == "--constants") {
+            const std::string c = next();
+            if (c != "newest" && c != "oldest") usage();
+            csrc = c == "newest" ? varda::ConstantSource::Newest : varda::ConstantSource::Oldest;
+        }
         else if (a == "--verify-host") verify_host = true;
         else if (a == "--bench") bench = std::stoi(next());
         else if (a == "--forward-iters") forward_iters = std::stoi(next());
@@ -592,6 +606,8 @@ int main(int argc, char** argv) {
         report["timestep_hours"] = cfg.timestep_hours;
         report["steps"] = steps;
         report["forcings"] = forcing_mode;
+        report["constants"] = csrc == varda::ConstantSource::Newest ? "newest" : "oldest";
+        std::printf("constant inputs: %s\n", varda::to_string(csrc));
         if (replay) report["replay_source"] = rsrc->path;
         if (!tol_used.empty()) report["tolerances"] = tol_used;
         if (const char* j = std::getenv("SLURM_JOB_ID")) report["slurm_job_id"] = j;
@@ -646,7 +662,7 @@ int main(int argc, char** argv) {
         // ---- the rollout
         std::vector<float> y_keep;  // all steps, for the bitwise verifications
         std::vector<uint64_t> win_hash;
-        const bool keep = verify_replay || verify_host;
+        const bool keep = verify_replay || verify_host || verify_constants;
         if (keep) y_keep.resize(size_t(steps) * out_n);
         std::vector<float> y_out;
         if (!out_path.empty()) y_out.resize(size_t(steps) * out_n);
@@ -674,11 +690,27 @@ int main(int argc, char** argv) {
             std::printf("\n");
             std::fflush(stdout);
         };
+        // Are the constant-in-time inputs bitwise equal in every slot of a window? (If so, the in-place
+        // and roll semantics give the same update.)
+        int const_unequal_steps = 0;
+        int64_t win_seen = 0;
+        auto const_unequal = [&](const float* w) {
+            int64_t bad = 0;
+#pragma omp parallel for reduction(+ : bad) schedule(static)
+            for (int64_t g = 0; g < G; ++g)
+                for (int c : cfg.forcing_constant_index)
+                    for (int t = 1; t < T; ++t)
+                        if (std::memcmp(&w[(int64_t(t) * G + g) * V_in + c], &w[g * V_in + c], 4) != 0) ++bad;
+            return bad != 0;
+        };
         const bool want_window = !cmp.empty() || keep;
         if (want_window) {
             req.on_window = [&](int s, const float* w) {
                 if (keep) win_hash.push_back(hash_bytes(w, in_n));
+                ++win_seen;
+                if (const_unequal(w)) ++const_unequal_steps;
                 for (auto& c : cmp) {
+                    if (const_unequal(c.ref->window + size_t(s) * in_n)) ++c.const_unequal_steps;
                     auto r = compare2(w, c.ref->window + size_t(s) * in_n, in_n, V_in, c.ref->mul_in, c.ref->add_in);
                     c.m[s][2] = r.first;
                     c.m[s][3] = r.second;
@@ -702,20 +734,21 @@ int main(int argc, char** argv) {
             };
         }
 
-        auto run_with = [&](const varda::RolloutRequest& q, const std::string& eng) -> double {
+        auto run_cs = [&](const varda::RolloutRequest& q, const std::string& eng, varda::ConstantSource cs) -> double {
             const double ts = app::now_s();
             t_prev = ts;
             if (eng == "host") {
-                varda::Rollout r(*model);
+                varda::Rollout r(*model, cs);
                 r.run(q);
             } else {
 #ifdef VARDA_WITH_CUDA
-                varda::cuda::DeviceRollout r(*model, opts.cuda_graph);
+                varda::cuda::DeviceRollout r(*model, opts.cuda_graph, cs);
                 r.run(q);
 #endif
             }
             return app::now_s() - ts;
         };
+        auto run_with = [&](const varda::RolloutRequest& q, const std::string& eng) { return run_cs(q, eng, csrc); };
 
         const double run_s = run_with(req, engine);
         std::printf("rollout: %d steps in %.3f s (%.3f s/step, incl. %s)\n", steps, run_s, run_s / steps,
@@ -738,12 +771,13 @@ int main(int argc, char** argv) {
         }
 
         // ---- bitwise verifications against a second rollout
-        auto verify_against = [&](varda::RolloutRequest q, const std::string& eng, const std::string& name) {
+        auto verify_against = [&](varda::RolloutRequest q, const std::string& eng, const std::string& name,
+                                  varda::ConstantSource cs) {
             std::vector<float> y2(size_t(steps) * out_n);
             std::vector<uint64_t> h2;
             q.on_step = [&](int s, const DateTime&, const float* y) { std::memcpy(&y2[size_t(s) * out_n], y, out_n * 4); };
             q.on_window = [&](int, const float* w) { h2.push_back(hash_bytes(w, in_n)); };
-            run_with(q, eng);
+            run_cs(q, eng, cs);
             json per = json::array();
             int64_t bad_total = 0;
             int win_bad = 0;
@@ -765,17 +799,32 @@ int main(int argc, char** argv) {
             varda::RolloutRequest q = req;
             q.replay_forcings = req.replay_forcings ? nullptr : replay;
             report["verify_replay"] = verify_against(q, engine, std::string("computed vs replayed forcings (") +
-                                                                     (req.replay_forcings ? "second run computed" : "second run replayed") + ")");
+                                                                     (req.replay_forcings ? "second run computed" : "second run replayed") + ")", csrc);
         }
         if (verify_host) {
             if (engine != "device") throw std::runtime_error("--verify-host needs the device engine");
-            report["verify_host"] = verify_against(req, "host", "device rollout vs host-level Rollout (same backend)");
+            report["verify_host"] = verify_against(req, "host", "device rollout vs host-level Rollout (same backend)", csrc);
+        }
+        if (verify_constants) {
+            const varda::ConstantSource other =
+                csrc == varda::ConstantSource::Newest ? varda::ConstantSource::Oldest : varda::ConstantSource::Newest;
+            report["verify_constants"] = verify_against(req, engine, std::string("constants ") + varda::to_string(csrc) +
+                                                                         " vs " + varda::to_string(other), other);
+        }
+        {
+            json cj = {{"run_windows_steps_with_unequal_constants", const_unequal_steps}};
+            for (auto& c : cmp) cj[c.ref->tag] = c.const_unequal_steps;
+            report["constants_across_slots"] = cj;
+            std::printf("constant inputs unequal across slots: this run's windows %d of %d steps", const_unequal_steps,
+                        int(win_seen));
+            for (auto& c : cmp) std::printf(", %s windows %d", c.ref->tag.c_str(), c.const_unequal_steps);
+            std::printf("\n");
         }
 
         // ---- benchmark
 #ifdef VARDA_WITH_CUDA
         if (bench > 0 && engine == "device") {
-            varda::cuda::DeviceRollout r(*model, opts.cuda_graph);
+            varda::cuda::DeviceRollout r(*model, opts.cuda_graph, csrc);
             varda::RolloutRequest q = req;
             q.on_window = nullptr;
             q.on_step = [](int, const DateTime&, const float*) {};  // outputs to pinned host memory, untouched
@@ -828,7 +877,7 @@ int main(int argc, char** argv) {
             report["bench"] = bj;
             // the host-level loop on the same backend, for comparison (host copies every step)
             {
-                varda::Rollout h(*model);
+                varda::Rollout h(*model, csrc);
                 varda::RolloutRequest qh = q;
                 const double ts = app::now_s();
                 h.run(qh);
@@ -840,7 +889,7 @@ int main(int argc, char** argv) {
         }
 #endif
         if (bench > 0 && engine == "host") {
-            varda::Rollout r(*model);
+            varda::Rollout r(*model, csrc);
             varda::RolloutRequest q = req;
             q.on_window = nullptr;
             q.on_step = nullptr;

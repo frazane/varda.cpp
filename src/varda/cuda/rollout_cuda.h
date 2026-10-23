@@ -34,15 +34,17 @@ namespace varda::cuda {
 class CudaBackend;
 
 // The state update on the device: window (T, G, V_in) in place, y (G, V_out), forcing (G, F)
-// (may be null if no channel is a forcing). kind / src: device copies of StateUpdate::kind / src.
-// Same per-element semantics as StateUpdate::apply (exposed for the unit test).
+// (may be null if no channel is a forcing). kind / src: device copies of StateUpdate::kind / src;
+// constants: StateUpdate::constants. Same per-element semantics as StateUpdate::apply (exposed for
+// the unit test).
 void rollout_update(float* window, const float* y, const float* forcing, const int8_t* kind, const int* src, int T,
-                    int64_t G, int V_in, int V_out, int F, cudaStream_t s);
+                    int64_t G, int V_in, int V_out, int F, ConstantSource constants, cudaStream_t s);
 
 class DeviceRollout {
 public:
     // cuda_graph: one CUDA graph per step (default); false runs the same calls eagerly.
-    explicit DeviceRollout(Model& model, bool cuda_graph = true);
+    // cs: source of the newest slot's constant inputs (rollout.h; default in place, 9505dd0).
+    explicit DeviceRollout(Model& model, bool cuda_graph = true, ConstantSource cs = ConstantSource::Newest);
     ~DeviceRollout();
     DeviceRollout(const DeviceRollout&) = delete;
     DeviceRollout& operator=(const DeviceRollout&) = delete;

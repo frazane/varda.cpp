@@ -1,14 +1,21 @@
 // Rollout state update and dates (src/varda/rollout.h, docs/rollout-engine.md), on tiny synthetic
 // windows whose values differ between slots, so that a value taken from the wrong slot shows:
-//  1. T = 2: roll, prognostic feedback (permuted output indices), forcings, and constant inputs
-//     inherited from the OLDEST slot (anemoi-inference: the roll brings slot 0 round);
-//  2. T = 3: the same with a deeper window;
+//  1. T = 2..5, both constant sources, three consecutive updates, each bitwise equal to the literal
+//     upstream definition executed on whole slots: anemoi-inference 9505dd0's advance_map
+//     (inin = [(i, i-m) for i in range(m, n)], in order; outin = [(m-i-1, n-i-1)], m = 1, n = T) for
+//     the default ConstantSource::Newest, and eaeb36fa's roll(-1) for ConstantSource::Oldest; plus
+//     explicit slot-by-slot expectations: slot t <- old slot t+1, prognostic inputs from their (permuted)
+//     outputs, forcings, and constants that keep the NEWEST slot's value (default) or take the OLDEST
+//     slot's (roll); with constants equal in all slots, both semantics give the same window;
+//  2. the default is ConstantSource::Newest;
 //  3. invalid index sets (channel uncovered, listed twice, out of range) and a config without a
 //     `forcings` section are rejected with an error;
 //  4. valid dates: date0 + (s + 1) * timestep (1 h and 6 h, across a day, a month and a leap day);
 //  5. if the converted models are present ($VARDA_SCRATCH/converted-new/<model>/model.safetensors):
 //     StateUpdate::from_config on the real configs (counts, and every input covered exactly once).
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <fstream>
 #include <stdexcept>
@@ -24,6 +31,14 @@ using namespace varda;
 namespace {
 
 int failures = 0;
+
+bool rep_print_once(int T, ConstantSource cs) {
+    static std::vector<std::pair<int, int>> seen;
+    const std::pair<int, int> k{T, int(cs)};
+    for (auto& p : seen) if (p == k) return false;
+    seen.push_back(k);
+    return true;
+}
 
 void expect(bool ok, const std::string& what) {
     if (!ok) {
@@ -48,12 +63,51 @@ float wval(int t, int64_t g, int c) { return 1000.0f * (t + 1) + 10.0f * g + c +
 float yval(int64_t g, int o) { return -(100.0f * g + o) - 0.5f; }
 float fval(int64_t g, int k) { return 0.25f + g + 0.0625f * k; }
 
-void check_update(int T) {
+// The two upstream definitions, executed literally on whole slots (independent of StateUpdate):
+//  - 9505dd0 (Metadata.advance_map, m = multi_step_output = 1, n = T):
+//      inin  = [(i, i - m) for i in range(m, n)]   ->  window[:, new] = window[:, old], in list order
+//      outin = [(m - i - 1, n - i - 1) for i in range(min(n, m))]   ->  newest slot: prognostic <- y, forcings
+//  - eaeb36fa: window = roll(window, -1, dim=1), then the same newest-slot writes.
+std::vector<float> reference_update(std::vector<float> w, int T, int64_t G, int V_in, int V_out,
+                                    const std::vector<int>& prog_in, const std::vector<int>& prog_out,
+                                    const std::vector<int>& dyn_in, const std::vector<float>& y,
+                                    const std::vector<float>& f, ConstantSource cs, std::string* map_text) {
+    const int64_t slot = G * V_in;
+    const int n = T, m = 1;
+    std::vector<std::pair<int, int>> inin, outin;
+    for (int i = m; i < n; ++i) inin.push_back({i, i - m});
+    for (int i = 0; i < std::min(n, m); ++i) outin.push_back({m - i - 1, n - i - 1});
+    if (map_text) {
+        *map_text = "inin";
+        for (auto& p : inin) *map_text += " (" + std::to_string(p.first) + "->" + std::to_string(p.second) + ")";
+        *map_text += " outin";
+        for (auto& p : outin) *map_text += " (y" + std::to_string(p.first) + "->" + std::to_string(p.second) + ")";
+    }
+    if (cs == ConstantSource::Newest) {
+        for (auto& p : inin)  // sequential, in place, like the torch assignments
+            std::copy(w.begin() + p.first * slot, w.begin() + (p.first + 1) * slot, w.begin() + p.second * slot);
+    } else {
+        std::vector<float> r(w.size());
+        for (int t = 0; t < T; ++t)  // roll(-1): r[t] = w[(t + 1) % T]
+            std::copy(w.begin() + ((t + 1) % T) * slot, w.begin() + ((t + 1) % T + 1) * slot, r.begin() + t * slot);
+        w = r;
+    }
+    for (auto& p : outin) {
+        float* nw = &w[p.second * slot];
+        for (int64_t g = 0; g < G; ++g) {
+            for (size_t i = 0; i < prog_in.size(); ++i) nw[g * V_in + prog_in[i]] = y[g * V_out + prog_out[i]];
+            for (size_t k = 0; k < dyn_in.size(); ++k) nw[g * V_in + dyn_in[k]] = f[g * dyn_in.size() + k];
+        }
+    }
+    return w;
+}
+
+void check_update(int T, ConstantSource cs) {
     const int64_t G = 3;
     const int V_in = 7, V_out = 5;
     // channels: 0,3,6 prognostic (from outputs 2,0,4: permuted), 1,4 dynamic forcings (columns 0,1), 2,5 constant
     const std::vector<int> prog_in = {0, 3, 6}, prog_out = {2, 0, 4}, dyn_in = {1, 4}, const_in = {2, 5};
-    StateUpdate u = StateUpdate::make(T, G, V_in, V_out, prog_in, prog_out, dyn_in, const_in);
+    StateUpdate u = StateUpdate::make(T, G, V_in, V_out, prog_in, prog_out, dyn_in, const_in, cs);
     expect(u.F == 2, "F");
     std::vector<float> w(size_t(T) * G * V_in), y(G * V_out), f(G * 2);
     for (int t = 0; t < T; ++t)
@@ -63,9 +117,26 @@ void check_update(int T) {
         for (int o = 0; o < V_out; ++o) y[g * V_out + o] = yval(g, o);
     for (int64_t g = 0; g < G; ++g)
         for (int k = 0; k < 2; ++k) f[g * 2 + k] = fval(g, k);
-    u.apply(w.data(), y.data(), f.data());
 
-    const std::string tag = "T=" + std::to_string(T) + ": ";
+    const bool newest_cs = cs == ConstantSource::Newest;
+    const std::string tag = "T=" + std::to_string(T) + (newest_cs ? " in place: " : " roll: ");
+    std::string map_text;
+    std::vector<float> want = w;
+    for (int rep = 1; rep <= 3; ++rep) {  // three consecutive updates, each against the literal reference
+        want = reference_update(want, T, G, V_in, V_out, prog_in, prog_out, dyn_in, y, f, cs, &map_text);
+        u.apply(w.data(), y.data(), f.data());
+        expect(std::memcmp(w.data(), want.data(), w.size() * 4) == 0,
+               tag + "update " + std::to_string(rep) + " bitwise equal to the literal upstream definition");
+    }
+    if (rep_print_once(T, cs))
+        std::printf("T=%d %s: %s\n", T, to_string(cs),
+                    newest_cs ? ("advance_map " + map_text).c_str() : "roll(-1), then outin");
+
+    // Explicit expectations after ONE update (fresh window): which slot each value comes from.
+    for (int t = 0; t < T; ++t)
+        for (int64_t g = 0; g < G; ++g)
+            for (int c = 0; c < V_in; ++c) w[(t * G + g) * V_in + c] = wval(t, g, c);
+    u.apply(w.data(), y.data(), f.data());
     for (int t = 0; t + 1 < T; ++t)
         for (int64_t g = 0; g < G; ++g)
             for (int c = 0; c < V_in; ++c)
@@ -79,18 +150,47 @@ void check_update(int T) {
         for (size_t k = 0; k < dyn_in.size(); ++k)
             expect(nw[dyn_in[k]] == fval(g, int(k)), tag + "dynamic forcing column");
         for (int c : const_in) {
-            expect(nw[c] == wval(0, g, c), tag + "constant input inherited from the OLDEST slot");
-            expect(nw[c] != wval(n, g, c), tag + "constant input not the newest slot's own old value");
+            if (newest_cs) {
+                expect(nw[c] == wval(n, g, c), tag + "constant input keeps the NEWEST slot's own value");
+                expect(nw[c] != wval(0, g, c), tag + "constant input not from the oldest slot");
+            } else {
+                expect(nw[c] == wval(0, g, c), tag + "constant input inherited from the OLDEST slot");
+                expect(nw[c] != wval(n, g, c), tag + "constant input not the newest slot's own old value");
+            }
         }
     }
-    // A second update: the constants keep rolling round; slot 0 now holds the original slot 1,
-    // so that is what the newest slot gets (anemoi's roll; for truly constant inputs all slots agree).
+    // A second update. In place: the newest slot's constants never change; roll: slot 0 now holds the
+    // original slot 1, so that is what comes round (for truly constant inputs all slots agree).
     u.apply(w.data(), y.data(), f.data());
     for (int64_t g = 0; g < G; ++g)
         for (int c : const_in) {
-            const float want = wval(1, g, c);
-            expect(w[(n * G + g) * V_in + c] == want, tag + "second update: constant from the oldest slot");
+            const float want2 = newest_cs ? wval(n, g, c) : wval(1, g, c);
+            expect(w[(n * G + g) * V_in + c] == want2, tag + "second update: constant source");
         }
+}
+
+// With constants equal in every slot (real inputs), both semantics give the same window.
+void check_equal_constants(int T) {
+    const int64_t G = 5;
+    const int V_in = 7, V_out = 5;
+    const std::vector<int> prog_in = {0, 3, 6}, prog_out = {2, 0, 4}, dyn_in = {1, 4}, const_in = {2, 5};
+    StateUpdate a = StateUpdate::make(T, G, V_in, V_out, prog_in, prog_out, dyn_in, const_in, ConstantSource::Newest);
+    StateUpdate b = StateUpdate::make(T, G, V_in, V_out, prog_in, prog_out, dyn_in, const_in, ConstantSource::Oldest);
+    std::vector<float> w(size_t(T) * G * V_in), y(G * V_out), f(G * 2);
+    for (int t = 0; t < T; ++t)
+        for (int64_t g = 0; g < G; ++g)
+            for (int c = 0; c < V_in; ++c) w[(t * G + g) * V_in + c] = (c == 2 || c == 5) ? wval(0, g, c) : wval(t, g, c);
+    for (int64_t g = 0; g < G; ++g)
+        for (int o = 0; o < V_out; ++o) y[g * V_out + o] = yval(g, o);
+    for (int64_t g = 0; g < G; ++g)
+        for (int k = 0; k < 2; ++k) f[g * 2 + k] = fval(g, k);
+    std::vector<float> wb = w;
+    for (int rep = 0; rep < 3; ++rep) {
+        a.apply(w.data(), y.data(), f.data());
+        b.apply(wb.data(), y.data(), f.data());
+    }
+    expect(std::memcmp(w.data(), wb.data(), w.size() * 4) == 0,
+           "T=" + std::to_string(T) + ": equal constants in all slots -> in place == roll, bitwise");
 }
 
 void check_errors() {
@@ -149,8 +249,15 @@ void check_real_configs() {
 }  // namespace
 
 int main() {
-    check_update(2);
-    check_update(3);
+    for (int T = 2; T <= 5; ++T) {
+        check_update(T, ConstantSource::Newest);
+        check_update(T, ConstantSource::Oldest);
+        check_equal_constants(T);
+    }
+    {  // the default is in place (anemoi-inference 9505dd0)
+        StateUpdate d = StateUpdate::make(2, 1, 3, 1, {0}, {0}, {1}, {2});
+        expect(d.constants == ConstantSource::Newest, "default constant source is in place (9505dd0)");
+    }
     check_errors();
     check_dates();
     check_real_configs();

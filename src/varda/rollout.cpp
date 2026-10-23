@@ -21,9 +21,14 @@ void require(bool ok, const std::string& what) {
 
 }  // namespace
 
+const char* to_string(ConstantSource c) {
+    return c == ConstantSource::Newest ? "newest (in place, anemoi-inference 9505dd0)"
+                                       : "oldest (roll, anemoi-inference eaeb36fa)";
+}
+
 StateUpdate StateUpdate::make(int T, int64_t G, int V_in, int V_out, const std::vector<int>& prog_in,
                               const std::vector<int>& prog_out, const std::vector<int>& dyn_in,
-                              const std::vector<int>& const_in) {
+                              const std::vector<int>& const_in, ConstantSource cs) {
     require(T >= 1 && G >= 0 && V_in > 0 && V_out > 0, "bad sizes");
     require(prog_in.size() == prog_out.size(), "residual_input and residual_output differ in length");
     StateUpdate u;
@@ -32,6 +37,7 @@ StateUpdate StateUpdate::make(int T, int64_t G, int V_in, int V_out, const std::
     u.V_in = V_in;
     u.V_out = V_out;
     u.F = static_cast<int>(dyn_in.size());
+    u.constants = cs;
     u.kind.assign(V_in, int8_t(-1));
     u.src.assign(V_in, -1);
     auto claim = [&](int c, Kind k, int s, const char* what) {
@@ -53,31 +59,34 @@ StateUpdate StateUpdate::make(int T, int64_t G, int V_in, int V_out, const std::
     return u;
 }
 
-StateUpdate StateUpdate::from_config(const Config& cfg) {
+StateUpdate StateUpdate::from_config(const Config& cfg, ConstantSource cs) {
     require(cfg.has_forcings,
             "the model config has no `forcings` section (dynamic/constant forcing names and input indices,"
             " timestep_hours); convert the checkpoint with a converter that writes it (docs/format.md §1.2)");
     return make(cfg.n_input_steps, cfg.n_data_nodes, cfg.n_input_vars, cfg.n_output_vars, cfg.residual_input,
-                cfg.residual_output, cfg.forcing_dynamic_index, cfg.forcing_constant_index);
+                cfg.residual_output, cfg.forcing_dynamic_index, cfg.forcing_constant_index, cs);
 }
 
 void StateUpdate::apply(float* w, const float* y, const float* f) const {
     require(F == 0 || f != nullptr, "forcings missing");
     const int64_t slot = G * V_in;
     float* newest = w + int64_t(T - 1) * slot;
+    const bool from_oldest = constants == ConstantSource::Oldest;
 #pragma omp parallel for schedule(static)
     for (int64_t g = 0; g < G; ++g) {
         float* col0 = w + g * V_in;  // oldest slot, grid point g
         for (int c = 0; c < V_in; ++c) {
             const float oldest = col0[c];
-            for (int t = 0; t + 1 < T; ++t) col0[t * slot + c] = col0[(t + 1) * slot + c];  // the roll
-            float v;
+            // advance_map "inin": slot t <- slot t+1, ascending (each source is read before it is
+            // overwritten); the newest slot is not touched by it.
+            for (int t = 0; t + 1 < T; ++t) col0[t * slot + c] = col0[(t + 1) * slot + c];
             switch (kind[c]) {
-                case Prognostic: v = y[g * V_out + src[c]]; break;
-                case Forcing: v = f[g * F + src[c]]; break;
-                default: v = oldest; break;  // constant in time: what the roll brings round
+                case Prognostic: newest[g * V_in + c] = y[g * V_out + src[c]]; break;  // "outin"
+                case Forcing: newest[g * V_in + c] = f[g * F + src[c]]; break;
+                default:  // constant in time: in place keeps the newest slot's own value
+                    if (from_oldest) newest[g * V_in + c] = oldest;  // eaeb36fa: what roll(-1) brings round
+                    break;
             }
-            newest[g * V_in + c] = v;
         }
     }
 }
@@ -96,9 +105,9 @@ void check_rollout_model(const Model& m) {
             " from converted-new/");
 }
 
-Rollout::Rollout(Model& model) : m_(model) {
+Rollout::Rollout(Model& model, ConstantSource cs) : m_(model) {
     check_rollout_model(model);
-    upd_ = StateUpdate::from_config(model.config());
+    upd_ = StateUpdate::from_config(model.config(), cs);
     win_.resize(size_t(upd_.T) * upd_.G * upd_.V_in);
     y_.resize(size_t(upd_.G) * upd_.V_out);
     f_.resize(size_t(upd_.G) * upd_.F);

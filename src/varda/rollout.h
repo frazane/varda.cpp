@@ -7,12 +7,16 @@
 // The window (1, T, G, V_in) holds PHYSICAL fp32 values in model-input order, oldest slot first.
 // Step s (0-based):
 //   1. y = predict_step(window)                  (re-normalises the whole window every step)
-//   2. unless s is the last step, update the window in place:
-//        roll by one slot (slot t <- slot t+1);
-//        newest slot, prognostic inputs  <- y's prognostic outputs (indices.residual_input /
-//                                           residual_output; physical, bounded);
-//        newest slot, dynamic forcings   <- forcings at the valid date of this step's output;
-//        newest slot, constant inputs    <- inherited through the roll, i.e. from the OLDEST slot.
+//   2. unless s is the last step, update the window in place (anemoi-inference 9505dd0, the
+//      version the Hugging Face release pins: metadata.advance_map, one output step m = 1):
+//        inin:  slot t <- slot t+1 for t = 0 .. T-2, in ascending order (a shift down by one);
+//        outin: newest slot, prognostic inputs <- y's prognostic outputs (indices.residual_input /
+//                                                 residual_output; physical, bounded);
+//               newest slot, dynamic forcings  <- forcings at the valid date of this step's output;
+//        newest slot, constant inputs: never written, so they keep the NEWEST slot's own values
+//        (ConstantSource::Newest, the default). ConstantSource::Oldest reproduces anemoi-inference
+//        eaeb36fa (the Python project's references), whose roll(-1) brought the OLDEST slot's values
+//        round. The two agree whenever the constants are equal in all slots (real inputs).
 //   3. valid date of output s = date0 + (s + 1) * timestep_hours, date0 = the newest input slot's date.
 #pragma once
 
@@ -30,6 +34,13 @@ namespace varda {
 // What the update writes into each input channel of the newest slot. Built from the config:
 // every input channel must be exactly one of prognostic, dynamic forcing or constant (as
 // anemoi-inference's "check" requires), otherwise construction throws.
+// Where the newest slot's constant-in-time inputs come from in the update.
+enum class ConstantSource : int8_t {
+    Newest,  // kept in place: anemoi-inference 9505dd0 (advance_map), the default
+    Oldest,  // inherited through roll(-1): anemoi-inference eaeb36fa
+};
+const char* to_string(ConstantSource c);
+
 struct StateUpdate {
     enum Kind : int8_t { Kept = 0, Prognostic = 1, Forcing = 2 };
 
@@ -37,15 +48,16 @@ struct StateUpdate {
     int64_t G = 0;
     std::vector<int8_t> kind;  // [V_in]
     std::vector<int> src;      // [V_in]: Prognostic -> output index, Forcing -> forcing column, Kept -> unused
+    ConstantSource constants = ConstantSource::Newest;
 
     // Throws std::runtime_error naming the problem if the config has no `forcings` section
     // or the index sets do not partition the inputs.
-    static StateUpdate from_config(const Config& cfg);
+    static StateUpdate from_config(const Config& cfg, ConstantSource cs = ConstantSource::Newest);
     // Explicit index lists (tests): prog_in[i] <- y[prog_out[i]], dyn_in[k] <- forcing column k,
-    // const_in carried by the roll.
+    // const_in constant in time (source: `cs`).
     static StateUpdate make(int T, int64_t G, int V_in, int V_out, const std::vector<int>& prog_in,
                             const std::vector<int>& prog_out, const std::vector<int>& dyn_in,
-                            const std::vector<int>& const_in);
+                            const std::vector<int>& const_in, ConstantSource cs = ConstantSource::Newest);
 
     // window: (T, G, V_in) in place; y: (G, V_out); forcing: (G, F) (may be null when F == 0).
     void apply(float* window, const float* y, const float* forcing) const;
@@ -77,7 +89,7 @@ class Rollout {
 public:
     // Throws if the model's config has no `forcings` section, no timestep, or the file has no
     // grid coordinates (needed for computed forcings).
-    explicit Rollout(Model& model);
+    explicit Rollout(Model& model, ConstantSource cs = ConstantSource::Newest);
 
     void run(const RolloutRequest& req);
 

@@ -21,12 +21,15 @@ double now_s() {
     return duration<double>(steady_clock::now().time_since_epoch()).count();
 }
 
-// One thread per (grid point g, input channel c): reads the T slots of the column, shifts them
-// down by one and writes the newest slot from its source. Each thread owns its column, so the
-// in-place roll is race free. Pure copies: no arithmetic, bitwise the host StateUpdate::apply.
+// One thread per (grid point g, input channel c): shifts the column's T slots down by one
+// (advance_map "inin") and writes the newest slot from its source ("outin"); a constant input
+// keeps the newest slot's own value, or with from_oldest (eaeb36fa's roll) takes the old oldest
+// one. Each thread owns its column, so the in-place update is race free. Pure copies: no
+// arithmetic, bitwise the host StateUpdate::apply.
 __global__ void rollout_update_kernel(float* __restrict__ w, const float* __restrict__ y,
                                       const float* __restrict__ f, const int8_t* __restrict__ kind,
-                                      const int* __restrict__ src, int T, int64_t G, int V_in, int V_out, int F) {
+                                      const int* __restrict__ src, int T, int64_t G, int V_in, int V_out, int F,
+                                      bool from_oldest) {
     const int64_t n = G * V_in;
     const int64_t slot = n;
     for (int64_t i = blockIdx.x * int64_t(blockDim.x) + threadIdx.x; i < n; i += int64_t(gridDim.x) * blockDim.x) {
@@ -35,24 +38,23 @@ __global__ void rollout_update_kernel(float* __restrict__ w, const float* __rest
         const float oldest = w[i];
         for (int t = 0; t + 1 < T; ++t) w[t * slot + i] = w[(t + 1) * slot + i];
         const int k = kind[c];
-        float v;
-        if (k == StateUpdate::Prognostic) v = y[g * V_out + src[c]];
-        else if (k == StateUpdate::Forcing) v = f[g * F + src[c]];
-        else v = oldest;
-        w[int64_t(T - 1) * slot + i] = v;
+        float* nw = w + int64_t(T - 1) * slot + i;
+        if (k == StateUpdate::Prognostic) *nw = y[g * V_out + src[c]];
+        else if (k == StateUpdate::Forcing) *nw = f[g * F + src[c]];
+        else if (from_oldest) *nw = oldest;  // otherwise: the newest slot keeps its own value
     }
 }
 
 }  // namespace
 
 void rollout_update(float* window, const float* y, const float* forcing, const int8_t* kind, const int* src, int T,
-                    int64_t G, int V_in, int V_out, int F, cudaStream_t s) {
+                    int64_t G, int V_in, int V_out, int F, ConstantSource constants, cudaStream_t s) {
     const int64_t n = G * V_in;
     if (n == 0) return;
     const int threads = 256;
     const int64_t blocks = std::min<int64_t>((n + threads - 1) / threads, 108 * 32);
     rollout_update_kernel<<<static_cast<unsigned>(blocks), threads, 0, s>>>(window, y, forcing, kind, src, T, G, V_in,
-                                                                           V_out, F);
+                                                                           V_out, F, constants == ConstantSource::Oldest);
     VARDA_CUDA_LAUNCH();
 }
 
@@ -72,12 +74,12 @@ float* DeviceRollout::halloc(size_t n) {
     return static_cast<float*>(p);
 }
 
-DeviceRollout::DeviceRollout(Model& model, bool cuda_graph) : m_(model), use_graph_(cuda_graph) {
+DeviceRollout::DeviceRollout(Model& model, bool cuda_graph, ConstantSource cs) : m_(model), use_graph_(cuda_graph) {
     check_rollout_model(model);
     be_ = as_cuda(model);
     if (!be_) throw std::runtime_error("DeviceRollout: the model is not on a CUDA device");
     VARDA_CUDA_CHECK(cudaSetDevice(be_->device()));
-    upd_ = StateUpdate::from_config(model.config());
+    upd_ = StateUpdate::from_config(model.config(), cs);
     in_n_ = be_->input_numel();
     out_n_ = be_->output_numel();
     f_n_ = upd_.G * upd_.F;
@@ -138,7 +140,7 @@ void DeviceRollout::enqueue_step(int p, bool update) {
     be_->denormalise(yn_, y_[p], main_);
     if (update)
         rollout_update(win_, y_[p], upd_.F ? f_[p] : nullptr, kind_, src_, upd_.T, upd_.G, upd_.V_in, upd_.V_out,
-                       upd_.F, main_);
+                       upd_.F, upd_.constants, main_);
 }
 
 void DeviceRollout::capture() {

@@ -1,11 +1,14 @@
 // Device state update of the CUDA rollout (varda::cuda::rollout_update, src/varda/cuda/rollout_cuda.h)
-// vs the host StateUpdate::apply (src/varda/rollout.h): bitwise equal on synthetic windows (T = 2
-// and 3, G not a multiple of the block size, permuted prognostic indices, values distinct per
-// slot), over two consecutive updates. Skipped (exit 0) without a CUDA device.
+// vs the host StateUpdate::apply (src/varda/rollout.h): bitwise equal on synthetic windows (T = 2, 3
+// and 4, G not a multiple of the block size, permuted prognostic indices, values distinct per slot),
+// over two consecutive updates, for both constant sources (in place = anemoi-inference 9505dd0, the
+// default; roll = eaeb36fa). Also checks that the two sources really differ on such windows (so the
+// flag reaches the kernel). Skipped (exit 0) without a CUDA device.
 #include <cuda_runtime.h>
 
 #include <cstdio>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 #include "varda/cuda/common.h"
@@ -16,11 +19,11 @@ using namespace varda;
 
 static int failures = 0;
 
-static void run_case(int T, int64_t G) {
+static std::vector<float> run_case(int T, int64_t G, ConstantSource cs) {
     const int V_in = 11, V_out = 8;
     const std::vector<int> prog_in = {0, 2, 3, 8, 10}, prog_out = {7, 1, 0, 4, 5}, dyn_in = {1, 6, 9},
                            const_in = {4, 5, 7};
-    StateUpdate u = StateUpdate::make(T, G, V_in, V_out, prog_in, prog_out, dyn_in, const_in);
+    StateUpdate u = StateUpdate::make(T, G, V_in, V_out, prog_in, prog_out, dyn_in, const_in, cs);
     std::vector<float> w(size_t(T) * G * V_in), y(G * V_out), f(G * u.F);
     unsigned x = 12345;
     auto rnd = [&]() { x = x * 1664525u + 1013904223u; return float(x >> 8) / 65536.0f - 128.0f; };
@@ -43,12 +46,13 @@ static void run_case(int T, int64_t G) {
     VARDA_CUDA_CHECK(cudaMemcpy(ds, u.src.data(), V_in * 4, cudaMemcpyHostToDevice));
     for (int rep = 0; rep < 2; ++rep) {
         u.apply(w.data(), y.data(), f.data());
-        cuda::rollout_update(dw, dy, df, dk, ds, T, G, V_in, V_out, u.F, nullptr);
+        cuda::rollout_update(dw, dy, df, dk, ds, T, G, V_in, V_out, u.F, u.constants, nullptr);
         VARDA_CUDA_CHECK(cudaDeviceSynchronize());
         std::vector<float> got(w.size());
         VARDA_CUDA_CHECK(cudaMemcpy(got.data(), dw, w.size() * 4, cudaMemcpyDeviceToHost));
         const bool eq = std::memcmp(got.data(), w.data(), w.size() * 4) == 0;
-        std::printf("T=%d G=%lld update %d: device %s host\n", T, (long long)G, rep + 1, eq ? "==" : "!=");
+        std::printf("T=%d G=%lld %s, update %d: device %s host\n", T, (long long)G,
+                    cs == ConstantSource::Newest ? "in place" : "roll", rep + 1, eq ? "==" : "!=");
         if (!eq) ++failures;
     }
     cudaFree(dw);
@@ -56,6 +60,7 @@ static void run_case(int T, int64_t G) {
     cudaFree(df);
     cudaFree(dk);
     cudaFree(ds);
+    return w;
 }
 
 int main() {
@@ -64,9 +69,15 @@ int main() {
         std::printf("skip: no CUDA device\n");
         return 0;
     }
-    run_case(2, 1);
-    run_case(2, 40321);
-    run_case(3, 777);
+    const std::vector<std::pair<int, int64_t>> cases = {{2, 1}, {2, 40321}, {3, 777}, {4, 1001}};
+    for (const auto& [T, G] : cases) {
+        auto a = run_case(T, G, ConstantSource::Newest);
+        auto b = run_case(T, G, ConstantSource::Oldest);
+        if (std::memcmp(a.data(), b.data(), a.size() * 4) == 0) {
+            std::printf("FAIL: T=%d: in place and roll give the same window on distinct slots\n", T);
+            ++failures;
+        }
+    }
     if (failures) {
         std::printf("%d failure(s)\n", failures);
         return 1;
