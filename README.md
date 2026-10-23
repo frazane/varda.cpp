@@ -121,7 +121,8 @@ anemoi-inference does); it needs ecCodes (`-DVARDA_GRIB=ON`, `tools/env.sh`): `d
 Apple Silicon: the CPU fp32 backend builds natively on macOS arm64 with OpenMP and OpenBLAS.
 Build, GRIB dependencies and verification: [docs/apple-silicon.md](docs/apple-silicon.md).
 The optional [Metal/MPS backend](docs/metal.md) runs on the Apple GPU with
-`--device metal --precision fp32`; CUDA requires an NVIDIA GPU.
+`--device metal --precision fp32` or `--precision fp16` (mixed precision);
+CUDA requires an NVIDIA GPU.
 
 ## Licence and disclaimer
 

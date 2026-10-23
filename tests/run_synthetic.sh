@@ -14,7 +14,8 @@
 #   SKIP_CUDA=1 forces the CUDA part to be skipped (it is also skipped, with a note, when
 #             no GPU is visible).
 # Runs per model: CPU fp32 at 1 and 8 threads, CPU fp32 with VARDA_CPU_CHUNK_ROWS=37 (8
-# threads); CUDA fp32, CUDA fp32 with VARDA_DEC_CHUNK_ROWS=128, CUDA fp16.
+# threads); CUDA fp32, CUDA fp32 with VARDA_DEC_CHUNK_ROWS=128, CUDA fp16. Metal
+# fp32 and mixed fp16 each run with default chunking and VARDA_METAL_CHUNK_ROWS=37.
 # Prints a summary (worst rel_absmax and ratio to the tolerance per run) and exits non-zero
 # if any run fails or errors. The varda-parity check includes the hook-inertness check.
 set -u
@@ -115,6 +116,8 @@ for m in $MODELS; do
     if [ "$have_metal" = 1 ]; then
       run "$m" metal-fp32 synthetic-fp32 "" --device metal --precision fp32
       run "$m" metal-fp32-chunk37 synthetic-fp32 "VARDA_METAL_CHUNK_ROWS=37" --device metal --precision fp32
+      run "$m" metal-fp16 synthetic-fp16 "" --device metal --precision fp16
+      run "$m" metal-fp16-chunk37 synthetic-fp16 "VARDA_METAL_CHUNK_ROWS=37" --device metal --precision fp16
     fi
   ;; esac
 done

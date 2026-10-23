@@ -89,7 +89,7 @@ jobs:
           if ! MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=0 \
             BIN="$PWD/build-ci" SYN_DIR="$RUNNER_TEMP/varda-synthetic" \
             OUT="$RUNNER_TEMP/varda-metal-parity" bash tests/run_synthetic.sh metal; then
-            cat "$RUNNER_TEMP/varda-metal-parity/a.metal-fp32.log"
+            cat "$RUNNER_TEMP/varda-metal-parity"/a.metal-fp*.log
             exit 1
           fi
           MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=0 \

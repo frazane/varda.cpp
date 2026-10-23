@@ -82,7 +82,7 @@ cmd_setup() {
             die "the build has no varda-forecast: ecCodes not found? set ECCODES_HOME (log: $BUILD/varda-build.log)"
         if ! grep -q '^CMAKE_CUDA_COMPILER:.*nvcc' "$BUILD/CMakeCache.txt"; then
             if [[ -x "$BUILD/varda-metal-info" ]]; then
-                say "note: built without CUDA; Metal enabled (--device metal --precision fp32)"
+                say "note: built without CUDA; Metal enabled (--device metal --precision fp32|fp16)"
             else
                 say "note: built without CUDA (no nvcc found): only --device cpu will work"
             fi
@@ -154,9 +154,6 @@ cmd_forecast() {
     done
     case "$precision" in fp16|fp32) ;; *) die "--precision must be fp16 or fp32" ;; esac
     case "$device" in cuda|cpu|metal) ;; *) die "--device must be cuda, cpu or metal" ;; esac
-    if [[ "$device" == metal && "$precision" != fp32 ]]; then
-        die "the Metal backend runs fp32 only: pass --precision fp32"
-    fi
     if [[ -n "$lead" ]]; then
         case "$lead" in
             *d) lead=$(( ${lead%d} * 24 )) ;;
