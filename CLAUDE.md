@@ -10,6 +10,9 @@
 - `docs/cpu.md`, `docs/cuda.md`: the two backends. `docs/rollout-engine.md`: the C++ rollout.
   `docs/forcings.md`: computed forcings. `docs/rollout.md`: reference rollouts and their
   tolerances. `docs/tools.md`: converter. `docs/testing.md`: every test suite and how to run it.
+- `docs/forecast.md`: running a forecast from real data (GRIB in, GRIB out), overlap, timings, limits.
+  `docs/spec-io.md`: the I/O spec. `docs/realdata-reference.md`: the anemoi-inference reference run and dumps.
+  `docs/io-input.md`: GRIB -> x0. `docs/io-output.md`: y -> GRIB, io config.
 - `docs/results.md`: parity and benchmark numbers, each with its full configuration.
 - The maths is specified in the Python project (read-only, `$IE_ROOT` =
   `$HOME/projects/the Python project`): `docs/spec-model.md` (encoder, processor,
@@ -75,7 +78,7 @@ backend only. GPU target: sm_80 (A100-SXM4 96 GB on the GPU nodes).
 | | Varda forecaster (= varda) | dev (dev model) |
 |---|---|---|
 | checkpoint | `$VARDA_SCRATCH/hf/varda-forecaster-det-sgm/model.ckpt` (HF download; same sha256 as `$VARDA_CKPT`) | `$VARDA_DEV_CKPT` |
-| converted | `$VARDA_SCRATCH/converted/varda/model.safetensors` | `$VARDA_SCRATCH/converted/dev/model.safetensors` |
+| converted | `$VARDA_SCRATCH/converted/varda-v2/model.safetensors` (adds the cutout masks the GRIB layer needs; every other tensor bitwise equal to `converted/varda/`) | `$VARDA_SCRATCH/converted/dev/model.safetensors` |
 | golden (Python project) | `$IE_SCRATCH/golden/varda/{cpu-fp32-pyg,cuda-fp32-triton,cuda-fp16-triton}/` (~40 GB each) | `$IE_SCRATCH/golden/{cpu-fp32-pyg,cuda-fp32-triton,cuda-fp16-triton}/` (1.4 GB each) |
 | exported golden | `$VARDA_SCRATCH/golden/varda/<tag>.safetensors` | `$VARDA_SCRATCH/golden/dev/<tag>.safetensors` |
 | tolerances | `tolerances/varda.json` | `tolerances/dev.json` |

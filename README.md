@@ -57,6 +57,7 @@ All seven items of the definition of done are met (details and job ids: `docs/re
 | generality: 6 synthetic models vs float64 reference | ≤ 9.2e-7 fp32 (tol 1e-5), ≤ 1.4e-3 fp16 (tol 3e-3), CPU and CUDA |
 | computed forcings vs anemoi-inference | bitwise (0 of 194M values differ) |
 | rollout, 24 × 6 h steps vs anemoi-inference's loop | CPU fp32 0.58, CUDA fp32 0.50, fp16 0.73 / 0.84 of per-step tolerances; forcings, dates and device loop == host loop bitwise |
+| real-data forecast, KENDA-CH1 + IFS open data, 2026-10-22T15 (`docs/forecast.md`) | `x0` and every input stage bitwise vs anemoi-inference's dumps; GRIB writer byte-identical to anemoi's (676/676 messages, fed its states) and for step 0 (140/140); 4-step rollout vs anemoi-inference fp16 worst 0.49 of per-step tolerance (0/16 above); GRIB in to GRIB out, fp16, 10.4 s warm on an A100 (graph on), against 191 s for anemoi-inference on the same inputs and node, same job (18x; fp32 41 s vs 163 s, 4.0x; process wall clock, `docs/results.md` section 5) |
 
 Speed, A100-SXM4-80GB, one warm forward pass, all implementations in the same job:
 
@@ -77,12 +78,15 @@ Design and methodology additions are in `docs/design.md`.
 ```
 src/varda/      engine library: format (safetensors mmap), config, graph (CSR), model,
                 cpu/ (fp32 oracle: OpenMP + OpenBLAS), cuda/ (CUDA kernels + cuBLAS)
-apps/           varda-info, varda-run, varda-parity, varda-bench, varda-rollout
+apps/           varda-info, varda-run, varda-parity, varda-bench, varda-rollout;
+                apps/io/: varda-prepare, varda-grib-write, varda-grib-compare, varda-forecast
 tests/          C++ unit tests (ctest)
 python/         converter, golden export, reference drivers (tools only, never the engine)
 tolerances/     per-checkpoint tolerances, keyed by uuid (from the Python project)
 docs/           design.md (start here), format.md (contracts), results.md, cpu.md, cuda.md,
-                rollout-engine.md, rollout.md, forcings.md, tools.md, testing.md
+                rollout-engine.md, rollout.md, forcings.md, tools.md, testing.md,
+                forecast.md (real data: GRIB in, GRIB out), spec-io.md, io-input.md, io-output.md,
+                realdata-reference.md
 bench/          same-job benchmark driver (original, Python fast path, varda.cpp)
 ```
 
@@ -95,3 +99,6 @@ cmake -S . -B build && cmake --build build -j
 build/varda-run --model model.safetensors --input golden.safetensors --device cuda --precision fp16
 build/varda-rollout ...                                                  # docs/rollout-engine.md
 ```
+
+`build/varda-forecast` runs a forecast from real data (KENDA-CH1 and IFS open data in, GRIB out, as
+anemoi-inference does); it needs ecCodes (`-DVARDA_GRIB=ON`, `tools/env.sh`): `docs/forecast.md`.

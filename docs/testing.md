@@ -10,6 +10,8 @@ need a compute node (CLAUDE.md, "Compute"); a job copies the binaries it runs to
 | ctest (`tests/*.cpp\|cu`) | kernels, GEMM wrapper, forcings, rollout state | CPU; GPU for the `.cu` tests; data for part of `test_forcings` | `cd build-<you> && ctest` |
 | Python tests (`python/tests/test_convert.py`) | converted-file contract, restricted unpickler | `.venv`; converted files (env vars) | see below |
 | `varda-parity` on real golden data | engine vs the Python reference, all contract keys | converted model + golden + `tolerances/<model>.json` | see below |
+| ctest, GRIB layer (`tests/io/*.cpp`) | numpy log, vertical interpolation, input and output building blocks, ecCodes link | ecCodes (`VARDA_GRIB=ON`); data for the real-data parts | `cd build-<you> && ctest` |
+| real-data checks | x0, GRIB bytes and the rollout against anemoi-inference's run of 2026-10-22T15 | frozen reference data, converted model, GPU for the rollout | section 5 |
 | synthetic suite (`tests/run_synthetic.sh`) | generality: models outside the real envelope vs an independent float64 reference | `.venv`, `build-*/varda-parity`; GPU for the CUDA part | `BIN=build-<you> tests/run_synthetic.sh` |
 
 ## 1. ctest
@@ -27,6 +29,8 @@ exit 0) when their data or device is missing.
   (`$VARDA_SCRATCH/forcings/`), date helpers, thread invariance. Data part skipped if fixtures are missing.
 - `test_rollout`, `test_rollout_cuda`: rollout state update (roll, feedback, forcings, constants) on synthetic
   windows, host and device bitwise equal; dates; config validation. The device test skips without a GPU.
+
+The GRIB layer's tests (`tests/io/*.cpp`, built only when ecCodes is found) are listed in section 5.1.
 
 Measured (build-synth, node with one A100, 2026-10-23): 6/6 passed, 18.5 s total
 (`test_forcings` 12.7 s, others at most 2.7 s).
@@ -168,3 +172,88 @@ debug, the numbers above); 283661 failed on I64 alignment of the first generator
 Add an entry to `CONFIGS` in `synthetic.py` (and a layout to `LAYOUTS` if the variable spaces differ), run
 `.venv/bin/python -I python/tests/synthetic.py --write-tolerances tolerances`, add the name to `MODELS` in
 `tests/run_synthetic.sh`, commit the new tolerance file. The generator hash changes, so the next run regenerates.
+
+## 5. Real-data I/O
+
+Reference: anemoi-inference's own run of the Hugging Face config on 2026-10-22T15 with every stage dumped
+(`docs/realdata-reference.md`, runs `ref-fp16` and `ref-fp32` under `$VARDA_SCRATCH/realdata/20261022T15/`). Results:
+`docs/results.md` section 5. Build with ecCodes (`source tools/env.sh` sets `ECCODES_HOME` and
+`VARDA_COSMO_DEFINITIONS`); the apps are in `apps/io/`.
+
+### 5.1 ctest targets (`tests/io/`, one executable and one ctest test each)
+
+Parts that need data skip with a message and exit 0 when their variables are unset.
+
+- `test_io_link`: the GRIB layer links against the ecCodes of the reference, and the COSMO definitions give KENDA-CH1
+  messages their COSMO short names. Real-data part: `VARDA_KENDA_SAMPLE` = a KENDA-CH1 `T` file, plus
+  `VARDA_COSMO_DEFINITIONS`.
+- `test_io_numpy_log`: `logf_np` against numpy's float32 `np.log`: special values and a table recorded with numpy
+  2.5.4 on an EPYC 7713 (dispatch X86_V3). With `--stdin` it is the exhaustive check over all 2 139 095 039 positive
+  finite float32 (numpy's output streamed in, command in the file header; 0 differ, job 285295).
+- `test_io_vertical`: the vertical interpolation and destaggering (`interpolate_extrapolate`, `destagger_z`) bitwise on 6
+  synthetic columns whose values were produced by the plugin in the reference env; every extrapolation branch and the
+  top clamp. No data needed.
+- `test_io_input`: dates, state handling, regrid matrix files, `y = W x` in stored order. Real-data part, needs all of
+  `VARDA_REGRID_MATRIX`, `VARDA_N320_TEMPLATE` (HF `templates/ifs-levtype=sfc.grib`), `VARDA_REGRID_REF_DUMPS` (a
+  reference run's `dumps/`) and `VARDA_COSMO_DEFINITIONS`: MIR's own `regrid.1` input messages through our regridder
+  must decode bitwise like MIR's output messages.
+- `test_io_output`: 45 checks of the output side: Python-style parsing, `tp` accumulate and rescale, `assign_mask`, NaN
+  and inf encoding, path rendering, the io config, `build_keys`, patch names, template matching, and a synthetic
+  end-to-end write on the real templates. Needs `VARDA_IO_CONFIG` (default
+  `$VARDA_SCRATCH/realdata/assets/varda-io.json`, produced by `python/export_io_config.py`), and for the end-to-end part
+  `VARDA_TEMPLATES` (default `$VARDA_SCRATCH/hf/templates`) and `VARDA_COSMO_DEFINITIONS`.
+
+### 5.2 Input side: `varda-prepare --compare`
+
+```
+R=$VARDA_SCRATCH/realdata/20261022T15
+build-out/varda-prepare --model $VARDA_SCRATCH/converted/varda-v2/model.safetensors \
+    --io-config $VARDA_SCRATCH/realdata/assets/varda-io.json \
+    --regrid-matrix $VARDA_SCRATCH/realdata/assets/regrid-ifs0p25-n320.safetensors \
+    --n320-template $VARDA_SCRATCH/hf/templates/ifs-levtype=sfc.grib --realdata $R --out OUT \
+    --compare $R/ref-fp16/dumps [--mir-mat <MIR .mat file>] --threads 64
+```
+Compares every stage with the reference's dumps (sources, regrid outputs, cutout, `x0` per column, step-0 state) and exits
+1 on any difference; expected: all bitwise (`docs/io-input.md` section 4). Run on a compute node (`cpu-short`, 64 cores;
+about 8 s).
+
+### 5.3 Output side: encoder-only byte identity
+
+`varda-grib-write` feeds the reference's own states (`state0.pre`, `step<s>.y`) to the writer, so the model is out of the
+loop, then `varda-grib-compare` checks the files against the reference's:
+```
+build-out/varda-grib-write --io-config $VARDA_SCRATCH/realdata/assets/varda-io.json \
+    --templates $VARDA_SCRATCH/hf/templates --model $VARDA_SCRATCH/converted/varda-v2/model.safetensors \
+    --dumps $R/ref-fp16/dumps --out OUT --date 2026-10-22T15:00:00
+build-out/varda-grib-compare --require-bytes OUT/outputs $R/ref-fp16/outputs     # exit 0: 676/676 messages byte-identical
+```
+`varda-grib-compare TEST REF` compares messages in file order, every header key, bitmap and values (default
+tolerance 0); `--rel-tol`, `--abs-tol`, `--ignore-key`, `--max-report`, `-q` as in `docs/io-output.md` section 3. Use
+`$R/ref-fp32` for the fp32 states. Jobs 285346, 285350.
+
+### 5.4 Rollout judged against the reference
+
+`export_rollout_realdata.py` turns a reference run's stages into a rollout file (needs a rollout file of the same
+checkpoint as template for the index tensors), and `varda-rollout` judges the real-data rollout per step with the
+rollout tolerances (`docs/rollout-engine.md` section 4):
+```
+.venv/bin/python -I python/reference/realdata/export_rollout_realdata.py $R/ref-fp16 \
+    $VARDA_SCRATCH/rollout/ref/cpu-fp32-pyg/rollout.safetensors          # -> $R/ref-fp16/rollout.safetensors
+build-out/varda-rollout --model $VARDA_SCRATCH/converted/varda-v2/model.safetensors \
+    --input $R/ref-fp16/rollout.safetensors --compare $R/ref-fp16/rollout.safetensors \
+    --device cuda --precision fp16 --check-forcings --verify-host --json rollout.json
+```
+For fp32 the pair has no tolerance table; the numbers are reported only.
+
+### 5.5 End to end: `varda-forecast`
+
+```
+build-out/varda-forecast --model ... --io-config ... --regrid-matrix ... --templates $VARDA_SCRATCH/hf/templates \
+    --realdata $R --out OUT --precision fp16 --dump-y
+build-out/varda-grib-compare --require-bytes -q OUT/outputs $R/ref-fp16/outputs
+```
+Expected: step 0 files (`*_0.grib`) byte-identical (140 messages); step files differ by the model error, so the compare
+reports failures at tolerance 0 (by construction; with `--rel-tol` set to the scale of interest it is a report, not a
+verdict). The verdict on the model output is 5.4; `OUT/y.safetensors` (`--dump-y`) must equal the `y` of
+`varda-rollout --out` bitwise (job 285378). Rerun with the same arguments: the bytes must equal. Jobs copy the
+binaries first (`$VARDA_SCRATCH/jobs/<name>/bin`).

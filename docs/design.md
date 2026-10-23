@@ -22,11 +22,20 @@ Backend ── CPU fp32 oracle (OpenMP + OpenBLAS)                              
    ▼
 Rollout ── host loop (any backend) / device loop (one CUDA graph per step)   docs/rollout-engine.md
        └─ computed forcings, bitwise equal to anemoi's                        docs/forcings.md
+
+Real data (varda-forecast; the engine above is unchanged):                  docs/forecast.md
+KENDA-CH1 + IFS open data (GRIB) ── vertical interpolation, MIR regrid matrix, cutout,
+   │                                  merge, forcings → x0                    docs/io-input.md
+   ▼  (input thread, parallel with model load + rollout set-up)
+Rollout ── y per step ──► writer thread: post-process, parallel GRIB encode,   docs/io-output.md
+                          lam (ICON templates) + global (IFS templates) files
 ```
 
 Library: `src/varda/` (`varda.h` is the public API). Apps: `varda-info` (inspect a file),
 `varda-run` (forward + timing), `varda-parity` (one-step parity against golden data),
-`varda-bench` (GPU timing), `varda-rollout` (rollout, per-step comparison and judging).
+`varda-bench` (GPU timing), `varda-rollout` (rollout, per-step comparison and judging); with
+ecCodes, `apps/io/`: `varda-prepare` (GRIB -> x0), `varda-grib-write`/`varda-grib-compare` (output
+side), `varda-forecast` (GRIB in, rollout, GRIB out).
 Tests: `docs/testing.md`.
 
 ## 2. Decisions
@@ -65,6 +74,9 @@ Tests: `docs/testing.md`.
 | generality | float64 numpy reference on 6 synthetic models | 1e-5 (fp32), 3e-3 (fp16) |
 | forcings | anemoi-inference's own `ComputedForcings` and the forcings recorded in reference rollouts | bitwise |
 | rollout, 24 steps | the original driven by anemoi-inference's own loop (CPU fp32, CUDA fp32/fp16, fp16 perturbation ensemble) | per-step tolerances, `tolerances/rollout/<model>.json` |
+| real-data input, 2026-10-22T15 | anemoi-inference's dumps of every stage (sources, regrid, cutout, x0) | bitwise |
+| real-data output | anemoi-inference's GRIB files, fed with its own states (encoder only); step 0 of a forecast | byte-identical |
+| real-data rollout | the original driven by anemoi-inference, fp16 and fp32 | per-step tolerances (fp16 `fast-fp16-vs-ref-fp16`), fp32 reported |
 | internal | hook vs no hook, graph vs eager, device loop vs host loop, computed vs replayed forcings, thread counts | bitwise |
 
 ## 4. Methodology additions (from porting to C++/CUDA)
@@ -126,3 +138,18 @@ are in the linked documents.
   operation order in double precision, glibc reproduces numpy bit for bit.
 - **Double-buffer by parity and capture one graph per parity**, rather than patching graph
   parameters. Deliver results one step behind so the GPU never waits for the host.
+
+**Real-data I/O**
+- **The reference's numerics live in its dependencies.** numpy's float32 `log` is its own SIMD routine, not glibc's
+  `logf`, and which one runs depends on the CPU. It had to be ported and checked exhaustively over all float32 inputs.
+  Decoding GRIB values as float or as double changes the results; so does the row order of MIR's interpolation matrix
+  (sum in stored order). Find the dependency that defines each number, then compare to it bitwise.
+- **Freeze the open data immediately, and pin "latest".** Open data is retained for hours or days. Download once, record
+  hashes, and write down every "latest run" decision (here the constants run) so the reference can be replayed offline
+  and the code never decides.
+- **Isolate the encoder by feeding it the reference's own states.** Byte identity of the files is then a property of the
+  writer alone; with the model in the loop, files can differ only by model error, which a zero-tolerance compare cannot
+  separate from a bug.
+- **For a short forecast the time is in the I/O, not the GPU.** Overlap what is independent (input vs model load, writing
+  vs rollout) and measure the queue wait separately from the copy into the queue; otherwise a blocked producer and an
+  expensive hand-over look the same. Parallel encoding must keep the output order so that bytes do not change.

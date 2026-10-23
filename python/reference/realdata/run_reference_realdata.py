@@ -494,6 +494,10 @@ def main() -> None:
     ap.add_argument("--cache", default=None, help="frozen cache root (default $VARDA_SCRATCH/realdata/<date>)")
     ap.add_argument("--online", action="store_true", help="network on, fresh caches; only the ECMWF run is pinned")
     ap.add_argument("--stub-model", action="store_true", help="zeros instead of the network (I/O cross-checks)")
+    ap.add_argument("--no-dumps", action="store_true",
+                    help="no hooks, no dumps: the plain runner on the frozen inputs (timing baseline)")
+    ap.add_argument("--ecmwf-cache", default=None,
+                    help="earthkit/MIR cache directory to use (and keep) instead of <out>/cache/ecmwf, e.g. a warm one")
     args = ap.parse_args()
 
     date = dt.datetime.fromisoformat(args.date)
@@ -519,6 +523,8 @@ def main() -> None:
         kenda_cache, ecmwf_cache = out / "cache" / "kenda", out / "cache" / "ecmwf"
     else:
         kenda_cache, ecmwf_cache = root / "cache" / "kenda", out / "cache" / "ecmwf"  # ecmwf: earthkit + MIR caches
+    if args.ecmwf_cache:
+        ecmwf_cache = Path(args.ecmwf_cache).resolve()
     for section in ("constant_forcings", "input"):
         for src in cfg[section]["cutout"]:
             (name, sub), = src.items()
@@ -537,14 +543,15 @@ def main() -> None:
     from anemoi.inference.runners import create_runner
 
     rec = Recorder(out)
-    install_mir_hook(rec)
+    if not args.no_dumps:
+        install_mir_hook(rec)
     if not args.online:
         block_network()
 
     t0 = time.perf_counter()
     config = RunConfiguration.load(cfg, [overrides])
     runner = create_runner(config)
-    info = install_runner_hooks(runner, rec, args.stub_model)
+    info = {"predict": None} if args.no_dumps else install_runner_hooks(runner, rec, args.stub_model)
     t1 = time.perf_counter()
     runner.execute()
     t2 = time.perf_counter()
@@ -556,6 +563,8 @@ def main() -> None:
         "argv": sys.argv,
         "online": args.online,
         "stub_model": args.stub_model,
+        "no_dumps": args.no_dumps,
+        "ecmwf_cache": str(ecmwf_cache),
         "precision_arg": args.precision,
         "runner_precision": runner.precision,
         "checkpoint_precision": runner.checkpoint.precision,
