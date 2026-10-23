@@ -1,0 +1,73 @@
+name: CPU portability
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-24.04
+            arch: x86_64
+          - name: macOS arm64
+            os: macos-15
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      OMP_NUM_THREADS: '2'
+      OPENBLAS_NUM_THREADS: '1'
+      VECLIB_MAXIMUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install build dependencies
+        run: |
+          test "$(uname -m)" = '${{ matrix.arch }}'
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            brew install cmake libomp openblas
+          else
+            sudo apt-get update
+            sudo apt-get install -y cmake make g++ libopenblas-dev
+          fi
+          python -m venv .venv
+          .venv/bin/python -m pip install -r python/tests/requirements-cpu.txt
+      - name: Build CPU and GRIB executables
+        run: |
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            omp_prefix="$(brew --prefix libomp)"
+            blas_prefix="$(brew --prefix openblas)"
+            CMAKE_PREFIX_PATH="$omp_prefix:$blas_prefix"
+            export CMAKE_PREFIX_PATH
+          fi
+          ECCODES_HOME="$(.venv/bin/python -I -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+          export ECCODES_HOME
+          cmake -S . -B build-ci -DVARDA_CUDA=OFF -DVARDA_GRIB=ON
+          cmake --build build-ci -j 2
+          test -x build-ci/varda-forecast
+      - name: Unit tests
+        run: ctest --test-dir build-ci --output-on-failure
+      - name: Synthetic numerical parity
+        run: |
+          BIN="$PWD/build-ci" SYN_DIR="$RUNNER_TEMP/varda-synthetic" \
+            bash tests/run_synthetic.sh cpu
+      - name: Repeated inference smoke test
+        run: |
+          build-ci/varda-run --model "$RUNNER_TEMP/varda-synthetic/e.model.safetensors" \
+            --input "$RUNNER_TEMP/varda-synthetic/e.golden.safetensors" \
+            --device cpu --precision fp32 --threads 2 --steps 3

@@ -118,6 +118,10 @@ build/varda-rollout ...                                                  # docs/
 `build/varda-forecast` runs a forecast from real data (KENDA-CH1 and IFS open data in, GRIB out, as
 anemoi-inference does); it needs ecCodes (`-DVARDA_GRIB=ON`, `tools/env.sh`): `docs/forecast.md`.
 
+Apple Silicon: the CPU fp32 backend builds natively on macOS arm64 with OpenMP and OpenBLAS.
+Build, GRIB dependencies and verification: [docs/apple-silicon.md](docs/apple-silicon.md).
+There is no Apple GPU backend; CUDA requires an NVIDIA GPU.
+
 ## Licence and disclaimer
 
 - The code is licensed under the BSD 3-Clause License (`LICENSE`), for every version of this repository.
