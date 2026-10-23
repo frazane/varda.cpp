@@ -44,14 +44,20 @@ the Metal GPU before downloading inputs; it does not invoke Slurm.
   are GPU kernels. Fraction bounding stages the products before assignment,
   including when the total field is itself an output being bounded.
 - Metal compilation uses safe math and precise functions, with contraction off
-  in the shaders. Metal has no fp64: LayerNorm uses compensated fp32 moments.
+  in the shaders. Metal has no fp64: LayerNorm uses one SIMD group per row,
+  queries the SIMD width at runtime and computes compensated fp32 moments after
+  subtracting a common row origin. Applying normalization to centered values
+  avoids cancellation for nearly constant rows with large offsets.
   The erf form of GELU evaluates erf with A&S 7.1.26; the configured tanh form is
   also supported. This is a separate numerical implementation, validated by the
   existing fp32 tolerances, rather than a bitwise match to CPU or CUDA.
 - Shared buffers hold the weights and reusable activations. Input/output copies
   and hook reads happen only after the relevant GPU work is complete. Hooks
   synchronize/read the same production calculations; they do not substitute CPU
-  calculations. GPU command-buffer errors propagate to the caller.
+  calculations. GPU command-buffer errors propagate to the caller. Submission
+  batches are capped at 64 encoded operations (compute dispatches or MPS calls),
+  retaining a final completion wait before reading output. This bounds queued
+  operation count and resource retention, not elapsed GPU time.
 
 `VARDA_METAL_CHUNK_ROWS` controls complete destination-row chunks (default 8192).
 It bounds dense/attention workspace; it does not split a destination's softmax.
@@ -70,7 +76,8 @@ BIN="$PWD/build-metal" SYN_DIR="$PWD/local/synthetic" \
 
 On Apple M1, fp32: all 12 synthetic parity runs (six configurations, default
 chunking and 37-row chunks) pass unchanged `synthetic-fp32` tolerances. Worst
-activation `rel_absmax` is 2.10e-6, or 0.210 of its 1e-5 tolerance. Input
+activation is `proc.1.out` in model d: `rel_absmax` 2.72e-6 and `max_abs`
+4.18e-5, or 0.272 of its 1e-5 relative tolerance (8 host threads). Input
 normalisation and assembly are bitwise equal to the reference; hook-free and
 hooked outputs are bitwise equal. A small-chunk run also passes with the Metal
 API validation layer enabled.
@@ -79,6 +86,25 @@ The integration suite checks repeated inference, a four-step host rollout with
 computed forcings/feedback against CPU at the existing synthetic fp32 tolerance,
 completely empty graphs, FP16 rejection and invalid chunk sizes. These are
 synthetic correctness checks, not meteorological forecast qualification.
+It also generates three independent golden models with 7/35/96 channels,
+including one hidden node, incomplete SIMD groups, 1/7/37-row chunks, and 8,201
+data nodes crossing the default chunk boundary: ten further parity checks,
+including hook inertness. CI runs GPU parity and integration with Metal API and
+shader validation enabled.
+
+The macOS-only `test_metal_kernels` CTest target directly checks the production
+LayerNorm shader against double-precision mathematical references: 384 cases
+with widths 1 through 4097, random/constant/nearly constant/cancellation-prone
+inputs, optional bias and output guards. All pass at 1e-5; measured worst
+`rel_absmax` 3.39e-7 and `max_abs` 1.62e-6. The old serial shader fails 90 of
+these cases (worst relative error 1.07e-2). This test enables Metal API/shader
+validation and returns skip code 77 when no GPU is available.
+
+An Apple M1 fp32 microbenchmark of models e and d (two alternating baseline/new
+rounds of 30 predictions, discard the first three calls, eight host threads)
+measured mean warm forward times of 40.8 -> 25.9 ms and 53.2 -> 31.1 ms after
+parallel LayerNorm and bounded batching. Repeats are bitwise stable; Metal has
+no CUDA graph path. These synthetic timings do not establish full-model speed.
 
 `varda-metal-info` exits 77 if no unified-memory Metal device is present. An
 explicit synthetic `metal` run also exits 77 rather than reporting a GPU pass

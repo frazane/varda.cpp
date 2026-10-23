@@ -48,6 +48,32 @@ class MetalTests(unittest.TestCase):
                               "--device", "metal", "--precision", "fp32", "--steps", 3)
         self.assertIn("repeats bitwise equal", result.stdout)
 
+    def test_irregular_shapes_and_chunk_boundaries(self):
+        # Fresh independent golden data exercises incomplete SIMD groups and
+        # workspace reuse across both small chunks and the default 8192 limit.
+        configs = (("odd", 35, 5, 257, 33), ("tiny", 7, 1, 9, 1),
+                   ("cross", 96, 3, 8201, 257))
+        for name, channels, heads, nodes, hidden in configs:
+            cfg = dict(synthetic.CONFIGS["f"], C=channels, heads=heads,
+                       mlp=83 if channels < 40 else 192, G=nodes, H=hidden,
+                       seed=71 + channels, n_proc=3)
+            synthetic.CONFIGS[name] = cfg
+            try:
+                synthetic.generate(name, str(self.root))
+                tolerance = self.root / f"{name}.tolerances.json"
+                tolerance.write_text(json.dumps(synthetic.tolerance_file(name)))
+            finally:
+                del synthetic.CONFIGS[name]
+            for chunk in ((37, 8192) if name == "cross" else (1, 7, 37, 8192)):
+                with self.subTest(model=name, chunk=chunk):
+                    report = self.root / f"{name}.{chunk}.report.json"
+                    self.run_app("varda-parity", "--model", self.root / f"{name}.model.safetensors",
+                                 "--check", f"{self.root}/{name}.golden.safetensors=synthetic-fp32",
+                                 "--tolerances", tolerance, "--report", report,
+                                 "--device", "metal", "--precision", "fp32", "--threads", 2,
+                                 env=dict(os.environ, VARDA_METAL_CHUNK_ROWS=str(chunk)))
+                    self.assertTrue(json.loads(report.read_text())["hook_inert"])
+
     def test_fp16_rejected(self):
         result = self.run_app("varda-run", "--model", self.model, "--input", self.inputs,
                               "--device", "metal", "--precision", "fp16", ok=False)

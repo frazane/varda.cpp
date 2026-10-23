@@ -83,7 +83,9 @@ jobs:
             exit 0
           fi
           if [[ "$probe" != 0 ]]; then exit "$probe"; fi
-          BIN="$PWD/build-ci" SYN_DIR="$RUNNER_TEMP/varda-synthetic" \
+          MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 \
+            BIN="$PWD/build-ci" SYN_DIR="$RUNNER_TEMP/varda-synthetic" \
             bash tests/run_synthetic.sh metal
-          .venv/bin/python -I python/tests/test_metal.py --bin build-ci \
+          MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 \
+            .venv/bin/python -I python/tests/test_metal.py --bin build-ci \
             --synthetic "$RUNNER_TEMP/varda-synthetic" --work "$RUNNER_TEMP/varda-metal"

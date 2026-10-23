@@ -87,6 +87,7 @@ private:
     Graph load_graph(SafeTensorsFile& f, const std::string& name, int64_t src, int64_t dst);
     id<MTLCommandBuffer> command();
     void flush();
+    void finish_op();
     void dispatch(const char* name, const Args& args, std::initializer_list<Tensor> buffers);
     void linear(const Linear& l, const Tensor& x, int64_t rows, const Tensor& out);
     void norm(const Norm& l, const Tensor& x, int64_t rows, const Tensor& out);
@@ -104,6 +105,7 @@ private:
     id<MTLDevice> device_;
     id<MTLCommandQueue> queue_;
     id<MTLCommandBuffer> command_;
+    size_t encoded_ops_ = 0;
     std::map<std::string, id<MTLComputePipelineState>> kernels_;
     std::map<std::tuple<int64_t, int64_t, int64_t>, MPSMatrixMultiplication*> gemms_;
     std::map<std::string, Tensor> arena_;
@@ -295,6 +297,7 @@ id<MTLCommandBuffer> MetalBackend::command() {
     return command_;
 }
 void MetalBackend::flush() {
+    encoded_ops_ = 0;
     if (!command_) return;
     id<MTLCommandBuffer> pending = command_;
     command_ = nil;
@@ -302,6 +305,11 @@ void MetalBackend::flush() {
     [pending waitUntilCompleted];
     if (pending.status == MTLCommandBufferStatusError)
         throw std::runtime_error("Metal execution: " + std::string(pending.error.localizedDescription.UTF8String));
+}
+void MetalBackend::finish_op() {
+    // Bound queued API operations and retained MPS resources without stalling at
+    // every model phase. This is an operation-count bound, not a GPU time limit.
+    if (++encoded_ops_ >= 64) flush();
 }
 void MetalBackend::dispatch(const char* name, const Args& args, std::initializer_list<Tensor> buffers) {
     if (!args.n) return;
@@ -314,9 +322,12 @@ void MetalBackend::dispatch(const char* name, const Args& args, std::initializer
         [encoder setBuffer:t.buffer offset:t.offset atIndex:index++];
     }
     [encoder setBytes:&args length:sizeof(args) atIndex:8];
-    const NSUInteger width = std::min<NSUInteger>(256, pipeline.maxTotalThreadsPerThreadgroup);
-    [encoder dispatchThreads:MTLSizeMake(args.n, 1, 1) threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+    const NSUInteger simd = pipeline.threadExecutionWidth;
+    const NSUInteger width = std::min<NSUInteger>(256, pipeline.maxTotalThreadsPerThreadgroup) / simd * simd;
+    const NSUInteger threads = std::strcmp(name, "layernorm") == 0 ? u(int64_t(args.n) * simd) : args.n;
+    [encoder dispatchThreads:MTLSizeMake(threads, 1, 1) threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
     [encoder endEncoding];
+    finish_op();
 }
 
 void MetalBackend::linear(const Linear& l, const Tensor& x, int64_t rows, const Tensor& out) {
@@ -332,6 +343,7 @@ void MetalBackend::linear(const Linear& l, const Tensor& x, int64_t rows, const 
     if (!gemm) throw std::runtime_error("cannot create an MPS matrix multiplication");
     [gemm encodeToCommandBuffer:command() leftMatrix:matrix(x, rows, l.in)
                    rightMatrix:matrix(l.w, l.out, l.in) resultMatrix:matrix(out, rows, l.out)];
+    finish_op();
     if (l.b.buffer) dispatch("bias_add", {u(rows * l.out), u(l.out)}, {out, l.b});
 }
 void MetalBackend::norm(const Norm& l, const Tensor& x, int64_t rows, const Tensor& out) {
@@ -400,7 +412,7 @@ void MetalBackend::run(const float* x, float* y, const ActivationHook* hook) {
         linear(enc_src_, features.sub(row * F_), n, embed);
         if (hook) { flush(); std::memcpy(enc_full.data() + row * C_, embed.data(), n * C_ * sizeof(float)); }
         source(enc_, embed, n, row);
-        flush();  // bound command-buffer duration and temporary MPS resource lifetimes
+        if (hook) flush();
     }
     if (hook) (*hook)("enc.emb_src", enc_full.data(), {G_, C_});
     Tensor dst = arena_.at("encoder.dest");
@@ -420,7 +432,6 @@ void MetalBackend::run(const float* x, float* y, const ActivationHook* hook) {
             destination(processors_[i], proc_graph_, row, n, state.sub(row * C_), next.sub(row * C_));
         }
         report(hook, "proc." + std::to_string(i) + ".out", next, {H_, C_});
-        flush();
         state = next;
     }
     Tensor latent = arena_.at("latent");
@@ -435,7 +446,7 @@ void MetalBackend::run(const float* x, float* y, const ActivationHook* hook) {
         destination(dec_, dec_graph_, row, n, embed, block);
         norm(out_norm_, block, n, ln_);
         linear(out_proj_, ln_, n, decoded.sub(row * Vo));
-        flush();
+        if (hook) flush();
         if (hook) {
             std::memcpy(dec_embed.data() + row * C_, embed.data(), n * C_ * sizeof(float));
             std::memcpy(dec_block.data() + row * C_, block.data(), n * C_ * sizeof(float));
@@ -471,7 +482,7 @@ void MetalBackend::run(const float* x, float* y, const ActivationHook* hook) {
 void MetalBackend::predict_step(const float* x, float* y, const ActivationHook* hook) {
     @autoreleasepool {
         try { run(x, y, hook); }
-        catch (...) { command_ = nil; throw; }
+        catch (...) { command_ = nil; encoded_ops_ = 0; throw; }
     }
 }
 }  // namespace

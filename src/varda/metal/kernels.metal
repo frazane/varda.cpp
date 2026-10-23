@@ -39,28 +39,32 @@ kernel void copy_array(device const float* in [[buffer(0)]], device float* out [
     if (i < p.n) out[i] = in[i];
 }
 
-// Compensated fp32 moments: Metal has no fp64. Keep the statistics stable without
-// changing the model's epsilon or relying on fast-math reassociation.
+// One SIMD group per row, including widths that are not multiples of its size.
+// Metal has no fp64: center on a common origin before compensated fp32 moments,
+// then normalize centered values directly to avoid cancellation in x*rstd+shift.
 kernel void layernorm(device const float* in [[buffer(0)]], device const float* w [[buffer(1)]],
                       device const float* b [[buffer(2)]], device float* out [[buffer(3)]],
-                      constant Args& p [[buffer(8)]], uint row [[thread_position_in_grid]]) {
+                      constant Args& p [[buffer(8)]], uint tid [[thread_position_in_grid]],
+                      uint lane [[thread_index_in_simdgroup]], uint simd_width [[threads_per_simdgroup]]) {
+    uint row = tid / simd_width;
     if (row >= p.n) return;
     uint base = row * p.a;
+    const float origin = in[base];
     float sum = 0, correction = 0;
-    for (uint c = 0; c < p.a; ++c) {
-        float v = in[base + c] - correction, next = sum + v;
+    for (uint c = lane; c < p.a; c += simd_width) {
+        float v = (in[base + c] - origin) - correction, next = sum + v;
         correction = (next - sum) - v; sum = next;
     }
-    float mean = sum / float(p.a);
+    float mean = simd_sum(sum) / float(p.a);
     sum = 0; correction = 0;
-    for (uint c = 0; c < p.a; ++c) {
-        float d = in[base + c] - mean;
+    for (uint c = lane; c < p.a; c += simd_width) {
+        float d = (in[base + c] - origin) - mean;
         float v = d * d - correction, next = sum + v;
         correction = (next - sum) - v; sum = next;
     }
-    float rstd = 1.0f / sqrt(sum / float(p.a) + p.x), shift = -rstd * mean;
-    for (uint c = 0; c < p.a; ++c) {
-        float v = in[base + c] * rstd + shift;
+    float rstd = 1.0f / sqrt(simd_sum(sum) / float(p.a) + p.x);
+    for (uint c = lane; c < p.a; c += simd_width) {
+        float v = ((in[base + c] - origin) - mean) * rstd;
         v = v * w[c];
         out[base + c] = p.b ? v + b[c] : v;
     }
