@@ -135,6 +135,9 @@ Post-processing logs: `jobs/realdata-post/`.
 | `ref-fp32` | `32` | float32 (autocast to fp32 = plain fp32) | 20.7, 9.69, 8.41, 8.41 | 363 |
 | `stub-offline`, `stub-online` | stub (zeros) | – | – | 215, 355 |
 
+The stub runs (`stub-offline`, `stub-online`, 34 GB) were deleted on 2026-10-23 once the replay check was recorded; its
+result is `compare-stub-offline-vs-online.json` (kept), and the commands above regenerate the runs.
+
 Settings shared by every run:
 - The default `Runner` (forecaster), not the parallel runner.
 - `ANEMOI_INFERENCE_NUM_CHUNKS_MAPPER=16`; `_NUM_CHUNKS_PROCESSOR` unset.

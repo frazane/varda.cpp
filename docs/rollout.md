@@ -105,6 +105,9 @@ and these are the runner's own.
 | `ensemble/ulp-seed2` | 24 | same, seed 2 | 47.1 s | 283404 |
 | `ensemble/pyg-backend` | 24 | fp16, **pyg** backend on the GPU (scatter atomics) | 76.0 s; CUDA 41.6 GB | 283405 |
 
+The `ensemble/` rollouts (357 GB) were deleted on 2026-10-23 after calibration; the tolerances derived from them are
+committed (`tolerances/rollout/varda.json`, method below), and the commands above regenerate them.
+
 GPU jobs: `-p gpu-short --gres=gpu:1 -c 16 --mem=200G` (peak RSS 98 GB with `--runs 2`, 64 GB with one run: the hooks
 keep the 24 windows, 25.6 GB, and the outputs, 10.9 GB, on the host). Smoke tests first: 2 steps CPU (job 283286, 252 s/step)
 and 2 steps fp16 GPU with `--runs 2` (283287). Logs, `exit_code` files and the job scripts are in

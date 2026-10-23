@@ -140,8 +140,8 @@ Converted file (format.md §1, extension): `grid.latitudes`, `grid.longitudes`, 
 zip members (bitwise, tested). `python/convert.py` asserts they agree with `nodes.data.attr` =
 [sin lat, sin lon, cos lat, cos lon] (float32 of the radians; measured max abs difference 2.4e-7 (varda),
 2.5e-7 (dev); threshold 1e-6). All other tensors and the config are unchanged. Until the engine
-consumes these two tensors the files are in `$VARDA_SCRATCH/converted-new/<model>/model.safetensors`
-(strict loaders reject unconsumed tensors); `converted/` is untouched.
+consumed these two tensors the files were kept apart in `converted-new/`; the files under `converted/` now carry
+them (`converted-new/` was a byte-identical copy and was deleted on 2026-10-23).
 
 ## 6. C++ API (`src/varda/forcings.h`)
 
@@ -167,7 +167,7 @@ T23, 2025-01-01T00, 2024-01-01T00, 2023-12-31T23, 2023-03-01T00, 2024-07-01T09, 
 2100-03-01T06, eight 6-hourly steps after 2024-06-01T00, and 2024-06-01T01/02/03). It also re-checks insolation against
 `earthkit.meteo.solar.cos_solar_zenith_angle` (equal in every case).
 
-Test: `tests/test_forcings.cpp` (ctest `test_forcings`; needs `$VARDA_SCRATCH` fixtures and `converted-new/`, skips the
+Test: `tests/test_forcings.cpp` (ctest `test_forcings`; needs `$VARDA_SCRATCH` fixtures and `converted/`, skips the
 data part with a message otherwise). Per forcing and date it prints max abs difference, count of elements not bitwise
 equal and max ulp. Results (OpenMP 16 threads, glibc libm, gcc 12.3):
 
@@ -191,4 +191,4 @@ Converter verification (`python/tests/test_convert.py`, run with `VARDA_CONVERTE
 10 tests ok, including: names = contract names + `grid.latitudes`/`grid.longitudes`; those two are F64 `[n_data_nodes]`;
 agreement with `nodes.data.attr` < 1e-6; `grid.*` bitwise equal to the zip members read independently; every other
 tensor bitwise equal to the Python engine's `weights.pt` and the config equal to its `config.json`. Additionally all
-384 old tensors and the metadata of `converted/<model>` are byte-identical to `converted-new/<model>`.
+384 old tensors and the metadata of `converted/<model>` were byte-identical to `converted-new/<model>` (that copy since deleted).

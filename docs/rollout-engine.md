@@ -56,7 +56,7 @@ column; constant: kept). Every input must be exactly one of the three, as anemoi
 requires (Varda: 79 = 66 + 5 + 8; dev: 84 = 71 + 5 + 8); anything else, or a config without the
 `forcings` section, is rejected with an error naming the channel or the section. Coordinates for the
 computed forcings are the file's `grid.latitudes` / `grid.longitudes` (F64, `Model::latitudes()`), so the
-rollout needs a file from `converted-new/` (or a later `converted/`); `check_rollout_model` says so.
+rollout needs a file that carries them (every file now under `converted/`); `check_rollout_model` says so.
 
 ## 2. API
 

@@ -57,7 +57,7 @@ rebuild functions are rejected). File-based tests are skipped when the env vars 
 ## Verification (2026-10-22, jobs 283263 dev, 283264 varda, tests 283269; logs in
 `$VARDA_SCRATCH/jobs/convert/`)
 
-Outputs in `$VARDA_SCRATCH/converted-new/<model>/model.safetensors`.
+Outputs in `$VARDA_SCRATCH/converted/<model>/model.safetensors` (Varda with cutout masks: `converted/varda-v2/`; `converted-new/` was a byte-identical copy of `converted/` and was deleted on 2026-10-23).
 
 | | Varda (varda, HF ckpt) | dev |
 |---|---|---|

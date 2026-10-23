@@ -3,7 +3,7 @@
 //  2. bitwise comparison, per model / date / forcing, with anemoi's own ComputedForcings output
 //     ($VARDA_SCRATCH/forcings/<model>.safetensors, written by python/reference/make_forcings_fixture.py)
 //     computed from the grid.latitudes / grid.longitudes of the converted file
-//     ($VARDA_SCRATCH/converted-new/<model>/model.safetensors, else converted/);
+//     ($VARDA_SCRATCH/converted/<model>/model.safetensors);
 //  3. thread-count invariance.
 // Reports max abs difference, number of elements that are not bitwise equal, and the max ulp distance.
 // Environment: VARDA_SCRATCH (default $VARDA_SCRATCH), VARDA_FORCINGS_DIR (fixtures),
@@ -96,8 +96,7 @@ struct Totals {
 
 void test_model(const std::string& model, const std::string& scratch, const std::string& fixdir, bool dump) {
     std::string fix = fixdir + "/" + model + ".safetensors";
-    std::string conv = scratch + "/converted-new/" + model + "/model.safetensors";
-    if (!file_exists(conv)) conv = scratch + "/converted/" + model + "/model.safetensors";
+    const std::string conv = scratch + "/converted/" + model + "/model.safetensors";
     if (!file_exists(fix) || !file_exists(conv)) {
         std::printf("[%s] SKIPPED: need %s and %s\n", model.c_str(), fix.c_str(), conv.c_str());
         return;

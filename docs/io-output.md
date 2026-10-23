@@ -121,6 +121,9 @@ output is compared with `varda-grib-compare OUT/outputs REF/outputs --require-by
 | 285350 (cpu-short) | the same for `ref-fp32` | 10 files, 676 messages, **bytes equal 676 / 676**, values bitwise 676 / 676, 0 key mismatches; C3 bitwise |
 | 285350 | negative control: encoder output of the fp16 dumps vs the `ref-fp32` outputs | exit 1 as it must: step 0 files identical (140 messages), the 536 step messages differ (6395 key mismatches, mostly the value statistics `average`/`kurtosis`), worst `max_abs` 14.06, `rel_absmax` 1.09e-2 |
 
+The encoder outputs `realdata/20261022T15/cpp-encoder-ref-{fp16,fp32}/` were deleted on 2026-10-23; `varda-grib-write`
+regenerates them in about a minute (command above).
+
 So the expectation of spec §5.2 holds: given the reference's own states, the C++ writer's files are
 byte-identical to anemoi-inference's, including key order, the NaN bitmap of the global files, tp
 accumulation/rescaling and the unpadded file names (`outputs/202610221500_6.grib`,

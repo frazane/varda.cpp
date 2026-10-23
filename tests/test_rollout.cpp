@@ -11,7 +11,7 @@
 //  3. invalid index sets (channel uncovered, listed twice, out of range) and a config without a
 //     `forcings` section are rejected with an error;
 //  4. valid dates: date0 + (s + 1) * timestep (1 h and 6 h, across a day, a month and a leap day);
-//  5. if the converted models are present ($VARDA_SCRATCH/converted-new/<model>/model.safetensors):
+//  5. if the converted models are present ($VARDA_SCRATCH/converted/<model>/model.safetensors):
 //     StateUpdate::from_config on the real configs (counts, and every input covered exactly once).
 #include <algorithm>
 #include <cstdio>
@@ -225,7 +225,7 @@ void check_real_configs() {
     const char* e = std::getenv("VARDA_SCRATCH");
     const std::string root = e && *e ? e : "$VARDA_SCRATCH";
     for (const char* m : {"dev", "varda"}) {
-        const std::string p = root + "/converted-new/" + m + "/model.safetensors";
+        const std::string p = root + "/converted/" + m + "/model.safetensors";
         if (!std::ifstream(p).good()) {
             std::printf("skip %s: %s not found\n", m, p.c_str());
             continue;
