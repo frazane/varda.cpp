@@ -272,7 +272,7 @@ bounding, denormalise). Baselines: coordinator's job 283323 (A100-SXM4-80GB, war
 
 | model | precision | load s | first call s (eager, host API) | host `predict_step` ms (incl. H2D/D2H, graph on) | peak device memory GB (incl. 0.45 context, 3.49 / 0.09 bench buffers) |
 |---|---|---|---|---|---|
-| Varda | fp16 | 1.2 (12.7 cold file cache) | 0.89 | 891 | 24.74 |
+| Varda | fp16 | 1.2 (12.7 cold file cache; 1.9-2.7 cold since the parallel prefetch, `Model::load`, job 286500) | 0.89 | 891 | 24.74 |
 | Varda | fp32 | 1.1 | 7.59 | 7624 | 42.24 |
 | dev | fp16 | 0.7 | 0.08 | 36.5 | 2.43 |
 | dev | fp32 | 0.9 | 0.34 | 334.4 | 4.16 |

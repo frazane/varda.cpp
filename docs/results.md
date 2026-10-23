@@ -136,7 +136,7 @@ anemoi-inference is the next section.
 
 ### Speed vs anemoi-inference, same job
 
-Job 285717 (`$VARDA_SCRATCH/jobs/bench-forecast/`), node <node>, A100-SXM4-80GB, driver 595.91.07, 32 CPUs, the same
+Job 285717 (`$VARDA_SCRATCH/jobs/bench-forecast/`), the binary of commit a9dcc66, i.e. before the start-up speed-ups of the last subsection below; node <node>, A100-SXM4-80GB, driver 595.91.07, 32 CPUs, the same
 frozen 2026-10-22T15 inputs, 1-day (4-step) forecast, all 10 GRIB files written including step 0.
 - anemoi-inference: `python/reference/realdata/run_reference_realdata.py --no-dumps` (plain runner, HF config, offline
   replay, `python -O`, mapper chunks 16, triton attention, fp16 autocast = the checkpoint's precision), with a shared
@@ -158,3 +158,38 @@ frozen 2026-10-22T15 inputs, 1-day (4-step) forecast, all 10 GRIB files written 
   is outside the model: its four `predict_step` calls took 10.9 s in fp16 (5.77 + 3 x ~1.71 s, measured with CUDA
   synchronisation in the dumped run, job 285290) of a 133 s `execute`; the rest is input pre-processing, regridding and
   output encoding. So the ratio is mostly an I/O-pipeline ratio; like-for-like GPU forward times are in section 3.
+
+### Start-up: cold file caches (job 286500)
+
+Commits 5538fa1 (parallel mmap prefetch of the weights, `src/varda/format.cpp`) and eb7f17b (concurrent
+KENDA and IFS branches, GRIB read-ahead, parallel merge/x0; `docs/io-input.md` section 7). A user's `./varda forecast`
+is almost always cold (fresh allocation, other node), so cold is the headline; the warm numbers above are the old
+binary's.
+
+Job 286500 (`$VARDA_SCRATCH/jobs/combined-cold/`, `run.sh`, `logs/`), <node>, A100-SXM4-80GB, 32 CPUs, fp16, device
+rollout, CUDA graph on, 4 steps (24 h), real input 2026-10-23T09 (2.4 GB, cached). old = a9dcc66, new = eb7f17b,
+alternated in the same job. wall = process wall clock of `varda-forecast`; load, input, ready and rollout are
+`forecast.json` `seconds`. Cold = in the job, `posix_fadvise(DONTNEED)` on every input and asset file plus
+`lfs ladvise -a dontneed` (server cache), `fincore` showing 0 resident bytes before each run, on a private copy of the
+assets (fadvise cannot drop pages another process maps).
+
+| run | wall | load | input | ready | rollout |
+|---|---|---|---|---|---|
+| old cold 1 / 2 / 3 | 26.31 / 21.36 / 20.82 | 16.57 / 15.69 / 15.11 | 14.55 / 14.41 / 13.94 | 18.06 / 16.92 / 16.35 | 3.19 / 3.21 / 3.26 |
+| **new cold 1 / 2 / 3** | **8.68 / 8.56 / 8.30** | 2.72 / 2.60 / 1.92 | 3.79 / 3.88 / 3.69 | 4.18 / 4.01 / 3.73 | 3.16 / 3.33 / 3.37 |
+| old warm (3 runs) | 10.50-10.63 | 2.06-2.09 | 6.01-6.04 | 6.02-6.05 | 3.26-3.39 |
+| new warm (3 runs) | 7.81-7.86 | 1.46-1.55 | 3.29-3.32 | 3.29-3.33 | 3.37 |
+
+- Cold: 20.8-26.3 s -> 8.3-8.7 s, same job, same data. Warm: 10.5-10.6 s -> 7.8-7.9 s.
+- Cold weights load: 15-17 s -> 1.9-2.7 s. Cause: a cold mapping on Lustre was faulted in as one serial stream at
+  ~100 MB/s (13 s for the 1.3 GB file); `SafeTensorsFile::prefetch()` now populates it with 32 threads.
+- Input stages, new cold run 3 (`new-cold-3.json`): `kenda`/`ifs` 3.19 / 2.96 s overlapped (`kenda_ifs` 3.19), read waits
+  0.84 / 0.28 s, `model_grid` 0.18, `merge` 0.16, `x0` 0.11 s, `total` 3.51 s; old cold run 3: kenda 5.53, ifs 5.61,
+  merge 0.33, x0 1.00, total 12.58 s.
+- The rollout (3.2-3.4 s for 4 steps) is unchanged and is now the largest single part of the wall clock.
+- Verification: `varda-prepare --compare` on the frozen date 2026-10-22T15, every stage bitwise against the
+  anemoi-inference ref-fp16 and ref-fp32 dumps (job 286496); `x0` hash b840f06bc289bc1f and step-0 state
+  099fe37f726f2874, as before, at 1, 16 and 64 threads. GRIB for 20261023T09: all 10 files byte-identical to the
+  previous binary in every run. ctest 11/11 (job 286500).
+- No anemoi-inference run in this job, so no new ratio against it is claimed; the ratios above are for the old binary.
+- Three cold runs per binary, one node.

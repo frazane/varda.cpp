@@ -77,7 +77,8 @@ OUT/forecast.json                                     provenance and timings
 The 4-step forecast is 10 files, 676 messages, 1 276 890 049 bytes. `forecast.json` holds: model, assets, io config, regrid matrix, templates, definitions, realdata dir, checkpoint uuid, date,
 device, precision, graph, engine (`device`/`host`), threads, steps, the files written, the input log (every file and
 message used), the write queue length, `step_ms` (per step on the GPU) and `seconds`: `load`, `input` (and
-`input_stages`: `kenda`, `ifs`, `merge`, `x0`), `rollout_setup`, `ready`, `initial_state_write`, `rollout`,
+`input_stages`: `model_grid`, `kenda`, `ifs`, `kenda_read_wait`, `ifs_read_wait`, `kenda_ifs`, `merge`, `x0`; `kenda` and `ifs` run
+concurrently, so they overlap and do not sum to `total`; `docs/io-input.md` section 7), `rollout_setup`, `ready`, `initial_state_write`, `rollout`,
 `rollout_blocked_on_writer`, `rollout_callback_copy`, `write_after_rollout`, `step_write` (per step), `grib`
 (`post`, `encode`, `write`, `messages`, `bytes`) and `total`.
 
@@ -85,7 +86,7 @@ message used), the write queue length, `step_ms` (per step on the GPU) and `seco
 
 ```
 main thread     : load weights -> set up rollout (eager pass + graph) ---------- | join input | rollout, callback copies y | finish
-input thread    : InputModel::load -> build_input (KENDA, IFS+regrid, merge, x0) |
+input thread    : InputModel::load -> build_input (KENDA || IFS+regrid, merge, x0) |
 writer thread   :                                                                 | initial state | step 1 | step 2 | ... | step n
 ```
 
@@ -104,6 +105,17 @@ writer thread   :                                                               
   on the writer thread in step order.
 
 ## 4. Timings
+
+Start-up (model load, input) was sped up after the tables below were measured (commits 5538fa1, eb7f17b). Current
+expectation, job 286500 (A100-SXM4-80GB, 32 CPUs, fp16, graph on, 4 steps, process wall clock, three runs each):
+**8.3-8.7 s with cold file caches**, 7.8-7.9 s warm; the binary of the tables below, same job: 20.8-26.3 s cold,
+10.5-10.6 s warm. Cold weights load 1.9-2.7 s (was 15-17 s). Table and method: `docs/results.md` section 5, last
+subsection. The tables below, the "10.4 s warm" and the 14 s cold load are historical (commit a9dcc66).
+
+Environment: `VARDA_PREFETCH_THREADS` (weights prefetch threads, default 32, 0 disables; the cold mapping on Lustre was
+faulted in as one serial stream at ~100 MB/s), `VARDA_INPUT_IO_THREADS` (input GRIB reader threads, default 16),
+`VARDA_INPUT_IFS_THREADS` (OpenMP team of the IFS branch, default a quarter of the threads clamped to 4..16),
+`VARDA_INPUT_TRACE` (per-file and per-branch timelines in the input log). None changes a result.
 
 Job 285715, `debug` partition, node <node> (A100-SXM4-80GB, 32 CPUs), `varda-forecast --realdata ... --precision fp16`
 (device rollout, CUDA graph on, 4 steps, write queue 4, 32 OpenMP threads), the same command run three times in one job
@@ -135,9 +147,9 @@ Reading it:
 - Before the writer thread and the transpose (job 285381, same node and data, 16 threads): fp16 forecast 14.3 s; the
   per-step write went from 0.86 s to 0.63-0.69 s (jobs 285651 and 285692, `docs/results.md` section 5). The files are
   byte-identical to the earlier version's.
-- Cold start: 20.1 s, 14.0 s of it loading the weights from the file system.
+- Cold start (old binary): 20.1 s, 14.0 s of it loading the weights from the file system. Fixed by the prefetch (cold load 1.9-2.7 s, job 286500).
 
-Same job, same inputs and node (job 285717), whole-process wall clock, fp16: anemoi-inference 191 s warm (277 s first
+Same job, same inputs and node (job 285717, old binary a9dcc66), whole-process wall clock, fp16: anemoi-inference 191 s warm (277 s first
 run), varda.cpp 10.4 s warm (23.4 s first run), 18x warm; fp32 163 s against 41 s (4.0x). Details and configuration:
 `docs/results.md` section 5.
 

@@ -247,3 +247,24 @@ run's whole `execute` takes 244 s (`ref-fp16` manifest).
   run at start time (18z+0h here, `pins.json`).
 - **NaN.** The 2026-10-22 inputs give a NaN-free `x0`. A NaN stops the run, with the variable and
   point count, unless `--allow-nans` (the reference's `allow_nans: true`) is given.
+
+## 7. Concurrency (eb7f17b)
+
+The cold input went from 13.9-14.6 s to 3.7-3.9 s (job 286500, `docs/results.md` section 5, last subsection). What runs in parallel:
+- The KENDA and IFS branches run concurrently; their log lines are joined in the original order. The IFS branch has its own
+  OpenMP team (`VARDA_INPUT_IFS_THREADS`, default a quarter of the threads, clamped to 4..16).
+- `GribPrefetch` reads the input GRIB files ahead: `VARDA_INPUT_IO_THREADS` (default 16) reader threads do parallel chunked
+  `pread`s, one parser thread builds the ecCodes handles (ecCodes serialises handle creation). Plain GRIB2 files are
+  wrapped in place, without a copy.
+- ecCodes concepts are preloaded from the N320 template; KENDA fields decode into uninitialised buffers.
+- The x0 buffer and the computed forcings are made on their own thread; merge, x0 and the NaN count are parallel.
+- The model grid tensors and the regrid matrix are read with parallel `pread`s before mapping (`model_grid`).
+
+Why results stay bitwise: only copies and integer counts are parallelised, and every per-field computation keeps its
+order. `varda-prepare --compare` on 2026-10-22T15: every stage bitwise against the ref-fp16 and ref-fp32 dumps (job 286496);
+`x0` hash b840f06bc289bc1f and step-0 state 099fe37f726f2874, the same as before at 1, 16 and 64 threads.
+
+`VARDA_INPUT_TRACE` adds per-file and per-branch timelines to the input log. New `input_stages` keys (also in
+`forecast.json` `seconds`): `model_grid`, `kenda_read_wait`, `ifs_read_wait` (time a branch waited for its files) and
+`kenda_ifs` (wall clock of the two branches together). `kenda` and `ifs` overlap and no longer sum to `total`.
+The timing table in section 5 is from before this change.

@@ -106,8 +106,8 @@ Measured on this cluster on 2026-10-23 (section 6):
 | `make_assets.py link` (bundle creation, hard links, sha256 of every file) | 3 min 6 s |
 | fetch of one date (2.50 GB, login node) | 22 s |
 | `srun -p debug` allocation | seconds when the partition is free (it was here) |
-| forecast, 24 h fp16 on an A100 | 20-21 s on a node where the files are not cached yet (14 s of it loading the weights), about 10.5 s warm (`docs/forecast.md` section 4) |
-| `./varda forecast latest` from the login node, all of it | 50 s (fetch 22 s, forecast 21 s, the rest srun and the summary) |
+| forecast, 24 h fp16 on an A100 | now 8.3-8.7 s on a node where the files are not cached yet, 7.8 s warm (job 286500, `docs/results.md` section 5). Historical (commit a9dcc66): 20-21 s cold, 14 s of it loading the weights, about 10.5 s warm |
+| `./varda forecast latest` from the login node, all of it | 50 s (fetch 22 s, forecast 21 s, the rest srun and the summary; measured with the previous binary, the forecast part is now about 8.5 s cold) |
 
 ## 4. Another machine
 
