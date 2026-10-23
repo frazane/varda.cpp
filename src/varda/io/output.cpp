@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <mutex>
 #include <regex>
 #include <set>
 #include <stdexcept>
@@ -414,10 +415,22 @@ struct GribOutput::Impl {
         return t->second;
     }
 
-    void write_field(OutStream& s, const IoVariable& v, std::vector<float> values, int step_hours,
-                     const Top& top) {
+    // The template of a variable whose template write_state has already looked up (thread-safe).
+    const GribHandle& template_of(const OutStream& s, const IoVariable& v) const {
+        return s.templates.at(s.entry_of.at(v.name)->file);
+    }
+
+    struct Encoded {
+        GribHandle h;
+        std::string path, error;
+    };
+
+    // One message, encoded as anemoi-inference's encode_message does; no shared state is modified, so
+    // messages of a state are encoded in parallel and written afterwards in order.
+    Encoded encode_field(const OutStream& s, const IoVariable& v, std::vector<float> values, int step_hours,
+                         const Top& top) const {
         const OutputDef& d = *s.def;
-        const GribHandle& tmpl = template_for(s, v);
+        const GribHandle& tmpl = template_of(s, v);
         auto sit = top.start_steps.find(v.name);
         ScalarMap keys = build_keys(v, d.encoding, tmpl.get_long("edition"), base, step_hours,
                                     sit == top.start_steps.end() ? std::nullopt : std::optional<int>(sit->second));
@@ -430,13 +443,18 @@ struct GribOutput::Impl {
             put(meta, "bitmapPresent", Scalar::integer(1));
         }
         put_default(meta, "generatingProcessIdentifier", Scalar::integer(255));
-        GribHandle h = tmpl.clone();
+        Encoded e;
+        {
+            std::lock_guard<std::mutex> lock(clone_mutex);  // reads the shared template handle
+            e.h = tmpl.clone();
+        }
+        GribHandle& h = e.h;
         KeyVals kv;
         for (const auto& [k, x] : meta) kv.emplace_back(k, x.str());
         try {
             h.set_key_vals(kv);
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "Failed to set metadata at once: %s\n", e.what());
+        } catch (const std::exception& ex) {
+            std::fprintf(stderr, "Failed to set metadata at once: %s\n", ex.what());
             for (const auto& [k, x] : meta) {
                 if (x.kind == Scalar::Int) h.set_long(k, long(x.i));
                 else h.set_string(k, x.s);
@@ -447,15 +465,7 @@ struct GribOutput::Impl {
 
         // target file
         const std::string dt = h.get_string("dateTime");
-        const std::string rel = render_path(d.path_effective, dt, h.get_long("step"));
-        const std::string path = out_dir + "/" + rel;
-        auto w = s.writers.find(path);
-        if (w == s.writers.end()) {
-            fs::create_directories(fs::path(path).parent_path());
-            w = s.writers.emplace(path, std::make_unique<GribFileWriter>(path)).first;
-            s.created.push_back(path);
-        }
-        w->second->write(h);
+        e.path = out_dir + "/" + render_path(d.path_effective, dt, h.get_long("step"));
 
         if (d.check_encoding) {
             auto mm = mismatches(h, keys);
@@ -469,6 +479,17 @@ struct GribOutput::Impl {
                 throw std::runtime_error(msg);
             }
         }
+        return e;
+    }
+
+    void write_encoded(OutStream& s, const Encoded& e) {
+        auto w = s.writers.find(e.path);
+        if (w == s.writers.end()) {
+            fs::create_directories(fs::path(e.path).parent_path());
+            w = s.writers.emplace(e.path, std::make_unique<GribFileWriter>(e.path)).first;
+            s.created.push_back(e.path);
+        }
+        w->second->write(e.h);
     }
 
     template <class Col>
@@ -476,19 +497,34 @@ struct GribOutput::Impl {
         Top top = run_top(names, column);
         for (auto& s : streams) {
             // write_initial_state first checks that every field has a template
-            for (const auto& n : names) {
-                const IoVariable& v = cfg.variable(n);
-                if (!v.computed_forcing) template_for(s, v);
-            }
+            std::vector<size_t> fields;
             for (size_t i = 0; i < names.size(); ++i) {
                 const IoVariable& v = cfg.variable(names[i]);
                 if (v.computed_forcing) continue;
-                auto it = top.changed.find(names[i]);
-                std::vector<float> a = it != top.changed.end() ? it->second : column(i);
-                write_field(s, v, run_output_pps(*s.def, std::move(a)), step_hours, top);
+                template_for(s, v);
+                fields.push_back(i);
+            }
+            std::vector<Encoded> enc(fields.size());
+#pragma omp parallel for schedule(dynamic, 1)
+            for (size_t f = 0; f < fields.size(); ++f) {
+                const size_t i = fields[f];
+                try {
+                    const IoVariable& v = cfg.variable(names[i]);
+                    auto it = top.changed.find(names[i]);
+                    std::vector<float> a = it != top.changed.end() ? it->second : column(i);
+                    enc[f] = encode_field(s, v, run_output_pps(*s.def, std::move(a)), step_hours, top);
+                } catch (const std::exception& ex) {
+                    enc[f].error = ex.what();
+                }
+            }
+            for (const Encoded& e : enc) {  // in field order, as anemoi writes them
+                if (!e.error.empty()) throw std::runtime_error(e.error);
+                write_encoded(s, e);
             }
         }
     }
+
+    mutable std::mutex clone_mutex;
 };
 
 namespace {
