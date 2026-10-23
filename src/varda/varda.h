@@ -1,5 +1,5 @@
 // varda.cpp public API: load a converted anemoi GraphTransformer forecaster
-// (docs/format.md) and run its predict_step on the CPU or a CUDA GPU.
+// (docs/format.md) and run its predict_step on CPU, CUDA or an Apple Silicon GPU.
 #pragma once
 
 #include <cstdint>
@@ -12,7 +12,7 @@
 
 namespace varda {
 
-enum class Device { CPU, CUDA };
+enum class Device { CPU, CUDA, Metal };
 // FP16 reproduces the reference's fp16 autocast (Linear in fp16, LayerNorm and attention
 // softmax in fp32). CUDA only.
 enum class Precision { FP32, FP16 };

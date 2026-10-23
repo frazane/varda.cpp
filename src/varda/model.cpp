@@ -8,7 +8,14 @@
 
 namespace varda {
 
-std::string to_string(Device d) { return d == Device::CPU ? "cpu" : "cuda"; }
+std::string to_string(Device d) {
+    switch (d) {
+        case Device::CPU: return "cpu";
+        case Device::CUDA: return "cuda";
+        case Device::Metal: return "metal";
+    }
+    throw std::runtime_error("unknown compute device");
+}
 std::string to_string(Precision p) { return p == Precision::FP32 ? "fp32" : "fp16"; }
 
 Model::~Model() = default;
@@ -51,12 +58,22 @@ std::unique_ptr<Model> Model::load(const std::string& path, const Options& opts)
         if (opts.precision != Precision::FP32)
             throw std::runtime_error("the CPU backend runs fp32 only");
         m->backend_ = make_cpu_backend(m->cfg_, *m->file_, opts);
-    } else {
+    } else if (opts.device == Device::CUDA) {
 #ifdef VARDA_WITH_CUDA
         m->backend_ = make_cuda_backend(m->cfg_, *m->file_, opts);
 #else
         throw std::runtime_error("varda.cpp was built without CUDA (VARDA_CUDA=OFF)");
 #endif
+    } else if (opts.device == Device::Metal) {
+#ifdef VARDA_WITH_METAL
+        if (opts.precision != Precision::FP32)
+            throw std::runtime_error("the Metal backend runs fp32 only");
+        m->backend_ = make_metal_backend(m->cfg_, *m->file_, opts);
+#else
+        throw std::runtime_error("varda.cpp was built without Metal (VARDA_METAL=OFF)");
+#endif
+    } else {
+        throw std::runtime_error("unknown compute device");
     }
     m->file_->require_all_consumed();
     return m;

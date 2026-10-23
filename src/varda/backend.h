@@ -25,5 +25,9 @@ std::unique_ptr<Backend> make_cpu_backend(const Config& cfg, SafeTensorsFile& fi
 std::unique_ptr<Backend> make_cuda_backend(const Config& cfg, SafeTensorsFile& file,
                                            const Options& opts);
 #endif
+#ifdef VARDA_WITH_METAL
+std::unique_ptr<Backend> make_metal_backend(const Config& cfg, SafeTensorsFile& file,
+                                          const Options& opts);
+#endif
 
 }  // namespace varda

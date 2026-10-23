@@ -71,3 +71,19 @@ jobs:
           build-ci/varda-run --model "$RUNNER_TEMP/varda-synthetic/e.model.safetensors" \
             --input "$RUNNER_TEMP/varda-synthetic/e.golden.safetensors" \
             --device cpu --precision fp32 --threads 2 --steps 3
+      - name: Metal availability and numerical checks
+        if: runner.os == 'macOS'
+        run: |
+          set +e
+          build-ci/varda-metal-info
+          probe=$?
+          set -e
+          if [[ "$probe" == 77 ]]; then
+            echo '::notice::No Metal GPU on this runner; GPU execution checks are SKIPPED, not a GPU pass.'
+            exit 0
+          fi
+          if [[ "$probe" != 0 ]]; then exit "$probe"; fi
+          BIN="$PWD/build-ci" SYN_DIR="$RUNNER_TEMP/varda-synthetic" \
+            bash tests/run_synthetic.sh metal
+          .venv/bin/python -I python/tests/test_metal.py --bin build-ci \
+            --synthetic "$RUNNER_TEMP/varda-synthetic" --work "$RUNNER_TEMP/varda-metal"

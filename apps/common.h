@@ -129,7 +129,8 @@ inline Metric compare(const float* a, const float* r, int64_t n) {
 inline varda::Device parse_device(const std::string& s) {
     if (s == "cpu") return varda::Device::CPU;
     if (s == "cuda") return varda::Device::CUDA;
-    throw std::runtime_error("unknown --device '" + s + "' (cpu | cuda)");
+    if (s == "metal") return varda::Device::Metal;
+    throw std::runtime_error("unknown --device '" + s + "' (cpu | cuda | metal)");
 }
 
 inline varda::Precision parse_precision(const std::string& s) {

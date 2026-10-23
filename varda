@@ -3,7 +3,7 @@
 #
 #   ./varda setup                       build (build/, CUDA + GRIB) and check the assets bundle (create it here)
 #   ./varda fetch DATE|latest           download the inputs of one date into the input cache
-#   ./varda forecast DATE|latest [--lead-time H] [--precision fp16|fp32] [--device cuda|cpu] [--out DIR]
+#   ./varda forecast DATE|latest [--lead-time H] [--precision fp16|fp32] [--device cuda|cpu|metal] [--out DIR]
 #                                [-- extra varda-forecast options]
 #
 # DATE is the initial time in UTC, e.g. 2026-10-22T15 (hour 00, 03, ..., 21); `latest` is the newest KENDA-CH1
@@ -146,7 +146,10 @@ cmd_forecast() {
         esac
     done
     case "$precision" in fp16|fp32) ;; *) die "--precision must be fp16 or fp32" ;; esac
-    case "$device" in cuda|cpu) ;; *) die "--device must be cuda or cpu" ;; esac
+    case "$device" in cuda|cpu|metal) ;; *) die "--device must be cuda, cpu or metal" ;; esac
+    if [[ "$device" == metal && "$precision" != fp32 ]]; then
+        die "the Metal backend runs fp32 only: pass --precision fp32"
+    fi
     if [[ -n "$lead" ]]; then
         case "$lead" in
             *d) lead=$(( ${lead%d} * 24 )) ;;
@@ -161,7 +164,11 @@ cmd_forecast() {
 
     # where to run: here inside an allocation (or VARDA_SRUN=0), else through srun (decided before any download)
     local launch=()
-    if [[ -z "${SLURM_JOB_ID:-}" && "${VARDA_SRUN:-1}" != 0 ]]; then
+    if [[ "$device" == metal ]]; then
+        [[ "$(uname -s)" == Darwin ]] || die "Metal requires an Apple Silicon Mac"
+        [[ -x "$BUILD/varda-metal-info" ]] || die "this build has no Metal backend (VARDA_METAL=ON)"
+        "$BUILD/varda-metal-info" >/dev/null || die "no usable unified-memory Metal GPU"
+    elif [[ -z "${SLURM_JOB_ID:-}" && "${VARDA_SRUN:-1}" != 0 ]]; then
         command -v srun >/dev/null ||
             die "not in a Slurm allocation and no srun: run on a GPU machine with VARDA_SRUN=0"
         local def="${VARDA_SLURM_GPU:-}"

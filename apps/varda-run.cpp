@@ -1,7 +1,7 @@
 // Runs predict_step on an input read from a safetensors file and reports timings.
 //
 //   varda-run --model M.safetensors --input X.safetensors [--key in.x] [--steps N]
-//             [--device cpu|cuda] [--precision fp32|fp16] [--threads N] [--no-cuda-graph]
+//             [--device cpu|cuda|metal] [--precision fp32|fp16] [--threads N] [--no-cuda-graph]
 //             [--out Y.safetensors]
 //
 // The input tensor (default key `in.x`, e.g. from a golden file) must have the contract shape
@@ -25,7 +25,7 @@ namespace {
 
 [[noreturn]] void usage() {
     std::fprintf(stderr,
-                 "usage: varda-run --model M --input X [--key in.x] [--steps N] [--device cpu|cuda]\n"
+                 "usage: varda-run --model M --input X [--key in.x] [--steps N] [--device cpu|cuda|metal]\n"
                  "                 [--precision fp32|fp16] [--threads N] [--no-cuda-graph] [--out Y]\n");
     std::exit(2);
 }

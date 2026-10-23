@@ -1,8 +1,9 @@
 # Apple Silicon (macOS arm64)
 
 The existing CPU fp32 backend runs natively on Apple Silicon using Apple Clang,
-OpenMP and OpenBLAS. CUDA is NVIDIA-only; there is no Metal or MPS backend, so the
-Apple GPU is not used. No model arithmetic or numerical tolerances are changed.
+OpenMP and OpenBLAS. The optional native Metal/MPS backend runs fp32 inference on
+the Apple GPU; see [metal.md](metal.md). CUDA remains NVIDIA-only. CPU arithmetic
+and numerical tolerances are unchanged.
 
 ## CPU build
 
@@ -10,7 +11,7 @@ Install Xcode Command Line Tools and the build dependencies:
 
 ```sh
 brew install cmake libomp openblas
-cmake -S . -B build-apple -DVARDA_CUDA=OFF -DVARDA_GRIB=OFF \
+cmake -S . -B build-apple -DVARDA_CUDA=OFF -DVARDA_METAL=OFF -DVARDA_GRIB=OFF \
   -DCMAKE_PREFIX_PATH="$(brew --prefix libomp);$(brew --prefix openblas)"
 cmake --build build-apple -j 4
 OMP_NUM_THREADS=8 OPENBLAS_NUM_THREADS=1 ctest --test-dir build-apple --output-on-failure
