@@ -70,16 +70,23 @@ cmd_setup() {
     done
     if [[ $rebuild == 1 || ! -x "$BUILD/varda-forecast" ]]; then
         command -v cmake >/dev/null || die "cmake not found"
-        say "building into $BUILD (CUDA + GRIB) ..."
+        say "building engine and GRIB tools into $BUILD ..."
         cmake -S "$REPO" -B "$BUILD" -DCMAKE_BUILD_TYPE=Release -DVARDA_GRIB=ON >"$BUILD.cmake.log" 2>&1 ||
             { tail -20 "$BUILD.cmake.log" >&2; die "cmake configure failed (log: $BUILD.cmake.log)"; }
-        cmake --build "$BUILD" -j "$(nproc)" >>"$BUILD.cmake.log" 2>&1 ||
+        local jobs
+        if [[ "$(uname -s)" == Darwin ]]; then jobs="$(sysctl -n hw.logicalcpu)"; else jobs="$(nproc)"; fi
+        cmake --build "$BUILD" -j "$jobs" >>"$BUILD.cmake.log" 2>&1 ||
             { tail -30 "$BUILD.cmake.log" >&2; die "build failed (log: $BUILD.cmake.log)"; }
         mv "$BUILD.cmake.log" "$BUILD/varda-build.log"
         [[ -x "$BUILD/varda-forecast" ]] ||
             die "the build has no varda-forecast: ecCodes not found? set ECCODES_HOME (log: $BUILD/varda-build.log)"
-        grep -q 'CMAKE_CUDA_COMPILER:' "$BUILD/CMakeCache.txt" && grep -q '^CMAKE_CUDA_COMPILER:.*nvcc' "$BUILD/CMakeCache.txt" ||
-            say "note: built without CUDA (no nvcc found): only --device cpu will work"
+        if ! grep -q '^CMAKE_CUDA_COMPILER:.*nvcc' "$BUILD/CMakeCache.txt"; then
+            if [[ -x "$BUILD/varda-metal-info" ]]; then
+                say "note: built without CUDA; Metal enabled (--device metal --precision fp32)"
+            else
+                say "note: built without CUDA (no nvcc found): only --device cpu will work"
+            fi
+        fi
         say "built $BUILD/varda-forecast"
     else
         say "build: $BUILD/varda-forecast present (./varda setup --rebuild to rebuild)"
