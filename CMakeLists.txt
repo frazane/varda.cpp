@@ -19,6 +19,11 @@ set(CMAKE_BUILD_RPATH_USE_LINK_PATH ON)
 find_package(OpenMP REQUIRED)
 set(BLA_VENDOR OpenBLAS)
 find_package(BLAS REQUIRED)
+# Prefer OpenBLAS headers to the SDK's Accelerate cblas.h on macOS. The CPU backend
+# uses OpenBLAS's thread-control API, which Accelerate's headers do not declare.
+if(APPLE)
+  set(CMAKE_FIND_FRAMEWORK LAST)
+endif()
 find_path(CBLAS_INCLUDE_DIR cblas.h HINTS ENV OPENBLAS_HOME PATH_SUFFIXES include include/openblas REQUIRED)
 
 # CPU numerics: no implicit FMA contraction, so element-wise code rounds like the
@@ -26,7 +31,7 @@ find_path(CBLAS_INCLUDE_DIR cblas.h HINTS ENV OPENBLAS_HOME PATH_SUFFIXES includ
 set(VARDA_CXX_FLAGS -ffp-contract=off -Wall -Wextra -Wno-unused-parameter)
 if(VARDA_NATIVE)
   list(APPEND VARDA_CXX_FLAGS -march=native)
-else()
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
   list(APPEND VARDA_CXX_FLAGS -mavx2 -mfma -mf16c)
 endif()
 
@@ -66,7 +71,7 @@ endif()
 set(VARDA_HAVE_GRIB OFF)
 if(VARDA_GRIB)
   find_path(ECCODES_INCLUDE_DIR eccodes.h HINTS ENV ECCODES_HOME PATH_SUFFIXES eccodeslib/include include)
-  find_library(ECCODES_LIBRARY eccodes HINTS ENV ECCODES_HOME PATH_SUFFIXES eccodeslib/lib64 lib64 lib)
+  find_library(ECCODES_LIBRARY eccodes HINTS ENV ECCODES_HOME PATH_SUFFIXES eccodeslib/lib64 eccodeslib/lib lib64 lib)
   if(ECCODES_INCLUDE_DIR AND ECCODES_LIBRARY)
     set(VARDA_HAVE_GRIB ON)
     get_filename_component(ECCODES_LIBDIR ${ECCODES_LIBRARY} DIRECTORY)
@@ -74,9 +79,13 @@ if(VARDA_GRIB)
     add_library(varda_io STATIC ${VARDA_IO_SRC})
     target_include_directories(varda_io PUBLIC ${ECCODES_INCLUDE_DIR})
     target_compile_options(varda_io PRIVATE ${VARDA_CXX_FLAGS})
-    # libeccodes needs eckit next to it; old-style RPATH reaches transitive dependencies.
-    target_link_libraries(varda_io PUBLIC varda ${ECCODES_LIBRARY}
-      "-Wl,--disable-new-dtags,-rpath,${ECCODES_LIBDIR}:${ECCODES_LIBDIR}/../../eckitlib/lib64")
+    # ELF builds use old-style RPATH to reach ecCodes' transitive eckit dependency.
+    # Darwin uses the normal dylib load paths instead of this GNU linker option.
+    target_link_libraries(varda_io PUBLIC varda ${ECCODES_LIBRARY})
+    if(UNIX AND NOT APPLE)
+      target_link_libraries(varda_io PUBLIC
+        "-Wl,--disable-new-dtags,-rpath,${ECCODES_LIBDIR}:${ECCODES_LIBDIR}/../../eckitlib/lib64")
+    endif()
   else()
     message(WARNING "VARDA_GRIB=ON but ecCodes not found (set ECCODES_HOME): no GRIB layer")
   endif()

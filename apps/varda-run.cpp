@@ -10,6 +10,9 @@
 // Prints load time, per-step wall time, and peak RSS (VmHWM: includes the resident pages of
 // the mapped model and input files). --out writes the first output as `out.y`.
 #include <sys/resource.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
 
 #include <cstdio>
 #include <fstream>
@@ -27,14 +30,29 @@ namespace {
     std::exit(2);
 }
 
-// kB value of a /proc/self/status field (VmHWM, VmRSS, RssAnon, RssFile), or -1.
+// KiB value of a memory statistic, or -1 when unavailable.
 long proc_status_kb(const char* field) {
+#ifdef __APPLE__
+    if (std::string(field) == "VmHWM") {
+        struct rusage ru {};
+        return getrusage(RUSAGE_SELF, &ru) == 0 ? ru.ru_maxrss / 1024 : -1;
+    }
+    if (std::string(field) == "VmRSS") {
+        mach_task_basic_info_data_t info {};
+        mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+        if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                      reinterpret_cast<task_info_t>(&info), &count) == KERN_SUCCESS)
+            return static_cast<long>(info.resident_size / 1024);
+    }
+    return -1;
+#else
     std::ifstream f("/proc/self/status");
     std::string line;
     const std::string want = std::string(field) + ":";
     while (std::getline(f, line))
         if (line.compare(0, want.size(), want) == 0) return std::atol(line.c_str() + want.size());
     return -1;
+#endif
 }
 
 }  // namespace
@@ -97,9 +115,14 @@ int main(int argc, char** argv) {
                     steps > 1 ? (repeat_bitwise ? ", repeats bitwise equal" : ", REPEATS DIFFER") : "");
         struct rusage ru;
         getrusage(RUSAGE_SELF, &ru);
+#ifdef __APPLE__
+        std::printf("peak RSS %.2f GB (ru_maxrss), RSS now %.2f GB\n",
+                    ru.ru_maxrss / 1073741824.0, proc_status_kb("VmRSS") / 1048576.0);
+#else
         std::printf("peak RSS %.2f GB (VmHWM; ru_maxrss %.2f GB), RSS now %.2f GB (anon %.2f, file %.2f)\n",
                     proc_status_kb("VmHWM") / 1048576.0, ru.ru_maxrss / 1048576.0, proc_status_kb("VmRSS") / 1048576.0,
                     proc_status_kb("RssAnon") / 1048576.0, proc_status_kb("RssFile") / 1048576.0);
+#endif
 
         if (!out_path.empty()) {
             varda::write_safetensors(out_path, {{"out.y", varda::DType::F32, y_shape, y0.data()}},

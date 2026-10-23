@@ -16,7 +16,7 @@
 
 #include "nlohmann/json.hpp"
 
-#ifndef MADV_POPULATE_READ
+#if defined(__linux__) && !defined(MADV_POPULATE_READ)
 #define MADV_POPULATE_READ 22  // Linux >= 5.14; older kernels reject it with EINVAL
 #endif
 
@@ -143,17 +143,21 @@ void SafeTensorsFile::prefetch(int threads) const {
     threads = static_cast<int>(std::min<size_t>(static_cast<size_t>(threads), n_chunks));
     const size_t page = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
     std::atomic<size_t> next{0};
+#ifdef MADV_POPULATE_READ
     std::atomic<bool> populate{true};
+#endif
     auto worker = [&] {
         unsigned sum = 0;
         for (size_t c; (c = next.fetch_add(1)) < n_chunks;) {
             const size_t lo = c * kChunk, hi = std::min(map_size_, lo + kChunk);
             char* p = static_cast<char*>(map_) + lo;  // lo is a multiple of kChunk: page aligned
+#ifdef MADV_POPULATE_READ
             if (populate.load(std::memory_order_relaxed)) {
                 if (::madvise(p, hi - lo, MADV_POPULATE_READ) == 0) continue;
                 if (errno != EINVAL) continue;  // EINTR, or an I/O error that surfaces where the bytes are read, as before
                 populate.store(false, std::memory_order_relaxed);  // kernel without it: touch the pages
             }
+#endif
             const volatile unsigned char* q = reinterpret_cast<const unsigned char*>(p);
             for (size_t o = 0; o < hi - lo; o += page) sum += q[o];
         }

@@ -1,0 +1,5 @@
+# Small CPU/GRIB test environment; no torch or anemoi needed for synthetic parity.
+# Versions match requirements-ref-varda.lock.txt (numpy) and the real-data reference lock.
+numpy==2.3.5
+eccodeslib==2.47.3.21
+eckitlib==2.1.0.21
