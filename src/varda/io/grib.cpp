@@ -107,6 +107,35 @@ size_t GribHandle::size(const std::string& key) const {
     return n;
 }
 
+std::vector<std::string> GribHandle::key_names() const {
+    codes_keys_iterator* it = codes_keys_iterator_new(
+        h_, CODES_KEYS_ITERATOR_ALL_KEYS | CODES_KEYS_ITERATOR_SKIP_DUPLICATES, nullptr);
+    if (!it) throw std::runtime_error("ecCodes: cannot iterate keys");
+    std::vector<std::string> out;
+    while (codes_keys_iterator_next(it)) out.emplace_back(codes_keys_iterator_get_name(it));
+    codes_keys_iterator_delete(it);
+    return out;
+}
+
+GribHandle::KeyType GribHandle::native_type(const std::string& key) const {
+    int t = 0;
+    check(codes_get_native_type(h_, key.c_str(), &t), "get_native_type " + key);
+    switch (t) {
+        case CODES_TYPE_LONG: return KeyType::Long;
+        case CODES_TYPE_DOUBLE: return KeyType::Double;
+        case CODES_TYPE_STRING: return KeyType::String;
+        default: return KeyType::Other;
+    }
+}
+
+std::vector<long> GribHandle::get_long_array(const std::string& key) const {
+    size_t n = size(key);
+    std::vector<long> v(n);
+    check(codes_get_long_array(h_, key.c_str(), v.data(), &n), "get_long_array " + key);
+    v.resize(n);
+    return v;
+}
+
 std::vector<float> GribHandle::get_float_array(const std::string& key) const {
     size_t n = size(key);
     std::vector<float> v(n);

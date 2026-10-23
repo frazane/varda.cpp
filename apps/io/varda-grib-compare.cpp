@@ -15,7 +15,6 @@
 // --ignore-data-keys ignores the keys that depend on the values or on the packing (statistics, reference value,
 // binary scale factor, bits per value, lengths, md5Headers): for end-to-end comparisons that are not bitwise.
 // The COSMO definitions are taken from $VARDA_COSMO_DEFINITIONS (needed to read ICON messages).
-#include <eccodes.h>
 
 #include <algorithm>
 #include <cmath>
@@ -55,8 +54,10 @@ static std::string label(const GribHandle& h) {
     return g("shortName") + "/" + g("paramId") + "/" + g("typeOfLevel") + "/L" + g("level") + "/step" + g("step");
 }
 
+using KeyType = GribHandle::KeyType;
+
 struct KeyValue {
-    int type = 0;
+    KeyType type = KeyType::Other;
     bool missing = false;
     std::string s;
     std::vector<long> l;
@@ -65,71 +66,51 @@ struct KeyValue {
 
 static const size_t kMaxArray = 10000;
 
-static bool read_key(grib_handle* h, const char* name, KeyValue& kv, bool& too_big) {
+static bool read_key(const GribHandle& h, const std::string& name, KeyValue& kv, bool& too_big) {
     too_big = false;
-    int type = 0;
-    if (codes_get_native_type(h, name, &type) != 0) return false;
-    size_t n = 0;
-    if (codes_get_size(h, name, &n) != 0) return false;
-    if (n > kMaxArray) { too_big = true; return false; }
-    kv.type = type;
-    int err = 0;
-    kv.missing = codes_is_missing(h, name, &err) != 0;
-    if (type == CODES_TYPE_LONG) {
-        kv.l.resize(n);
-        if (codes_get_long_array(h, name, kv.l.data(), &n) != 0) return false;
-        kv.l.resize(n);
-    } else if (type == CODES_TYPE_DOUBLE) {
-        kv.d.resize(n);
-        if (codes_get_double_array(h, name, kv.d.data(), &n) != 0) return false;
-        kv.d.resize(n);
-    } else if (type == CODES_TYPE_STRING) {
-        size_t len = 0;
-        if (codes_get_length(h, name, &len) != 0) return false;
-        std::string s(len + 1, '\0');
-        len = s.size();
-        if (codes_get_string(h, name, s.data(), &len) != 0) return false;
-        s.resize(std::strlen(s.c_str()));
-        kv.s = s;
-    } else {
-        return false;  // bytes, sections, labels: covered by md5Headers
+    try {
+        const KeyType type = h.native_type(name);
+        if (h.size(name) > kMaxArray) { too_big = true; return false; }
+        if (type == KeyType::Other) return false;  // bytes, sections, labels: covered by md5Headers
+        kv.type = type;
+        kv.missing = h.is_missing(name);
+        if (type == KeyType::Long) kv.l = h.get_long_array(name);
+        else if (type == KeyType::Double) kv.d = h.get_double_array(name);
+        else kv.s = h.get_string(name);
+    } catch (const std::runtime_error&) {
+        return false;
     }
     return true;
 }
 
 static bool same_key(const KeyValue& a, const KeyValue& b) {
     if (a.type != b.type || a.missing != b.missing) return false;
-    if (a.type == CODES_TYPE_LONG) return a.l == b.l;
-    if (a.type == CODES_TYPE_STRING) return a.s == b.s;
+    if (a.type == KeyType::Long) return a.l == b.l;
+    if (a.type == KeyType::String) return a.s == b.s;
     if (a.d.size() != b.d.size()) return false;
     return a.d.empty() || std::memcmp(a.d.data(), b.d.data(), a.d.size() * sizeof(double)) == 0;
 }
 
 static std::string show(const KeyValue& k) {
     if (k.missing) return "MISSING";
-    if (k.type == CODES_TYPE_STRING) return "'" + k.s + "'";
+    if (k.type == KeyType::String) return "'" + k.s + "'";
     std::string s;
     auto add = [&](const std::string& x) { if (s.size() < 60) s += (s.empty() ? "" : ",") + x; };
-    if (k.type == CODES_TYPE_LONG) for (long v : k.l) add(std::to_string(v));
+    if (k.type == KeyType::Long) for (long v : k.l) add(std::to_string(v));
     else for (double v : k.d) { char b[40]; std::snprintf(b, sizeof b, "%.17g", v); add(b); }
     return k.l.size() > 1 || k.d.size() > 1 ? "[" + s + "]" : s;
 }
 
-static std::map<std::string, KeyValue> read_all_keys(const GribHandle& gh, long& skipped) {
+static std::map<std::string, KeyValue> read_all_keys(const GribHandle& h, long& skipped) {
     std::map<std::string, KeyValue> out;
-    grib_handle* h = gh.raw();
-    codes_keys_iterator* it = codes_keys_iterator_new(h, CODES_KEYS_ITERATOR_ALL_KEYS | CODES_KEYS_ITERATOR_SKIP_DUPLICATES, nullptr);
-    if (!it) throw std::runtime_error("cannot iterate keys");
-    while (codes_keys_iterator_next(it)) {
-        const char* name = codes_keys_iterator_get_name(it);
-        static const std::set<std::string> never = {"values", "codedValues", "packedValues", "bitmap"};
+    static const std::set<std::string> never = {"values", "codedValues", "packedValues", "bitmap"};
+    for (const std::string& name : h.key_names()) {
         if (never.count(name)) continue;
         KeyValue kv;
         bool big = false;
         if (read_key(h, name, kv, big)) out.emplace(name, std::move(kv));
         else if (big) ++skipped;
     }
-    codes_keys_iterator_delete(it);
     // explicit, as grib_compare -H does
     for (const char* name : {"md5Headers"}) {
         KeyValue kv;

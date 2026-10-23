@@ -46,6 +46,13 @@ public:
     std::string get_string(const std::string& key) const;
     size_t size(const std::string& key = "values") const;
 
+    // Key introspection (comparison tools): every key name, duplicates skipped, in ecCodes'
+    // iteration order; a key's native type.
+    enum class KeyType { Long, Double, String, Other };
+    std::vector<std::string> key_names() const;
+    KeyType native_type(const std::string& key) const;
+    std::vector<long> get_long_array(const std::string& key) const;
+
     // Decode as anemoi does: codes_get_float_array / codes_get_double_array (docs/spec-io.md §2.0).
     std::vector<float> get_float_array(const std::string& key = "values") const;
     std::vector<double> get_double_array(const std::string& key = "values") const;
