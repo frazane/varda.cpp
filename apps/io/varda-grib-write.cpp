@@ -127,7 +127,11 @@ int main(int argc, char** argv) {
             }
             const double a = app::now_s();
             go.write_step(6 * s, y.as<float>());
-            std::printf("step %d (+%dh) written in %.1f s\n", s, 6 * s, app::now_s() - a);
+            const auto st = go.stats();
+            std::printf("step %d (+%dh) written in %.2f s (cumulative: post %.2f s, encode %.2f s, write %.2f s, "
+                        "%lld messages, %.1f MB; cpu gather %.2f keys %.2f pack %.2f check %.2f s)\n", s, 6 * s,
+                        app::now_s() - a, st.post, st.encode, st.write, (long long)st.messages, st.bytes / 1e6,
+                        st.cpu_gather, st.cpu_keys, st.cpu_pack, st.cpu_check);
         }
         go.close();
         for (const auto& f : go.files()) std::printf("wrote %s\n", f.c_str());

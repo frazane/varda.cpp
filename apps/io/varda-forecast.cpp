@@ -8,13 +8,15 @@
 //                  ( --realdata DIR | --date T --kenda DIR --ifs-prev F.. --ifs F.. --ifs-constants F.. )
 //                  [--lead-time-hours H] [--device cuda|cpu] [--precision fp16|fp32] [--no-graph]
 //                  [--host-loop] [--definitions D] [--allow-nans] [--threads N] [--dump-y]
+//                  [--write-queue N]
 //
 // DIR receives the GRIB files under the configured relative paths (outputs/<dateTime>_<step>.grib); DIR/forecast.json the provenance and
 // timings. --dump-y also writes DIR/y.safetensors (`y.<step>` F32 [G, V_out], the model outputs
 // before post-processing) for comparisons against the reference dumps.
 //
-// The GRIB encoding of step s runs on a writer thread while the GPU computes step s+1: the rollout
-// callback only copies y and queues it.
+// Overlap: the input is prepared on its own thread while the weights load and the rollout is set up;
+// GRIB encoding (initial state, then each step) runs on a writer thread during the rollout, the rollout
+// callback only copying y into a queue of --write-queue steps (default min(steps, 8); 452 MB each).
 #include <omp.h>
 #include <sys/stat.h>
 
@@ -22,7 +24,9 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <deque>
+#include <memory>
 #include <exception>
 #include <fstream>
 #include <mutex>
@@ -65,36 +69,54 @@ void mkdirs(const std::string& p) {
     }
 }
 
-// Encodes steps in order on its own thread; the first error is rethrown by finish().
+// Encodes the initial state and the steps in order on its own thread, so GRIB encoding overlaps the
+// rollout; the first error is rethrown by finish(). At most `depth` steps wait in the queue (each holds
+// a copy of y, G * V_out floats): when the GPU is faster than the encoder, the rollout only blocks
+// once the queue is full.
 class StepWriter {
 public:
-    StepWriter(GribOutput& out, size_t n) : out_(out), n_(n), th_([this] { loop(); }) {}
+    StepWriter(GribOutput& out, size_t n, size_t depth)
+        : out_(out), n_(n), depth_(depth), th_([this] { loop(); }) {}
     ~StepWriter() {
         if (th_.joinable()) {
             stop();
             th_.join();
         }
     }
+    // `in` must stay alive and unchanged until finish().
+    void push_initial(const InputState& in) { enqueue({0, true, &in, {}}); }
     void push(int step_hours, const float* y) {
-        std::unique_lock<std::mutex> lk(mu_);
-        // At most two steps in flight: bounds host memory (G * V_out floats each).
-        cv_.wait(lk, [&] { return q_.size() < 2 || err_; });
-        if (err_) return;
-        q_.push_back({step_hours, std::vector<float>(y, y + n_)});
-        cv_.notify_all();
+        const double t0 = app::now_s();
+        Item it{step_hours, false, nullptr, std::vector<float>(y, y + n_)};
+        copy_s_ += app::now_s() - t0;
+        enqueue(std::move(it));
     }
     void finish() {
         stop();
         th_.join();
         if (err_) std::rethrow_exception(err_);
     }
-    const std::vector<double>& seconds() const { return secs_; }
+    double initial_seconds() const { return initial_s_; }
+    const std::vector<double>& step_seconds() const { return secs_; }
+    double blocked_seconds() const { return blocked_s_; }  // time the rollout waited for a free slot
+    double copy_seconds() const { return copy_s_; }        // time the rollout callback spent copying y
 
 private:
     struct Item {
-        int step_hours;
+        int step_hours = 0;
+        bool initial = false;
+        const InputState* in = nullptr;
         std::vector<float> y;
     };
+    void enqueue(Item it) {
+        const double t0 = app::now_s();
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [&] { return q_.size() < depth_ || err_; });
+        blocked_s_ += app::now_s() - t0;
+        if (err_) return;
+        q_.push_back(std::move(it));
+        cv_.notify_all();
+    }
     void stop() {
         std::lock_guard<std::mutex> lk(mu_);
         done_ = true;
@@ -114,8 +136,13 @@ private:
             if (err_) continue;  // drain after an error
             try {
                 const double t0 = app::now_s();
-                out_.write_step(it.step_hours, it.y.data());
-                secs_.push_back(app::now_s() - t0);
+                if (it.initial) {
+                    out_.write_initial(it.in->initial_names, it.in->initial_values);
+                    initial_s_ = app::now_s() - t0;
+                } else {
+                    out_.write_step(it.step_hours, it.y.data());
+                    secs_.push_back(app::now_s() - t0);
+                }
             } catch (...) {
                 std::lock_guard<std::mutex> lk(mu_);
                 err_ = std::current_exception();
@@ -124,12 +151,13 @@ private:
         }
     }
     GribOutput& out_;
-    size_t n_;
+    size_t n_, depth_;
     std::mutex mu_;
     std::condition_variable cv_;
     std::deque<Item> q_;
     bool done_ = false;
     std::exception_ptr err_;
+    double initial_s_ = 0, blocked_s_ = 0, copy_s_ = 0;
     std::vector<double> secs_;
     std::thread th_;
 };
@@ -141,6 +169,7 @@ int main(int argc, char** argv) {
     InputFiles files;
     int lead_hours = 0, threads = 0;
     bool graph = true, host_loop = false, dump_y = false;
+    size_t write_queue = 0;  // 0: min(steps, 8)
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -167,6 +196,7 @@ int main(int argc, char** argv) {
         else if (a == "--allow-nans") files.allow_nans = true;
         else if (a == "--threads") threads = std::stoi(next());
         else if (a == "--dump-y") dump_y = true;
+        else if (a == "--write-queue") write_queue = size_t(std::stoul(next()));
         else usage();
     }
     if (model_path.empty() || io_config_path.empty() || files.regrid_matrix.empty() || templates.empty() ||
@@ -196,6 +226,30 @@ int main(int argc, char** argv) {
         opts.device = app::parse_device(device);
         opts.precision = app::parse_precision(precision);
         opts.cuda_graph = graph;
+
+        // Start-up in parallel: the input is prepared on its own thread from the converted file's
+        // config, grid and masks only, while this thread loads the weights onto the device and sets
+        // up the rollout (one eager forward and the CUDA graph capture).
+        InputState in;
+        double input_s = 0;
+        std::exception_ptr input_err;
+        std::thread input_thread([&] {
+            try {
+                const double ti = app::now_s();
+                const InputModel im = InputModel::load(model_path);
+                in = build_input(im, files);
+                input_s = app::now_s() - ti;
+            } catch (...) {
+                input_err = std::current_exception();
+            }
+        });
+        struct Joiner {
+            std::thread& t;
+            ~Joiner() {
+                if (t.joinable()) t.join();
+            }
+        } joiner{input_thread};
+
         double t0 = app::now_s();
         auto model = varda::Model::load(model_path, opts);
         const double load_s = app::now_s() - t0;
@@ -212,27 +266,39 @@ int main(int argc, char** argv) {
                     lead_hours, omp_get_max_threads());
 
         t0 = app::now_s();
-        const InputState in = build_input(*model, files);
-        const double input_s = app::now_s() - t0;
+        std::string engine;
+#ifdef VARDA_WITH_CUDA
+        std::unique_ptr<varda::cuda::DeviceRollout> device_rollout;
+        if (opts.device == varda::Device::CUDA && !host_loop) {
+            device_rollout = std::make_unique<varda::cuda::DeviceRollout>(*model, opts.cuda_graph);
+            engine = "device";
+        }
+#endif
+        std::unique_ptr<varda::Rollout> host_rollout;
+        if (engine.empty()) {
+            host_rollout = std::make_unique<varda::Rollout>(*model);
+            engine = "host";
+        }
+        const double setup_s = app::now_s() - t0;
+
+        input_thread.join();
+        if (input_err) std::rethrow_exception(input_err);
+        const double ready_s = app::now_s() - t_start;
         for (const auto& l : in.log) std::printf("  %s\n", l.c_str());
-        std::printf("input for %s prepared in %.2f s\n", varda::format_iso8601_utc(in.date0).c_str(), input_s);
+        std::printf("input for %s prepared in %.2f s; rollout set up in %.2f s; ready after %.2f s\n",
+                    varda::format_iso8601_utc(in.date0).c_str(), input_s, setup_s, ready_s);
 
         // The configured paths are relative (outputs/<dateTime>_<step>.grib), as anemoi-inference
         // resolves them against its working directory: here against --out.
         mkdirs(out_dir);
         GribOutput out(*model, cfg, templates, out_dir, in.date0);
-        double initial_s = 0;
-        if (cfg.write_initial_state) {
-            t0 = app::now_s();
-            out.write_initial(in.initial_names, in.initial_values);
-            initial_s = app::now_s() - t0;
-            std::printf("initial state written in %.2f s\n", initial_s);
-        }
-
         const size_t out_n = size_t(mc.n_data_nodes) * size_t(mc.n_output_vars);
+        if (write_queue == 0) write_queue = size_t(std::min(n_steps, 8));
+        StepWriter writer(out, out_n, write_queue);
+        if (cfg.write_initial_state) writer.push_initial(in);
+
         std::vector<float> ys;
         if (dump_y) ys.resize(out_n * size_t(n_steps));
-        StepWriter writer(out, out_n);
         varda::RolloutRequest q;
         q.x0 = in.x0.data();
         q.date0 = in.date0;
@@ -245,25 +311,22 @@ int main(int argc, char** argv) {
         };
         t0 = app::now_s();
         std::vector<float> step_ms;
-        std::string engine;
 #ifdef VARDA_WITH_CUDA
-        if (opts.device == varda::Device::CUDA && !host_loop) {
-            varda::cuda::DeviceRollout r(*model, opts.cuda_graph);
-            r.run(q);
-            step_ms = r.step_ms();
-            engine = "device";
-        } else
+        if (device_rollout) {
+            device_rollout->run(q);
+            step_ms = device_rollout->step_ms();
+        }
 #endif
-        {
-            varda::Rollout r(*model);
-            r.run(q);
-            for (const auto& t : r.times()) step_ms.push_back(float(1e3 * (t.predict + t.forcings + t.update)));
-            engine = "host";
+        if (host_rollout) {
+            host_rollout->run(q);
+            for (const auto& t : host_rollout->times())
+                step_ms.push_back(float(1e3 * (t.predict + t.forcings + t.update)));
         }
         const double rollout_s = app::now_s() - t0;
         writer.finish();
         out.close();
         const double write_tail_s = app::now_s() - t0 - rollout_s;
+        const GribOutput::Stats gs = out.stats();
         const double total_s = app::now_s() - t_start;
 
         if (dump_y) {
@@ -288,21 +351,29 @@ int main(int argc, char** argv) {
                     {"n_steps", n_steps},
                     {"files", out.files()},
                     {"input_log", in.log},
+                    {"write_queue", write_queue},
                     {"seconds",
                      {{"load", load_s},
                       {"input", input_s},
                       {"input_stages", in.seconds},
-                      {"initial_state_write", initial_s},
+                      {"rollout_setup", setup_s},
+                      {"ready", ready_s},
+                      {"initial_state_write", writer.initial_seconds()},
                       {"rollout", rollout_s},
+                      {"rollout_blocked_on_writer", writer.blocked_seconds()},
+                      {"rollout_callback_copy", writer.copy_seconds()},
                       {"write_after_rollout", write_tail_s},
-                      {"step_write", writer.seconds()},
+                      {"step_write", writer.step_seconds()},
+                      {"grib", {{"post", gs.post}, {"encode", gs.encode}, {"write", gs.write},
+                                {"messages", gs.messages}, {"bytes", gs.bytes}}},
                       {"total", total_s}}},
                     {"step_ms", step_ms}};
         std::ofstream(out_dir + "/forecast.json") << rep.dump(1) << "\n";
-        std::printf("forecast done in %.2f s: load %.2f, input %.2f, initial write %.2f, rollout %.2f (+%.2f s "
-                    "writing after the last step); %zu files under %s\n",
-                    total_s, load_s, input_s, initial_s, rollout_s, write_tail_s, out.files().size(),
-                    out_dir.c_str());
+        std::printf("forecast done in %.2f s: ready after %.2f (load %.2f + set-up %.2f | input %.2f), rollout "
+                    "%.2f (callback: %.2f s copying y, %.2f s blocked on the writer), +%.2f s writing after the last step; GRIB encode %.2f s, "
+                    "write %.2f s; %zu files under %s\n",
+                    total_s, ready_s, load_s, setup_s, input_s, rollout_s, writer.copy_seconds(), writer.blocked_seconds(), write_tail_s,
+                    gs.encode, gs.write, out.files().size(), out_dir.c_str());
     } catch (const std::exception& e) {
         std::fprintf(stderr, "varda-forecast: %s\n", e.what());
         return 1;

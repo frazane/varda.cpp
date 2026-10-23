@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <future>
 #include <mutex>
 #include <regex>
 #include <set>
@@ -325,6 +327,7 @@ struct GribOutput::Impl {
     int64_t G = 0;
     std::vector<OutStream> streams;
     std::map<std::string, std::vector<float>> acc;  // accumulators by variable name
+    std::vector<float> transposed;                  // write_step's (V, G) copy of y
 
     const GridSource& source(const std::string& name, size_t* idx = nullptr) const {
         for (size_t i = 0; i < sources.size(); ++i)
@@ -428,7 +431,10 @@ struct GribOutput::Impl {
     // One message, encoded as anemoi-inference's encode_message does; no shared state is modified, so
     // messages of a state are encoded in parallel and written afterwards in order.
     Encoded encode_field(const OutStream& s, const IoVariable& v, std::vector<float> values, int step_hours,
-                         const Top& top) const {
+                         const Top& top, double* cpu) const {
+        using clock = std::chrono::steady_clock;
+        auto secs = [](clock::time_point a) { return std::chrono::duration<double>(clock::now() - a).count(); };
+        auto t0 = clock::now();
         const OutputDef& d = *s.def;
         const GribHandle& tmpl = template_of(s, v);
         auto sit = top.start_steps.find(v.name);
@@ -461,7 +467,11 @@ struct GribOutput::Impl {
             }
         }
         std::vector<double> dv(values.begin(), values.end());
+        cpu[1] += secs(t0);
+        t0 = clock::now();
         h.set_double_array("values", dv);
+        cpu[2] += secs(t0);
+        t0 = clock::now();
 
         // target file
         const std::string dt = h.get_string("dateTime");
@@ -479,6 +489,7 @@ struct GribOutput::Impl {
                 throw std::runtime_error(msg);
             }
         }
+        cpu[3] += secs(t0);
         return e;
     }
 
@@ -492,9 +503,15 @@ struct GribOutput::Impl {
         w->second->write(e.h);
     }
 
+    GribOutput::Stats stats;
+
     template <class Col>
     void write_state(const std::vector<std::string>& names, Col&& column, int step_hours) {
+        using clock = std::chrono::steady_clock;
+        auto secs = [](clock::time_point a) { return std::chrono::duration<double>(clock::now() - a).count(); };
+        auto t0 = clock::now();
         Top top = run_top(names, column);
+        stats.post += secs(t0);
         for (auto& s : streams) {
             // write_initial_state first checks that every field has a template
             std::vector<size_t> fields;
@@ -505,26 +522,57 @@ struct GribOutput::Impl {
                 fields.push_back(i);
             }
             std::vector<Encoded> enc(fields.size());
+            t0 = clock::now();
 #pragma omp parallel for schedule(dynamic, 1)
             for (size_t f = 0; f < fields.size(); ++f) {
                 const size_t i = fields[f];
+                double cpu[4] = {0, 0, 0, 0};
                 try {
+                    const auto tg = clock::now();
                     const IoVariable& v = cfg.variable(names[i]);
                     auto it = top.changed.find(names[i]);
                     std::vector<float> a = it != top.changed.end() ? it->second : column(i);
-                    enc[f] = encode_field(s, v, run_output_pps(*s.def, std::move(a)), step_hours, top);
+                    a = run_output_pps(*s.def, std::move(a));
+                    cpu[0] += secs(tg);
+                    enc[f] = encode_field(s, v, std::move(a), step_hours, top, cpu);
                 } catch (const std::exception& ex) {
                     enc[f].error = ex.what();
                 }
+                std::lock_guard<std::mutex> lock(stats_mutex);
+                stats.cpu_gather += cpu[0];
+                stats.cpu_keys += cpu[1];
+                stats.cpu_pack += cpu[2];
+                stats.cpu_check += cpu[3];
             }
-            for (const Encoded& e : enc) {  // in field order, as anemoi writes them
-                if (!e.error.empty()) throw std::runtime_error(e.error);
-                write_encoded(s, e);
-            }
+            stats.encode += secs(t0);
+            for (const Encoded& e : enc)
+                if (!e.error.empty()) {
+                    wait_pending();
+                    throw std::runtime_error(e.error);
+                }
+            // Write this output's messages (in field order, as anemoi writes them) while the next
+            // output is encoded; outputs write to different files.
+            wait_pending();
+            pending = std::async(std::launch::async, [this, &s, secs, enc = std::move(enc)]() {
+                const auto tw = clock::now();
+                for (const Encoded& e : enc) {
+                    write_encoded(s, e);
+                    stats.bytes += int64_t(e.h.message().second);
+                }
+                stats.messages += int64_t(enc.size());
+                stats.write += secs(tw);
+            });
         }
+        wait_pending();
+    }
+
+    std::future<void> pending;  // the previous output's file writes
+    void wait_pending() {
+        if (pending.valid()) pending.get();  // rethrows a write error
     }
 
     mutable std::mutex clone_mutex;
+    std::mutex stats_mutex;
 };
 
 namespace {
@@ -579,14 +627,20 @@ void GribOutput::write_initial(const std::vector<std::string>& names, const std:
 
 void GribOutput::write_step(int step_hours, const float* y) {
     const size_t V = p_->out_names.size();
-    const int64_t G = p_->G;
+    const size_t G = size_t(p_->G);
+    // y is (G, V): transpose it once, in cache-sized blocks, so that every message reads its variable
+    // contiguously (a strided gather per message streams all of y through memory V times).
+    std::vector<float>& yt = p_->transposed;
+    yt.resize(G * V);
+    constexpr size_t B = 256;
+#pragma omp parallel for schedule(static)
+    for (size_t g0 = 0; g0 < G; g0 += B) {
+        const size_t g1 = std::min(G, g0 + B);
+        for (size_t j = 0; j < V; ++j)
+            for (size_t g = g0; g < g1; ++g) yt[j * G + g] = y[g * V + j];
+    }
     p_->write_state(
-        p_->out_names,
-        [&](size_t j) {
-            std::vector<float> col(static_cast<size_t>(G));
-            for (int64_t g = 0; g < G; ++g) col[size_t(g)] = y[size_t(g) * V + j];
-            return col;
-        },
+        p_->out_names, [&](size_t j) { return std::vector<float>(yt.begin() + j * G, yt.begin() + (j + 1) * G); },
         step_hours);
 }
 
@@ -594,6 +648,8 @@ void GribOutput::close() {
     for (auto& s : p_->streams)
         for (auto& [path, w] : s.writers) w->close();
 }
+
+GribOutput::Stats GribOutput::stats() const { return p_->stats; }
 
 std::vector<std::string> GribOutput::files() const {
     std::vector<std::string> out;

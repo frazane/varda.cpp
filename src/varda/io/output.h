@@ -91,6 +91,16 @@ public:
 
     // Files created so far (final names), in creation order, per output.
     std::vector<std::string> files() const;
+
+    // Cumulative wall seconds since construction: top-level post-processors, message encoding
+    // (parallel over the messages of a state), and file writes (in order).
+    struct Stats {
+        double post = 0, encode = 0, write = 0;
+        // CPU seconds summed over threads, per part of a message's encoding
+        double cpu_gather = 0, cpu_keys = 0, cpu_pack = 0, cpu_check = 0;
+        int64_t messages = 0, bytes = 0;
+    };
+    Stats stats() const;
     int64_t n_points() const { return G_; }
 
 private:
