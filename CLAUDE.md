@@ -14,6 +14,8 @@
   `docs/spec-io.md`: the I/O spec. `docs/realdata-reference.md`: the anemoi-inference reference run and dumps.
   `docs/io-input.md`: GRIB -> x0. `docs/io-output.md`: y -> GRIB, io config.
 - `docs/results.md`: parity and benchmark numbers, each with its full configuration.
+- `docs/quickstart.md`: the user entrypoint (`./varda setup|fetch|forecast`), the assets bundle
+  (`tools/make_assets.py`) and the input fetch (`python/fetch_inputs.py`).
 - The maths is specified in the Python project (read-only, `$IE_ROOT` =
   `$HOME/projects/the Python project`): `docs/spec-model.md` (encoder, processor,
   decoder), `docs/spec-interface.md` (normaliser, residual, bounding, index spaces),

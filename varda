@@ -1,0 +1,256 @@
+#!/usr/bin/env bash
+# varda: a Varda-single-1.0 forecast from real data in three commands (docs/quickstart.md).
+#
+#   ./varda setup                       build (build/, CUDA + GRIB) and check the assets bundle (create it here)
+#   ./varda fetch DATE|latest           download the inputs of one date into the input cache
+#   ./varda forecast DATE|latest [--lead-time H] [--precision fp16|fp32] [--device cuda|cpu] [--out DIR]
+#                                [-- extra varda-forecast options]
+#
+# DATE is the initial time in UTC, e.g. 2026-10-22T15 (hour 00, 03, ..., 21); `latest` is the newest KENDA-CH1
+# analysis with t-6h also published. Outputs: DIR/outputs/*.grib (default DIR: ./varda-out/<YYYYmmddTHH>),
+# DIR/forecast.json, DIR/varda-forecast.log.
+#
+# Environment (all optional):
+#   VARDA_ENV        file sourced first (default: tools/env.sh of this repo; "none": nothing)
+#   VARDA_ASSETS     assets bundle (default: $VARDA_SCRATCH/assets/varda-single-1.0)
+#   VARDA_INPUTS     input cache root, one directory per date (default: $VARDA_SCRATCH/inputs)
+#   VARDA_BUILD      build directory (default: build/ of this repo)
+#   VARDA_PYTHON     python >= 3.9 for the fetch and assets tools (default: .venv/bin/python, else python3)
+#   VARDA_SRUN_ARGS  srun options when not inside a Slurm allocation
+#                    (default GPU: -p debug -A $ACCOUNT --gres=gpu:1 -c 32 --mem=200G --time=00:30:00)
+#   VARDA_SRUN       0: never use srun, run on this node
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+die() { echo "varda: $*" >&2; exit 1; }
+say() { echo "varda: $*" >&2; }
+
+usage() {
+    awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
+    exit "${1:-2}"
+}
+
+# ---- environment -----------------------------------------------------------------------------------------
+if [[ "${VARDA_ENV:-}" != none ]]; then
+    env_file="${VARDA_ENV:-$REPO/tools/env.sh}"
+    [[ -f "$env_file" ]] || die "VARDA_ENV=$env_file: no such file (VARDA_ENV=none to skip)"
+    # shellcheck disable=SC1090
+    source "$env_file"
+fi
+DATA="${VARDA_SCRATCH:-$HOME/.cache/varda}"
+ASSETS="${VARDA_ASSETS:-$DATA/assets/varda-single-1.0}"
+INPUTS="${VARDA_INPUTS:-$DATA/inputs}"
+BUILD="${VARDA_BUILD:-$REPO/build}"
+export VARDA_ASSETS="$ASSETS" VARDA_INPUTS="$INPUTS"
+
+python_bin() {
+    local cands=()
+    [[ -n "${VARDA_PYTHON:-}" ]] && cands+=("$VARDA_PYTHON")
+    cands+=("$REPO/.venv/bin/python" python3 python)
+    for p in "${cands[@]}"; do
+        if command -v "$p" >/dev/null 2>&1 &&
+            "$p" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' 2>/dev/null; then
+            echo "$p"
+            return
+        fi
+    done
+    die "no python >= 3.9 found (set VARDA_PYTHON); the fetch and assets tools need only the standard library"
+}
+
+# ---- setup -----------------------------------------------------------------------------------------------
+cmd_setup() {
+    local rebuild=0
+    for a in "$@"; do
+        case "$a" in
+            --rebuild) rebuild=1 ;;
+            -h|--help) usage 0 ;;
+            *) die "setup: unknown option $a" ;;
+        esac
+    done
+    if [[ $rebuild == 1 || ! -x "$BUILD/varda-forecast" ]]; then
+        command -v cmake >/dev/null || die "cmake not found"
+        say "building into $BUILD (CUDA + GRIB) ..."
+        cmake -S "$REPO" -B "$BUILD" -DCMAKE_BUILD_TYPE=Release -DVARDA_GRIB=ON >"$BUILD.cmake.log" 2>&1 ||
+            { tail -20 "$BUILD.cmake.log" >&2; die "cmake configure failed (log: $BUILD.cmake.log)"; }
+        cmake --build "$BUILD" -j "$(nproc)" >>"$BUILD.cmake.log" 2>&1 ||
+            { tail -30 "$BUILD.cmake.log" >&2; die "build failed (log: $BUILD.cmake.log)"; }
+        mv "$BUILD.cmake.log" "$BUILD/varda-build.log"
+        [[ -x "$BUILD/varda-forecast" ]] ||
+            die "the build has no varda-forecast: ecCodes not found? set ECCODES_HOME (log: $BUILD/varda-build.log)"
+        grep -q 'CMAKE_CUDA_COMPILER:' "$BUILD/CMakeCache.txt" && grep -q '^CMAKE_CUDA_COMPILER:.*nvcc' "$BUILD/CMakeCache.txt" ||
+            say "note: built without CUDA (no nvcc found): only --device cpu will work"
+        say "built $BUILD/varda-forecast"
+    else
+        say "build: $BUILD/varda-forecast present (./varda setup --rebuild to rebuild)"
+    fi
+
+    local py
+    py="$(python_bin)"
+    if [[ -d "$ASSETS" ]]; then
+        say "checking the assets bundle $ASSETS (sha256 of every file) ..."
+        "$py" -I "$REPO/tools/make_assets.py" check --dest "$ASSETS" ||
+            die "the assets bundle is incomplete or altered (above); move it away and run ./varda setup again"
+    else
+        say "no assets bundle at $ASSETS"
+        if "$py" -I "$REPO/tools/make_assets.py" link --dest "$ASSETS" 2>"$DATA/.make_assets.err.$$"; then
+            rm -f "$DATA/.make_assets.err.$$"
+        else
+            sed 's/^/  /' "$DATA/.make_assets.err.$$" >&2
+            rm -f "$DATA/.make_assets.err.$$"
+            cat >&2 <<EOF
+varda: the bundle could not be assembled from existing files on this machine. Build it from scratch
+       (docs/quickstart.md, section "Assets from scratch"), on a compute node:
+         $py -I tools/make_assets.py build --hf HF_DOWNLOAD_DIR --dest $ASSETS --grib IFS_FILE.grib2
+       or point VARDA_ASSETS at an existing bundle.
+EOF
+            exit 1
+        fi
+    fi
+    say "ready. Next: ./varda forecast latest"
+}
+
+# ---- fetch -----------------------------------------------------------------------------------------------
+# prints the input directory of DATE on stdout
+fetch_dir() {
+    local date="$1"
+    shift
+    local py io=()
+    py="$(python_bin)"
+    [[ -f "$ASSETS/varda-io.json" ]] && io=(--io-config "$ASSETS/varda-io.json")
+    "$py" -I "$REPO/python/fetch_inputs.py" "$date" --root "$INPUTS" "${io[@]}" "$@"
+}
+
+cmd_fetch() {
+    [[ $# -ge 1 ]] || usage
+    [[ "$1" == -h || "$1" == --help ]] && usage 0
+    fetch_dir "$@"
+}
+
+# ---- forecast --------------------------------------------------------------------------------------------
+cmd_forecast() {
+    [[ $# -ge 1 ]] || usage
+    [[ "$1" == -h || "$1" == --help ]] && usage 0
+    local date="$1"
+    shift
+    local lead="" precision=fp16 device=cuda out="" extra=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --lead-time) lead="${2:?--lead-time needs hours}"; shift 2 ;;
+            --precision) precision="${2:?}"; shift 2 ;;
+            --device) device="${2:?}"; shift 2 ;;
+            --out) out="${2:?}"; shift 2 ;;
+            --) shift; extra=("$@"); break ;;
+            -h|--help) usage 0 ;;
+            *) die "forecast: unknown option $1 (varda-forecast options go after --)" ;;
+        esac
+    done
+    case "$precision" in fp16|fp32) ;; *) die "--precision must be fp16 or fp32" ;; esac
+    case "$device" in cuda|cpu) ;; *) die "--device must be cuda or cpu" ;; esac
+    if [[ -n "$lead" ]]; then
+        case "$lead" in
+            *d) lead=$(( ${lead%d} * 24 )) ;;
+            *h) lead="${lead%h}" ;;
+        esac
+        [[ "$lead" =~ ^[0-9]+$ && $lead -gt 0 && $((lead % 6)) == 0 ]] ||
+            die "--lead-time must be a positive multiple of 6 hours (e.g. 24, 48h, 5d)"
+    fi
+
+    [[ -x "$BUILD/varda-forecast" ]] || die "no $BUILD/varda-forecast: run ./varda setup first"
+    [[ -f "$ASSETS/manifest.json" ]] || die "no assets bundle at $ASSETS: run ./varda setup first"
+
+    # where to run: here inside an allocation (or VARDA_SRUN=0), else through srun (decided before any download)
+    local launch=()
+    if [[ -z "${SLURM_JOB_ID:-}" && "${VARDA_SRUN:-1}" != 0 ]]; then
+        command -v srun >/dev/null ||
+            die "not in a Slurm allocation and no srun: run on a GPU machine with VARDA_SRUN=0"
+        local def="-p debug -A $ACCOUNT --gres=gpu:1 -c 32 --mem=200G --time=00:30:00"
+        [[ "$device" == cpu ]] && def="-p cpu-short -A $ACCOUNT -c 64 --mem=200G --time=01:00:00"
+        # shellcheck disable=SC2206
+        launch=(srun ${VARDA_SRUN_ARGS:-$def} --job-name=varda-forecast)
+    elif [[ "$device" == cuda ]]; then
+        if ! nvidia-smi -L 2>/dev/null | grep -q GPU; then
+            die "no GPU visible on $(hostname)${SLURM_JOB_ID:+ (allocation $SLURM_JOB_ID)}: request one" \
+                "(--gres=gpu:1), leave the allocation so ./varda uses srun, or pass --device cpu"
+        fi
+    fi
+    # 1. inputs, on this node (it needs the network unless the date is already cached)
+    local indir
+    indir="$(fetch_dir "$date")" || die "could not get the inputs for $date (above)"
+    local tag
+    tag="$(basename "$indir")"
+    [[ -n "$out" ]] || out="$PWD/varda-out/$tag"
+    mkdir -p "$out"
+    out="$(cd "$out" && pwd)"
+
+    # 2. a private copy of the binary (a rebuild during the run must not touch it)
+    mkdir -p "$DATA/jobs"
+    PRIV="$(mktemp -d "$DATA/jobs/varda-forecast-$tag-XXXXXX")"  # global: the EXIT trap runs after this function
+    trap 'rm -f "$PRIV/varda-forecast"; rmdir "$PRIV" 2>/dev/null || true' EXIT
+    cp "$BUILD/varda-forecast" "$PRIV/varda-forecast"
+
+    local args=(--assets "$ASSETS" --realdata "$indir" --out "$out" --device "$device" --precision "$precision"
+                --quiet)
+    [[ -n "$lead" ]] && args+=(--lead-time-hours "$lead")
+    args+=("${extra[@]}")
+
+    [[ ${#launch[@]} -gt 0 ]] && say "running on a compute node: ${launch[*]}"
+    say "forecast $tag: inputs $indir"
+    say "            outputs $out"
+    local log="$out/varda-forecast.log" rc=0
+    {
+        echo "# $(date -u +%FT%TZ) ${launch[*]} varda-forecast ${args[*]}"
+    } >"$log"
+    set +e
+    "${launch[@]}" "$PRIV/varda-forecast" "${args[@]}" 2>&1 | tee -a "$log"
+    rc=${PIPESTATUS[0]}
+    set -e
+    if [[ $rc != 0 ]]; then
+        if grep -qiE 'no CUDA|cuda.*(device|driver)|CUDA error' "$log"; then
+            die "varda-forecast failed: no usable GPU on the node (log: $log). Check VARDA_SRUN_ARGS or use --device cpu"
+        fi
+        die "varda-forecast failed (exit $rc); log: $log"
+    fi
+    summary "$out" "$indir"
+}
+
+summary() {
+    local out="$1" indir="$2" py
+    py="$(python_bin)"
+    "$py" -I - "$out" "$indir" <<'EOF'
+import json, os, sys
+out, indir = sys.argv[1], sys.argv[2]
+r = json.load(open(os.path.join(out, "forecast.json")))
+p = json.load(open(os.path.join(indir, "pins.json")))
+s = r["seconds"]
+files = sorted(r["files"])
+size = sum(os.path.getsize(f if os.path.isabs(f) else os.path.join(out, f)) for f in files)
+steps = ", ".join(f"{x:.0f}" for x in r["step_ms"])
+c = p["constant_forcings_run"]
+dates = ", ".join(f"{k[11:13]}Z <- {v['init'][:13].replace('T', ' ')}Z+{v['step']}h" for k, v in p["input_dates"].items())
+print()
+print(f"Varda forecast from {r['date']}, {r['n_steps']} steps of 6 h, {r['device']} {r['precision']}")
+print(f"  outputs   {out}/outputs/  ({len(files)} GRIB files, {size / 1e9:.2f} GB, "
+      f"{s['grib']['messages']} messages)")
+print(f"            lam (ICON-CH1 grid): {os.path.basename(min(f for f in files if 'global-' not in os.path.basename(f)))} ...")
+print(f"            global (N320):       {os.path.basename(min(f for f in files if 'global-' in os.path.basename(f)))} ...")
+print(f"  inputs    {indir}")
+print(f"            IFS {dates}; constants {c['init'][:13].replace('T', ' ')}Z+0h")
+print(f"  time      {s['total']:.1f} s in all: ready after {s['ready']:.1f} s (input {s['input']:.1f} s, "
+      f"weights {s['load']:.1f} s), rollout {s['rollout']:.1f} s ({steps} ms per step), "
+      f"last write {s['write_after_rollout']:.1f} s")
+print(f"  details   {out}/forecast.json, {out}/varda-forecast.log")
+EOF
+}
+
+# ---- main ------------------------------------------------------------------------------------------------
+[[ $# -ge 1 ]] || usage
+cmd="$1"
+shift
+case "$cmd" in
+    setup) cmd_setup "$@" ;;
+    fetch) cmd_fetch "$@" ;;
+    forecast) cmd_forecast "$@" ;;
+    -h|--help|help) usage 0 ;;
+    *) die "unknown command $cmd (setup, fetch, forecast)" ;;
+esac

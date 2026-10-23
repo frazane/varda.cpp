@@ -257,3 +257,11 @@ reports failures at tolerance 0 (by construction; with `--rel-tol` set to the sc
 verdict). The verdict on the model output is 5.4; `OUT/y.safetensors` (`--dump-y`) must equal the `y` of
 `varda-rollout --out` bitwise (job 285378). Rerun with the same arguments: the bytes must equal. Jobs copy the
 binaries first (`$VARDA_SCRATCH/jobs/<name>/bin`).
+
+## Entrypoint check
+
+`./varda forecast 2026-10-22T15` with `VARDA_INPUTS` pointing at a directory holding the frozen date (symlink
+`20261022T15 -> $VARDA_SCRATCH/realdata/20261022T15`) must give step-0 files byte-identical to
+`$VARDA_SCRATCH/realdata/20261022T15/ref-fp16/outputs/*_0.grib` and all 10 files byte-identical to `varda-forecast` run
+with explicit flags (jobs 285865, 285942: 10/10). `tools/make_assets.py check` verifies the assets bundle.
+

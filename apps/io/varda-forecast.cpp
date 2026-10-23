@@ -3,12 +3,17 @@
 // the autoregressive rollout (docs/rollout-engine.md), then the lam (ICON templates) and global (IFS
 // templates) GRIB files per step, including the initial state (varda::io::GribOutput).
 //
-//   varda-forecast --model M.safetensors --io-config varda-io.json --regrid-matrix R.safetensors
-//                  --templates HF_TEMPLATES_DIR --out DIR
+//   varda-forecast ( --assets BUNDLE | --model M.safetensors --io-config varda-io.json
+//                    --regrid-matrix R.safetensors --templates HF_TEMPLATES_DIR [--definitions D] )
+//                  --out DIR
 //                  ( --realdata DIR | --date T --kenda DIR --ifs-prev F.. --ifs F.. --ifs-constants F.. )
 //                  [--lead-time-hours H] [--device cuda|cpu] [--precision fp16|fp32] [--no-graph]
-//                  [--host-loop] [--definitions D] [--allow-nans] [--threads N] [--dump-y]
-//                  [--write-queue N]
+//                  [--host-loop] [--allow-nans] [--threads N] [--dump-y] [--write-queue N] [--quiet]
+//
+// --assets BUNDLE fills the five model-release files from one directory (docs/quickstart.md):
+// BUNDLE/model.safetensors, BUNDLE/varda-io.json, BUNDLE/regrid-ifs0p25-n320.safetensors,
+// BUNDLE/templates and BUNDLE/definitions. An explicit option overrides its bundle entry.
+// --quiet leaves the input log (every file and message used) out of stdout; it stays in forecast.json.
 //
 // DIR receives the GRIB files under the configured relative paths (outputs/<dateTime>_<step>.grib); DIR/forecast.json the provenance and
 // timings. --dump-y also writes DIR/y.safetensors (`y.<step>` F32 [G, V_out], the model outputs
@@ -54,10 +59,13 @@ using namespace varda::io;
 
 [[noreturn]] void usage() {
     std::fprintf(stderr,
-                 "usage: varda-forecast --model M --io-config J --regrid-matrix R --templates DIR --out DIR\n"
-                 "         (--realdata DIR | --date T --kenda DIR --ifs-prev F.. --ifs F.. --ifs-constants F..)\n"
+                 "usage: varda-forecast (--assets BUNDLE | --model M --io-config J --regrid-matrix R --templates DIR)\n"
+                 "         --out DIR (--realdata DIR | --date T --kenda DIR --ifs-prev F.. --ifs F.. --ifs-constants F..)\n"
                  "         [--lead-time-hours H] [--device cuda|cpu] [--precision fp16|fp32] [--no-graph]\n"
-                 "         [--host-loop] [--definitions D] [--allow-nans] [--threads N] [--dump-y]\n");
+                 "         [--host-loop] [--definitions D] [--allow-nans] [--threads N] [--dump-y]\n"
+                 "         [--write-queue N] [--quiet]\n"
+                 "  --assets BUNDLE: model.safetensors, varda-io.json, regrid-ifs0p25-n320.safetensors, templates/,\n"
+                 "                   definitions/ of BUNDLE (explicit options override)\n");
     std::exit(2);
 }
 
@@ -165,10 +173,10 @@ private:
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string model_path, io_config_path, templates, out_dir, realdata, device = "cuda", precision = "fp16";
+    std::string model_path, io_config_path, templates, out_dir, realdata, assets, device = "cuda", precision = "fp16";
     InputFiles files;
     int lead_hours = 0, threads = 0;
-    bool graph = true, host_loop = false, dump_y = false;
+    bool graph = true, host_loop = false, dump_y = false, quiet = false;
     size_t write_queue = 0;  // 0: min(steps, 8)
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -176,7 +184,8 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) usage();
             return argv[++i];
         };
-        if (a == "--model") model_path = next();
+        if (a == "--assets") assets = next();
+        else if (a == "--model") model_path = next();
         else if (a == "--io-config") io_config_path = next();
         else if (a == "--regrid-matrix") files.regrid_matrix = next();
         else if (a == "--templates") templates = next();
@@ -197,7 +206,31 @@ int main(int argc, char** argv) {
         else if (a == "--threads") threads = std::stoi(next());
         else if (a == "--dump-y") dump_y = true;
         else if (a == "--write-queue") write_queue = size_t(std::stoul(next()));
+        else if (a == "--quiet") quiet = true;
         else usage();
+    }
+    if (!assets.empty()) {
+        // The assets bundle (tools/make_assets.py): fixed names; explicit options win.
+        while (assets.size() > 1 && assets.back() == '/') assets.pop_back();
+        struct stat sb;
+        if (::stat(assets.c_str(), &sb) != 0 || !S_ISDIR(sb.st_mode)) {
+            std::fprintf(stderr, "varda-forecast: --assets %s: not a directory\n", assets.c_str());
+            return 1;
+        }
+        auto fill = [&](std::string& v, const char* name) {
+            if (!v.empty()) return;
+            v = assets + "/" + name;
+            if (::stat(v.c_str(), &sb) != 0) {
+                std::fprintf(stderr, "varda-forecast: assets bundle %s has no %s (tools/make_assets.py check)\n",
+                             assets.c_str(), name);
+                std::exit(1);
+            }
+        };
+        fill(model_path, "model.safetensors");
+        fill(io_config_path, "varda-io.json");
+        fill(files.regrid_matrix, "regrid-ifs0p25-n320.safetensors");
+        fill(templates, "templates");
+        fill(files.cosmo_definitions, "definitions");
     }
     if (model_path.empty() || io_config_path.empty() || files.regrid_matrix.empty() || templates.empty() ||
         out_dir.empty())
@@ -284,7 +317,8 @@ int main(int argc, char** argv) {
         input_thread.join();
         if (input_err) std::rethrow_exception(input_err);
         const double ready_s = app::now_s() - t_start;
-        for (const auto& l : in.log) std::printf("  %s\n", l.c_str());
+        if (!quiet)
+            for (const auto& l : in.log) std::printf("  %s\n", l.c_str());
         std::printf("input for %s prepared in %.2f s; rollout set up in %.2f s; ready after %.2f s\n",
                     varda::format_iso8601_utc(in.date0).c_str(), input_s, setup_s, ready_s);
 
@@ -341,6 +375,12 @@ int main(int argc, char** argv) {
                                                      {"date", varda::format_iso8601_utc(in.date0)}}).dump()}});
         }
         json rep = {{"model", model_path},
+                    {"assets", assets},
+                    {"io_config", io_config_path},
+                    {"regrid_matrix", files.regrid_matrix},
+                    {"templates", templates},
+                    {"definitions", files.cosmo_definitions},
+                    {"realdata", realdata},
                     {"checkpoint_uuid", mc.uuid},
                     {"date", varda::format_iso8601_utc(in.date0)},
                     {"device", device},

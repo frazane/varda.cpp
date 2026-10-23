@@ -29,82 +29,22 @@ import os
 import sys
 from datetime import datetime, timedelta
 
-import requests
+# Shared with python/fetch_inputs.py: HTTP (stdlib), STAC queries, the notebook's date rule, the ECMWF run rule.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))  # python/ (-I safe)
+from opendata import (  # noqa: E402
+    HF_REPO, atomic_write_json, download, get_json, icon_collection, pick_latest_kenda, resolve, stac_items,
+)
 
 VARDA_SCRATCH = os.environ.get("VARDA_SCRATCH", "$VARDA_SCRATCH")
-STAC = "https://data.geo.admin.ch/api/stac/v1"
-KENDA = "ch.meteoschweiz.ogd-analysis-kenda-ch1"
-ICON = "ch.meteoschweiz.ogd-forecasting-icon-ch1"
-HF_REPO = "MeteoSwiss/Varda-single-1.0"
-
-# ECMWF open-data facts, copied from anemoi_plugins_meteoswiss/inference/inputs/oper_ecmwf_opendata.py
-FREQUENCY_H, STEP_H, MAX_LEAD_TIME_H, STORED_RUNS = 6, 3, 144, 12
 
 
 def root(date: datetime) -> str:
     return os.path.join(VARDA_SCRATCH, "realdata", date.strftime("%Y%m%dT%H"))
 
 
-def atomic_write_bytes(path: str, data: bytes) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.part"
-    with open(tmp, "wb") as f:
-        f.write(data)
-    os.replace(tmp, path)
-
-
-def atomic_write_json(path: str, obj) -> None:
-    atomic_write_bytes(path, (json.dumps(obj, indent=2, sort_keys=True, default=str) + "\n").encode())
-
-
-def download(href: str, path: str) -> str:
-    if os.path.exists(path):
-        return f"keep {path}"
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.part"
-    with requests.get(href, stream=True, timeout=120) as r:
-        r.raise_for_status()
-        with open(tmp, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1 << 22):
-                f.write(chunk)
-    os.replace(tmp, path)
-    return f"got  {path} ({os.path.getsize(path) / 1e6:.1f} MB)"
-
-
-def stac_items(valid_time: datetime) -> list[dict]:
-    """Same query as oper_kenda_opendata._stac_items."""
-    url = f"{STAC}/collections/{KENDA}/items"
-    params = {"datetime": valid_time.strftime("%Y-%m-%dT%H:%M:%SZ"), "limit": 100}
-    out = []
-    while url:
-        r = requests.get(url, params=params, timeout=30)
-        r.raise_for_status()
-        page = r.json()
-        out += page.get("features", [])
-        nxt = [link["href"] for link in page.get("links", []) if link.get("rel") == "next"]
-        url, params = (nxt[0], None) if nxt else (None, None)
-    return out
-
-
 def cmd_pick(args) -> None:
     """The notebook's rule: latest KENDA-CH1 analysis t (t.hour % 3 == 0) with t-6h published."""
-    features = requests.post(
-        f"{STAC}/search",
-        json={
-            "collections": [KENDA],
-            "forecast:variable": "P",
-            "forecast:horizon": "P0DT00H00M00S",
-            "forecast:perturbed": False,
-            "limit": 100,
-        },
-        timeout=60,
-    ).json()["features"]
-    available = {
-        datetime.fromisoformat(f["properties"]["forecast:reference_datetime"].split("/")[0].removesuffix("Z"))
-        for f in features
-    }
-    latest = max(t for t in available if t.hour % 3 == 0 and t - timedelta(hours=6) in available)
-    print(latest.isoformat())
+    print(pick_latest_kenda().isoformat())
 
 
 def cmd_kenda(args) -> None:
@@ -120,9 +60,7 @@ def cmd_kenda(args) -> None:
             assets = list(it["assets"].values())
             assert len(assets) == 1, it["id"]
             jobs.append((assets[0]["href"], os.path.join(base, "raw", tag, f"{var}.grib2")))
-    coll = requests.get(f"{STAC}/collections/{ICON}", timeout=30)
-    coll.raise_for_status()
-    coll = coll.json()
+    coll = icon_collection()
     atomic_write_json(os.path.join(base, "stac", "collection_icon-ch1.json"), coll)
     for name, asset in coll.get("assets", {}).items():
         if asset.get("type") == "application/grib":
@@ -130,21 +68,6 @@ def cmd_kenda(args) -> None:
     with cf.ThreadPoolExecutor(8) as ex:
         for msg in ex.map(lambda j: download(*j), jobs):
             print(msg, flush=True)
-
-
-def resolve(target: datetime, latest: datetime, allow_forecast_fallback: bool) -> tuple[datetime, int]:
-    """Copy of OperEcmwfOpenDataInput._resolve_init_time_and_lead_hours (same checks)."""
-    hour = timedelta(hours=1)
-    offset = latest - target
-    assert offset % hour == timedelta(0)
-    hours_ahead = offset // hour
-    n_back = -(-max(hours_ahead, 0) // FREQUENCY_H)
-    assert n_back <= STORED_RUNS
-    init = latest - timedelta(hours=FREQUENCY_H * n_back)
-    lead = (target - init) // hour
-    assert 0 <= lead <= MAX_LEAD_TIME_H and lead % STEP_H == 0
-    assert lead == 0 or allow_forecast_fallback
-    return init, lead
 
 
 def cmd_ecmwf(args) -> None:
@@ -193,12 +116,11 @@ def cmd_ecmwf(args) -> None:
 
 def cmd_templates(args) -> None:
     """Fetch only templates/ of the HF repo (no huggingface_hub in the ref env: plain HTTP API)."""
-    info = requests.get(f"https://huggingface.co/api/models/{HF_REPO}", timeout=30).json()
+    info = get_json(f"https://huggingface.co/api/models/{HF_REPO}", timeout=30)
     rev = info["sha"]
-    tree = requests.get(f"https://huggingface.co/api/models/{HF_REPO}/tree/{rev}/templates?recursive=true", timeout=30)
-    tree.raise_for_status()
+    tree = get_json(f"https://huggingface.co/api/models/{HF_REPO}/tree/{rev}/templates?recursive=true", timeout=30)
     dest = os.path.join(VARDA_SCRATCH, "hf")
-    for x in tree.json():
+    for x in tree:
         if x["type"] != "file":
             continue
         print(download(f"https://huggingface.co/{HF_REPO}/resolve/{rev}/{x['path']}", os.path.join(dest, x["path"])))

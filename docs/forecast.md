@@ -10,9 +10,15 @@ templates) GRIB files out, initial state included. The pieces are documented whe
 - the rollout: `docs/rollout-engine.md`.
 
 This file is the end-to-end view: how to run it, how the work overlaps, where the time goes and what is not covered.
-Numbers: `docs/results.md` section 5.
+Numbers: `docs/results.md` section 5. The user entrypoint around it (`./varda setup`, `./varda forecast latest`: build,
+assets bundle, input download, srun) is `docs/quickstart.md`.
 
 ## 1. Inputs
+
+The first five rows are derived once per model release and live together in the **assets bundle**
+`$VARDA_SCRATCH/assets/varda-single-1.0/` (`--assets DIR`; built by `tools/make_assets.py`, `docs/quickstart.md`
+section 2): `model.safetensors`, `varda-io.json`, `regrid-ifs0p25-n320.safetensors`, `templates/`, `definitions/`,
+`manifest.json`. The bundle's files are hard links of (sha256-equal to) the paths in the table.
 
 | input | what | where (verified date) |
 |---|---|---|
@@ -32,7 +38,9 @@ constant forcings (`constant: true`); for 2026-10-22T15 that was the 18z+0h file
 in `pins.json`. A re-run later would pick another run, so the C++ never decides: `--ifs-constants` names the file.
 The same holds for the IFS runs behind t-6h and t (06z+3h and 12z+3h here).
 
-**`--realdata DIR`** is the shortcut for the frozen reference cache `$VARDA_SCRATCH/realdata/20261022T15`. It reads
+**`--realdata DIR`** reads an input directory: the frozen reference cache `$VARDA_SCRATCH/realdata/20261022T15`, or
+one written by `python/fetch_inputs.py` (`$VARDA_SCRATCH/inputs/<YYYYmmddTHH>`, same layout, with only the IFS
+messages used: `docs/quickstart.md` section 2). It reads
 `DIR/pins.json` (date, `input_dates`, `ecmwf_files`, `constant_forcings_run`), takes the KENDA cache from
 `DIR/cache/kenda` and the three IFS files from `DIR/cache/ecmwf/files`. `--date` given explicitly replaces the pinned date; the file lists are always taken from the pins. Any other date uses
 the explicit options.
@@ -42,13 +50,16 @@ the explicit options.
 ```
 source tools/env.sh
 cmake -S . -B build-out && cmake --build build-out -j 32
-R=$VARDA_SCRATCH/realdata
-build-out/varda-forecast --model $VARDA_SCRATCH/converted/varda-v2/model.safetensors \
-    --io-config $R/assets/varda-io.json --regrid-matrix $R/assets/regrid-ifs0p25-n320.safetensors \
-    --templates $VARDA_SCRATCH/hf/templates --realdata $R/20261022T15 --out OUT \
-    --device cuda --precision fp16 [--lead-time-hours H] [--write-queue N] [--allow-nans] [--dump-y]
+build-out/varda-forecast --assets $VARDA_SCRATCH/assets/varda-single-1.0 \
+    --realdata $VARDA_SCRATCH/realdata/20261022T15 --out OUT \
+    --device cuda --precision fp16 [--lead-time-hours H] [--write-queue N] [--allow-nans] [--dump-y] [--quiet]
 # any date:  --date 2026-10-22T15:00:00 --kenda DIR --ifs-prev F --ifs F --ifs-constants F
+# without the bundle: --model M --io-config J --regrid-matrix R --templates DIR [--definitions D] (table above)
 ```
+
+`./varda forecast DATE` (`docs/quickstart.md`) runs exactly this, with `--assets`, `--realdata` of the date's input
+directory and `--quiet` (the input log goes to `forecast.json` only). `--assets` gives the same bytes as the
+explicit options (job 285865, `docs/quickstart.md` section 6).
 
 It needs a GPU node (or `--device cpu`, ~60 s per step in fp32, `docs/results.md` section 3). `--lead-time-hours`
 defaults to the io config's (24 h, 4 steps of 6 h) and must be a multiple of the model's step. `--no-graph` and
@@ -63,7 +74,7 @@ OUT/outputs/global-202610221500_{0,6,12,18,24}.grib   global, IFS templates (sam
 OUT/forecast.json                                     provenance and timings
 ```
 
-The 4-step forecast is 10 files, 676 messages, 1 276 890 049 bytes. `forecast.json` holds: model, checkpoint uuid, date,
+The 4-step forecast is 10 files, 676 messages, 1 276 890 049 bytes. `forecast.json` holds: model, assets, io config, regrid matrix, templates, definitions, realdata dir, checkpoint uuid, date,
 device, precision, graph, engine (`device`/`host`), threads, steps, the files written, the input log (every file and
 message used), the write queue length, `step_ms` (per step on the GPU) and `seconds`: `load`, `input` (and
 `input_stages`: `kenda`, `ifs`, `merge`, `x0`), `rollout_setup`, `ready`, `initial_state_write`, `rollout`,
@@ -133,14 +144,16 @@ run), varda.cpp 10.4 s warm (23.4 s first run), 18x warm; fp32 163 s against 41 
 ## 5. Limits
 
 - **One verified date.** Everything is verified on 2026-10-22T15 only (`docs/realdata-reference.md`). Other dates run, but
-  carry no parity claim.
+  carry no parity claim (`docs/quickstart.md` section 6 records a run of another date).
 - **Tolerances come from another date.** The rollout tolerances (`tolerances/rollout/varda.json`) were calibrated
   on the 2024-06-01 golden input. They are applied unchanged to this date (fp16: 0.49 of the per-step tolerance); they
   were not recalibrated and were not loosened.
 - **AVX-512 numpy log path unverified.** The input side reproduces numpy's float32 `log` (`logf_np`), which is the
   AVX2/FMA3 routine of the reference host (EPYC 7713, dispatch `X86_V3`). A reference produced on an AVX-512 host
   would use another routine; that case has not been checked (`docs/io-input.md` section 6).
-- **Constants run must be given.** See section 1. `--realdata` reads it from `pins.json`; there is no "latest" logic.
+- **Constants run must be given.** See section 1. `--realdata` reads it from `pins.json`; the C++ has no "latest"
+  logic. `python/fetch_inputs.py` makes the choice at download time as anemoi-inference makes it at start time (the
+  latest run) and records it.
 - **NaN policy.** The 2026-10-22 inputs give a NaN-free `x0`. A NaN in any input stops the run, naming the variable and
   the count, unless `--allow-nans` (the reference's `allow_nans: true`) is passed. In the output, NaN occurs only in the
   global files at the masked points (as a bitmap); `tp` follows the reference (negative clamp, accumulation).

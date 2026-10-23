@@ -13,6 +13,18 @@ bit-identical to the Hugging Face file (sha256 `1ad7a7a6…a9c7d8`). Its specs, 
 activations, calibrated tolerances and reference environments are reused here; this
 project replaces PyTorch with C++17, OpenMP, BLAS, CUDA and cuBLAS.
 
+## Quick start
+
+A forecast from today's open data (KENDA-CH1 + ECMWF IFS), GRIB out, on this cluster:
+
+```
+./varda setup                       # once: build, check (or create) the assets bundle
+./varda forecast latest             # or a date: ./varda forecast 2026-10-22T15 [--lead-time 48] [--precision fp32]
+```
+
+GRIB files land in `./varda-out/<YYYYmmddTHH>/outputs/`. What each step does, where data go, other machines and
+troubleshooting: `docs/quickstart.md`.
+
 ## Goals
 
 1. **Convert once, load a clean format.** `python/convert.py` turns the pickled checkpoint

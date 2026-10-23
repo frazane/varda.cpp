@@ -74,3 +74,13 @@ The Varda file differs from the bootstrap only in the header (config `source.che
 bootstrap recorded the `$VARDA_CKPT` path and its mtime; the HF copy has
 the same sha256). Varda's raw `statistics` are not the ones folded into the normaliser buffers (max rel.
 difference 28.4), as in the reference; the `unused` reason says so.
+
+## User tools (real-data forecasts)
+
+- `varda` (repo root): the entrypoint, `./varda setup | fetch | forecast` (`docs/quickstart.md`).
+- `python/fetch_inputs.py`: downloads one date's inputs (KENDA-CH1 variables and only the needed IFS open-data
+  messages, as byte ranges) into the `--realdata` layout; standard library only. Shares `python/opendata.py` with the
+  reference fetcher `python/reference/realdata/fetch_realdata.py`.
+- `tools/make_assets.py check | link | build`: verifies, assembles (hard links from verified files) or rebuilds from the
+  Hugging Face download the assets bundle that `varda-forecast --assets` reads (`docs/quickstart.md` §4).
+
