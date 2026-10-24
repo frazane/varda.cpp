@@ -1,7 +1,7 @@
 # Apple Silicon (macOS arm64)
 
 The existing CPU fp32 backend runs natively on Apple Silicon using Apple Clang,
-OpenMP and OpenBLAS. The optional native Metal/MPS backend runs fp32 inference on
+OpenMP and OpenBLAS. The optional native Metal/MPS backend runs fp32 and mixed-fp16 inference on
 the Apple GPU; see [metal.md](metal.md). CUDA remains NVIDIA-only. CPU arithmetic
 and numerical tolerances are unchanged.
 

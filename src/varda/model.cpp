@@ -66,8 +66,6 @@ std::unique_ptr<Model> Model::load(const std::string& path, const Options& opts)
 #endif
     } else if (opts.device == Device::Metal) {
 #ifdef VARDA_WITH_METAL
-        if (opts.precision != Precision::FP32)
-            throw std::runtime_error("the Metal backend runs fp32 only");
         m->backend_ = make_metal_backend(m->cfg_, *m->file_, opts);
 #else
         throw std::runtime_error("varda.cpp was built without Metal (VARDA_METAL=OFF)");

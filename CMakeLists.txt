@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 project(varda LANGUAGES CXX)
 
 option(VARDA_CUDA "Build the CUDA backend" ON)
-option(VARDA_METAL "Build the Apple Silicon Metal fp32 backend" ${APPLE})
+option(VARDA_METAL "Build the Apple Silicon Metal fp32/mixed-fp16 backend" ${APPLE})
 option(VARDA_NATIVE "Tune CPU code for the build host (-march=native)" OFF)
 option(VARDA_GRIB "Build the GRIB input/output layer (needs ecCodes, ECCODES_HOME)" ON)
 

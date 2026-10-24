@@ -1,4 +1,4 @@
-// Native Metal fp32 inference. MPS handles dense GEMMs; graph attention and all
+// Native Metal fp32/mixed-fp16 inference. MPS handles dense GEMMs; graph attention and all
 // elementwise operations run as Metal compute kernels. No CPU compute fallback.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -52,14 +52,26 @@ static_assert(sizeof(Args) == 40, "Metal parameter layout");
 struct Tensor {
     id<MTLBuffer> buffer = nil;
     NSUInteger offset = 0;
-    Tensor sub(int64_t floats) const {
+    NSUInteger element_size = sizeof(float);
+    Tensor sub(int64_t elements) const {
         Tensor t = *this;
-        t.offset += static_cast<NSUInteger>(floats) * sizeof(float);
+        t.offset += static_cast<NSUInteger>(elements) * element_size;
         return t;
     }
-    float* data() const { return reinterpret_cast<float*>(static_cast<char*>(buffer.contents) + offset); }
+    float* data() const {
+        if (element_size != sizeof(float)) throw std::runtime_error("expected an fp32 host tensor");
+        return reinterpret_cast<float*>(static_cast<char*>(buffer.contents) + offset);
+    }
+    void read(float* out, size_t n) const {
+        const char* p = static_cast<const char*>(buffer.contents) + offset;
+        if (element_size == sizeof(float)) std::memcpy(out, p, n * sizeof(float));
+        else {
+            const auto* half = reinterpret_cast<const _Float16*>(p);
+            for (size_t i = 0; i < n; ++i) out[i] = static_cast<float>(half[i]);
+        }
+    }
 };
-struct Linear { Tensor w, b; int64_t out = 0, in = 0; };
+struct Linear { Tensor w, b; int64_t out = 0, in = 0; NSUInteger row_bytes = 0; };
 struct Norm { Tensor w, b; };
 struct Block {
     Linear q, k, v, self, edge, proj, mlp1, mlp2;
@@ -78,10 +90,10 @@ public:
 
 private:
     Tensor bytes(size_t n, const void* source = nullptr);
-    Tensor floats(int64_t n) { u(n); return bytes(static_cast<size_t>(n) * sizeof(float)); }
     template<class T> Tensor upload(const std::vector<T>& v) { return bytes(v.size() * sizeof(T), v.data()); }
-    Tensor arena(const std::string& name, int64_t n);
-    Linear load_linear(SafeTensorsFile& f, const std::string& name, int64_t out, int64_t in);
+    Tensor half_data(const float* source, int64_t rows, int64_t cols, int64_t stride);
+    Tensor arena(const std::string& name, int64_t n, bool half = false);
+    Linear load_linear(SafeTensorsFile& f, const std::string& name, int64_t out, int64_t in, bool edge = false);
     Norm load_norm(SafeTensorsFile& f, const std::string& name);
     Block load_block(SafeTensorsFile& f, const std::string& name, bool mapper);
     Graph load_graph(SafeTensorsFile& f, const std::string& name, int64_t src, int64_t dst);
@@ -101,6 +113,7 @@ private:
     void run(const float* x, float* y, const ActivationHook* hook);
 
     Config cfg_;
+    bool fp16_;
     int64_t C_, G_, H_, F_, chunk_;
     id<MTLDevice> device_;
     id<MTLCommandQueue> queue_;
@@ -111,6 +124,7 @@ private:
     std::map<std::string, Tensor> arena_;
     Tensor mul_in_, add_in_, mul_out_, add_out_, data_attr_, hidden_attr_, residual_in_, residual_out_;
     Tensor keys_, values_, scores_, ln_, q_, self_, attention_, residual_, hidden_;
+    Tensor gemm_input_, gemm_result_;
     Linear enc_src_, enc_dst_, dec_dst_, out_proj_;
     Norm out_norm_;
     Block enc_, dec_;
@@ -120,7 +134,7 @@ private:
 };
 
 Tensor MetalBackend::bytes(size_t n, const void* source) {
-    u(n / sizeof(float));  // every GPU buffer stores 32-bit floats or indices
+    u(n / sizeof(float));  // element counts are checked separately for fp16 storage
     const size_t size = std::max(n, sizeof(float));
     if (size > device_.maxBufferLength)
         throw std::runtime_error("Metal buffer exceeds this GPU's maxBufferLength");
@@ -134,19 +148,38 @@ Tensor MetalBackend::bytes(size_t n, const void* source) {
     return {buffer, 0};
 }
 
-Tensor MetalBackend::arena(const std::string& name, int64_t n) {
-    Tensor& t = arena_[name];
+Tensor MetalBackend::half_data(const float* source, int64_t rows, int64_t cols, int64_t stride) {
+    const int64_t n = rows * stride;
     u(n);
-    if (!t.buffer || t.buffer.length < static_cast<size_t>(n) * sizeof(float)) t = floats(n);
+    Tensor t = bytes(static_cast<size_t>(n) * sizeof(_Float16));
+    t.element_size = sizeof(_Float16);
+    auto* dest = static_cast<_Float16*>(t.buffer.contents);
+    std::fill_n(dest, n, _Float16(0));
+    for (int64_t r = 0; r < rows; ++r)
+        for (int64_t c = 0; c < cols; ++c) dest[r * stride + c] = static_cast<_Float16>(source[r * cols + c]);
     return t;
 }
 
-Linear MetalBackend::load_linear(SafeTensorsFile& f, const std::string& name, int64_t out, int64_t in) {
+Tensor MetalBackend::arena(const std::string& name, int64_t n, bool half) {
+    Tensor& t = arena_[name];
+    u(n);
+    const size_t element_size = half ? sizeof(_Float16) : sizeof(float);
+    if (!t.buffer || t.buffer.length < static_cast<size_t>(n) * element_size || t.element_size != element_size) {
+        t = bytes(static_cast<size_t>(n) * element_size);
+        t.element_size = element_size;
+    }
+    return t;
+}
+
+Linear MetalBackend::load_linear(SafeTensorsFile& f, const std::string& name, int64_t out, int64_t in, bool edge) {
     const TensorView& w = f.take(name + ".weight", DType::F32, {out, in});
-    Linear l{bytes(w.nbytes, w.data), {}, out, in};
+    const NSUInteger row_bytes = fp16_ ? (edge ? in * sizeof(_Float16) :
+        [MPSMatrixDescriptor rowBytesFromColumns:in dataType:MPSDataTypeFloat16]) : in * sizeof(float);
+    Linear l{fp16_ ? half_data(w.as<float>(), out, in, row_bytes / sizeof(_Float16)) : bytes(w.nbytes, w.data),
+             {}, out, in, row_bytes};
     if (!cfg_.is_absent(name + ".bias")) {
         const TensorView& b = f.take(name + ".bias", DType::F32, {out});
-        l.b = bytes(b.nbytes, b.data);
+        l.b = fp16_ ? half_data(b.as<float>(), 1, out, out) : bytes(b.nbytes, b.data);
     }
     return l;
 }
@@ -167,7 +200,7 @@ Block MetalBackend::load_block(SafeTensorsFile& f, const std::string& name, bool
     b.k = load_linear(f, name + ".k", C_, C_);
     b.v = load_linear(f, name + ".v", C_, C_);
     b.self = load_linear(f, name + ".self", C_, C_);
-    b.edge = load_linear(f, name + ".edge", C_, cfg_.edge_attr_dim);
+    b.edge = load_linear(f, name + ".edge", C_, cfg_.edge_attr_dim, true);
     b.proj = load_linear(f, name + ".proj", C_, C_);
     b.mlp1 = load_linear(f, name + ".mlp1", cfg_.mlp_hidden, C_);
     b.mlp2 = load_linear(f, name + ".mlp2", C_, cfg_.mlp_hidden);
@@ -190,15 +223,15 @@ Graph MetalBackend::load_graph(SafeTensorsFile& f, const std::string& name, int6
     g.rows = upload(g.host.row_ptr);
     g.sources = upload(g.host.src);
     g.destinations = upload(dest);
-    g.attrs = upload(g.host.attr);
+    g.attrs = fp16_ ? half_data(g.host.attr.data(), 1, g.host.attr.size(), g.host.attr.size()) : upload(g.host.attr);
     return g;
 }
 
 MetalBackend::MetalBackend(const Config& cfg, SafeTensorsFile& f, const Options& opts)
-    : cfg_(cfg), C_(cfg.num_channels), G_(cfg.n_data_nodes), H_(cfg.n_hidden_nodes), F_(cfg.src_features()),
+    : cfg_(cfg), fp16_(opts.precision == Precision::FP16), C_(cfg.num_channels), G_(cfg.n_data_nodes),
+      H_(cfg.n_hidden_nodes), F_(cfg.src_features()),
       chunk_(8192) {
     @autoreleasepool {
-        if (opts.precision != Precision::FP32) throw std::runtime_error("the Metal backend runs fp32 only");
         device_ = MTLCreateSystemDefaultDevice();
         if (!device_ || !device_.hasUnifiedMemory)
             throw std::runtime_error("no unified-memory Metal GPU is available; use --device cpu");
@@ -221,12 +254,16 @@ MetalBackend::MetalBackend(const Config& cfg, SafeTensorsFile& f, const Options&
 #endif
         compile.languageVersion = MTLLanguageVersion2_3;
         NSError* error = nil;
-        id<MTLLibrary> library = [device_ newLibraryWithSource:[NSString stringWithUTF8String:metal::kernel_source]
+        const std::string source = std::string(fp16_ ? "#define VARDA_METAL_FP16\n" : "") + metal::kernel_source;
+        id<MTLLibrary> library = [device_ newLibraryWithSource:[NSString stringWithUTF8String:source.c_str()]
                                                     options:compile error:&error];
         if (!library) throw std::runtime_error("Metal shader compilation: " + std::string(error.localizedDescription.UTF8String));
         for (const char* name : {"normalise", "assemble", "bias_add", "add_arrays", "copy_array", "layernorm",
                                  "gelu", "attention_scores", "attention_softmax", "attention_values", "residual",
-                                 "bound_clamp", "bound_product", "bound_assign", "denormalise"}) {
+                                 "bound_clamp", "bound_product", "bound_assign", "denormalise",
+                                 "pack_half_from_float", "pack_half_from_half", "linear_store_half"}) {
+            if (!fp16_ && (std::strncmp(name, "pack_half", 9) == 0 || std::strcmp(name, "linear_store_half") == 0))
+                continue;
             id<MTLFunction> function = [library newFunctionWithName:[NSString stringWithUTF8String:name]];
             id<MTLComputePipelineState> pipeline = [device_ newComputePipelineStateWithFunction:function error:&error];
             if (!pipeline) throw std::runtime_error("Metal pipeline " + std::string(name) + ": " + error.localizedDescription.UTF8String);
@@ -275,19 +312,27 @@ MetalBackend::MetalBackend(const Config& cfg, SafeTensorsFile& f, const Options&
             max_bound = std::max(max_bound, static_cast<int64_t>(b.index.size()));
         }
         const int64_t max_nodes = std::max(G_, H_);
-        keys_ = arena("keys", max_nodes * C_); values_ = arena("values", max_nodes * C_);
+        keys_ = arena("keys", max_nodes * C_, fp16_); values_ = arena("values", max_nodes * C_, fp16_);
         scores_ = arena("scores", std::max({enc_graph_.host.n_edges, proc_graph_.host.n_edges,
                                            dec_graph_.host.n_edges}) * cfg.num_heads);
-        ln_ = arena("ln", chunk_ * C_); q_ = arena("q", chunk_ * C_);
-        self_ = arena("self", chunk_ * C_); attention_ = arena("attention", chunk_ * C_);
-        residual_ = arena("residual", chunk_ * C_); hidden_ = arena("hidden", chunk_ * cfg.mlp_hidden);
+        ln_ = arena("ln", chunk_ * C_, fp16_); q_ = arena("q", chunk_ * C_, fp16_);
+        self_ = arena("self", chunk_ * C_, fp16_); attention_ = arena("attention", chunk_ * C_, fp16_);
+        residual_ = arena("residual", chunk_ * C_, fp16_); hidden_ = arena("hidden", chunk_ * cfg.mlp_hidden, fp16_);
         arena("input", cfg.n_input_steps * G_ * cfg.n_input_vars);
         arena("xn", cfg.n_input_steps * G_ * cfg.n_input_vars);
         arena("features", G_ * F_);
-        for (const char* name : {"z", "latent", "proc.a", "proc.b", "encoder.dest"}) arena(name, H_ * C_);
-        for (const char* name : {"embed", "block"}) arena(name, chunk_ * C_);
-        for (const char* name : {"decoder", "output"}) arena(name, G_ * cfg.n_output_vars);
+        for (const char* name : {"z", "latent", "proc.a", "proc.b", "encoder.dest"}) arena(name, H_ * C_, fp16_);
+        for (const char* name : {"embed", "block"}) arena(name, chunk_ * C_, fp16_);
+        arena("decoder", G_ * cfg.n_output_vars, fp16_);
+        arena("output", G_ * cfg.n_output_vars);
         arena("products", G_ * max_bound);
+        if (fp16_) {
+            const int64_t width = std::max<int64_t>({C_, cfg.mlp_hidden, F_, cfg.node_attr_dim, cfg.n_output_vars});
+            const NSUInteger in_stride = [MPSMatrixDescriptor rowBytesFromColumns:width dataType:MPSDataTypeFloat16];
+            const NSUInteger out_stride = [MPSMatrixDescriptor rowBytesFromColumns:width dataType:MPSDataTypeFloat32];
+            gemm_input_ = arena("gemm.input", chunk_ * (in_stride / sizeof(_Float16)), true);
+            gemm_result_ = arena("gemm.result", chunk_ * (out_stride / sizeof(float)));
+        }
     }
 }
 
@@ -331,9 +376,15 @@ void MetalBackend::dispatch(const char* name, const Args& args, std::initializer
 }
 
 void MetalBackend::linear(const Linear& l, const Tensor& x, int64_t rows, const Tensor& out) {
-    auto matrix = [](const Tensor& t, int64_t r, int64_t c) {
+    if (fp16_ && rows > chunk_) {
+        for (int64_t row = 0; row < rows; row += chunk_)
+            linear(l, x.sub(row * l.in), std::min(chunk_, rows - row), out.sub(row * l.out));
+        return;
+    }
+    auto matrix = [](const Tensor& t, int64_t r, int64_t c, NSUInteger row_bytes = 0) {
         MPSMatrixDescriptor* descriptor = [MPSMatrixDescriptor matrixDescriptorWithRows:r columns:c
-                                               rowBytes:c * sizeof(float) dataType:MPSDataTypeFloat32];
+            rowBytes:row_bytes ? row_bytes : c * t.element_size
+            dataType:t.element_size == sizeof(_Float16) ? MPSDataTypeFloat16 : MPSDataTypeFloat32];
         return [[MPSMatrix alloc] initWithBuffer:t.buffer offset:t.offset descriptor:descriptor];
     };
     const auto key = std::make_tuple(rows, l.out, l.in);
@@ -341,6 +392,26 @@ void MetalBackend::linear(const Linear& l, const Tensor& x, int64_t rows, const 
     if (!gemm) gemm = [[MPSMatrixMultiplication alloc] initWithDevice:device_ transposeLeft:NO transposeRight:YES
                            resultRows:rows resultColumns:l.out interiorColumns:l.in alpha:1.0 beta:0.0];
     if (!gemm) throw std::runtime_error("cannot create an MPS matrix multiplication");
+    if (fp16_) {
+        const NSUInteger in_bytes = [MPSMatrixDescriptor rowBytesFromColumns:l.in dataType:MPSDataTypeFloat16];
+        const NSUInteger out_bytes = [MPSMatrixDescriptor rowBytesFromColumns:l.out dataType:MPSDataTypeFloat32];
+        const int64_t in_stride = in_bytes / sizeof(_Float16), out_stride = out_bytes / sizeof(float);
+        Tensor operand = x;
+        // Common channel widths already have MPS-compatible packed half rows.
+        // FP32 inputs and odd/unaligned rows use the reusable conversion arena.
+        if (x.element_size != sizeof(_Float16) || in_bytes != l.in * sizeof(_Float16) || x.offset % 16) {
+            dispatch(x.element_size == sizeof(float) ? "pack_half_from_float" : "pack_half_from_half",
+                     {u(rows * in_stride), u(l.in), u(in_stride)}, {x, gemm_input_});
+            operand = gemm_input_;
+        }
+        [gemm encodeToCommandBuffer:command() leftMatrix:matrix(operand, rows, l.in, in_bytes)
+                       rightMatrix:matrix(l.w, l.out, l.in, l.row_bytes)
+                      resultMatrix:matrix(gemm_result_, rows, l.out, out_bytes)];
+        finish_op();
+        dispatch("linear_store_half", {u(rows * l.out), u(l.out), u(out_stride), l.b.buffer ? 1u : 0u},
+                 {gemm_result_, l.b.buffer ? l.b : l.w, out});
+        return;
+    }
     [gemm encodeToCommandBuffer:command() leftMatrix:matrix(x, rows, l.in)
                    rightMatrix:matrix(l.w, l.out, l.in) resultMatrix:matrix(out, rows, l.out)];
     finish_op();
@@ -390,7 +461,14 @@ void MetalBackend::report(const ActivationHook* hook, const std::string& key, co
                           std::vector<int64_t> shape) {
     if (!hook) return;
     flush();
-    (*hook)(key, t.data(), shape);
+    if (t.element_size == sizeof(float)) (*hook)(key, t.data(), shape);
+    else {
+        size_t count = 1;
+        for (int64_t n : shape) count *= n;
+        std::vector<float> values(count);
+        t.read(values.data(), count);  // diagnostic upcast; production computation remains on the GPU
+        (*hook)(key, values.data(), shape);
+    }
 }
 
 void MetalBackend::run(const float* x, float* y, const ActivationHook* hook) {
@@ -410,7 +488,7 @@ void MetalBackend::run(const float* x, float* y, const ActivationHook* hook) {
     for (int64_t row = 0; row < G_; row += chunk_) {
         const int64_t n = std::min(chunk_, G_ - row);
         linear(enc_src_, features.sub(row * F_), n, embed);
-        if (hook) { flush(); std::memcpy(enc_full.data() + row * C_, embed.data(), n * C_ * sizeof(float)); }
+        if (hook) { flush(); embed.read(enc_full.data() + row * C_, n * C_); }
         source(enc_, embed, n, row);
         if (hook) flush();
     }
@@ -448,8 +526,8 @@ void MetalBackend::run(const float* x, float* y, const ActivationHook* hook) {
         linear(out_proj_, ln_, n, decoded.sub(row * Vo));
         if (hook) flush();
         if (hook) {
-            std::memcpy(dec_embed.data() + row * C_, embed.data(), n * C_ * sizeof(float));
-            std::memcpy(dec_block.data() + row * C_, block.data(), n * C_ * sizeof(float));
+            embed.read(dec_embed.data() + row * C_, n * C_);
+            block.read(dec_block.data() + row * C_, n * C_);
         }
     }
     if (hook) {
