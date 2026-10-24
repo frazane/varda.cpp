@@ -8,9 +8,10 @@
   tolerances). Code that produces or consumes any of them follows it exactly.
 - `docs/design.md`: the map: pipeline, decisions, verification, methodology.
 - `docs/cpu.md`, `docs/cuda.md`: CPU and CUDA backends. `docs/rollout-engine.md`: the C++ rollout.
-- `docs/metal.md`: the optional Apple Silicon Metal/MPS fp32 backend and its qualification limits.
   `docs/forcings.md`: computed forcings. `docs/rollout.md`: reference rollouts and their
   tolerances. `docs/tools.md`: converter. `docs/testing.md`: every test suite and how to run it.
+- `docs/metal.md`: the optional Apple Silicon Metal/MPS backend (fp32 and mixed fp16) and its
+  qualification limits. `docs/apple-silicon.md`: building and verifying on macOS arm64.
 - `docs/forecast.md`: running a forecast from real data (GRIB in, GRIB out), overlap, timings, limits.
   `docs/spec-io.md`: the I/O spec. `docs/realdata-reference.md`: the anemoi-inference reference run and dumps.
   `docs/io-input.md`: GRIB -> x0. `docs/io-output.md`: y -> GRIB, io config.

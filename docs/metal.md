@@ -83,8 +83,8 @@ tracked Metal accesses preserve scratch dependencies. Large embedding GEMMs
 are also chunked in FP16 mode so scratch size stays bounded.
 
 Activation hooks upcast stored FP16 values for inspection after synchronization;
-they read the same production results. FP32 retains the original GEMM path and
-is bitwise equal to PR #2 for all six synthetic outputs. CPU remains FP32-only;
+they read the same production results. FP32 retains the original GEMM path; its
+outputs are unchanged by the FP16 support (bitwise, all six synthetic models). CPU remains FP32-only;
 CUDA precision choices are unchanged. FP32 accumulation does not prevent
 overflow when a genuinely large result is stored in FP16, nor recover input
 quantization losses. The policy follows autocast rounding boundaries but does
