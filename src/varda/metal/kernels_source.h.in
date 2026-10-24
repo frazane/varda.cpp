@@ -1,0 +1,4 @@
+#pragma once
+namespace varda::metal {
+inline constexpr const char* kernel_source = R"varda_msl(@VARDA_METAL_SOURCE@)varda_msl";
+}

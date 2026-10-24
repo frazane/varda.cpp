@@ -1,7 +1,7 @@
 // Parity check of the engine against golden activations (docs/format.md §2-4).
 //
 //   varda-parity --model M.safetensors --check GOLDEN.safetensors=TABLE [--check ...]
-//                [--report-only GOLDEN.safetensors] [--device cpu|cuda] [--precision fp32|fp16]
+//                [--report-only GOLDEN.safetensors] [--device cpu|cuda|metal] [--precision fp32|fp16]
 //                [--threads N] [--no-cuda-graph] [--tolerances FILE] [--report OUT.json]
 //
 // The input `in.x` comes from the first golden file (all must hold the same bytes). One
@@ -34,7 +34,7 @@ struct Check {
 [[noreturn]] void usage() {
     std::fprintf(stderr,
                  "usage: varda-parity --model M --check GOLDEN=TABLE [--check ...] [--report-only GOLDEN]\n"
-                 "                    [--device cpu|cuda] [--precision fp32|fp16] [--threads N] [--no-cuda-graph]\n"
+                 "                    [--device cpu|cuda|metal] [--precision fp32|fp16] [--threads N] [--no-cuda-graph]\n"
                  "                    [--tolerances FILE] [--report OUT.json]\n");
     std::exit(2);
 }

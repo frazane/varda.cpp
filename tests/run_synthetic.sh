@@ -2,7 +2,7 @@
 # Synthetic generality suite (docs/testing.md): tiny models outside the real checkpoints'
 # dimension envelope, checked with varda-parity against a float64 numpy reference.
 #
-#   BIN=build-cuda tests/run_synthetic.sh [cpu] [cuda]      (no argument: both)
+#   BIN=build-cuda tests/run_synthetic.sh [cpu] [cuda] [metal] (default: cpu cuda)
 #
 # Env:
 #   BIN       directory holding varda-parity (default: <repo>/build-synth). Required to exist.
@@ -52,6 +52,15 @@ fi
 # ---- runs
 have_gpu=0
 if [ "${SKIP_CUDA:-0}" != 1 ] && command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then have_gpu=1; fi
+have_metal=0
+case " $want " in *" metal "*)
+  [ -x "$BIN/varda-metal-info" ] || { echo "error: build has no varda-metal-info (VARDA_METAL=ON)"; exit 2; }
+  "$BIN/varda-metal-info"
+  probe=$?
+  if [ "$probe" = 0 ]; then have_metal=1
+  elif [ "$probe" != 77 ]; then echo "error: Metal device probe failed"; exit 2
+  fi
+;; esac
 
 fail=0
 SUMMARY="$OUT/summary.tsv"
@@ -102,11 +111,23 @@ for m in $MODELS; do
       run "$m" cuda-fp16        synthetic-fp16 "" --device cuda --precision fp16
     fi
   ;; esac
+  case " $want " in *" metal "*)
+    if [ "$have_metal" = 1 ]; then
+      run "$m" metal-fp32 synthetic-fp32 "" --device metal --precision fp32
+      run "$m" metal-fp32-chunk37 synthetic-fp32 "VARDA_METAL_CHUNK_ROWS=37" --device metal --precision fp32
+    fi
+  ;; esac
 done
 
 echo
 echo "model  run                 status  worst rel_absmax  (key)            ratio-to-tol"
 column -t -s$'\t' "$SUMMARY" 2>/dev/null || cat "$SUMMARY"
 case " $want " in *" cuda "*) [ "$have_gpu" = 1 ] || echo "NOTE: no GPU visible (or SKIP_CUDA=1): the CUDA runs were skipped, this is NOT a full pass." ;; esac
+case " $want " in *" metal "*)
+  if [ "$have_metal" = 0 ]; then
+    echo "NOTE: no Metal GPU: Metal checks were not run (exit 77), this is NOT a GPU pass."
+    [ "$fail" = 0 ] && exit 77
+  fi
+;; esac
 if [ "$fail" = 0 ]; then echo "synthetic suite: PASS"; else echo "synthetic suite: FAIL (logs in $OUT)"; fi
 exit "$fail"

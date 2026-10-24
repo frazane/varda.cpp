@@ -7,7 +7,7 @@
 //                    --regrid-matrix R.safetensors --templates HF_TEMPLATES_DIR [--definitions D] )
 //                  --out DIR
 //                  ( --realdata DIR | --date T --kenda DIR --ifs-prev F.. --ifs F.. --ifs-constants F.. )
-//                  [--lead-time-hours H] [--device cuda|cpu] [--precision fp16|fp32] [--no-graph]
+//                  [--lead-time-hours H] [--device cuda|cpu|metal] [--precision fp16|fp32] [--no-graph]
 //                  [--host-loop] [--allow-nans] [--threads N] [--dump-y] [--write-queue N] [--quiet]
 //
 // --assets BUNDLE fills the five model-release files from one directory (docs/quickstart.md):
@@ -61,7 +61,7 @@ using namespace varda::io;
     std::fprintf(stderr,
                  "usage: varda-forecast (--assets BUNDLE | --model M --io-config J --regrid-matrix R --templates DIR)\n"
                  "         --out DIR (--realdata DIR | --date T --kenda DIR --ifs-prev F.. --ifs F.. --ifs-constants F..)\n"
-                 "         [--lead-time-hours H] [--device cuda|cpu] [--precision fp16|fp32] [--no-graph]\n"
+                 "         [--lead-time-hours H] [--device cuda|cpu|metal] [--precision fp16|fp32] [--no-graph]\n"
                  "         [--host-loop] [--definitions D] [--allow-nans] [--threads N] [--dump-y]\n"
                  "         [--write-queue N] [--quiet]\n"
                  "  --assets BUNDLE: model.safetensors, varda-io.json, regrid-ifs0p25-n320.safetensors, templates/,\n"

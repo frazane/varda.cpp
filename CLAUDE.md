@@ -7,7 +7,8 @@
 - `docs/format.md`: the contracts (converted file, activation names, golden files,
   tolerances). Code that produces or consumes any of them follows it exactly.
 - `docs/design.md`: the map: pipeline, decisions, verification, methodology.
-- `docs/cpu.md`, `docs/cuda.md`: the two backends. `docs/rollout-engine.md`: the C++ rollout.
+- `docs/cpu.md`, `docs/cuda.md`: CPU and CUDA backends. `docs/rollout-engine.md`: the C++ rollout.
+- `docs/metal.md`: the optional Apple Silicon Metal/MPS fp32 backend and its qualification limits.
   `docs/forcings.md`: computed forcings. `docs/rollout.md`: reference rollouts and their
   tolerances. `docs/tools.md`: converter. `docs/testing.md`: every test suite and how to run it.
 - `docs/forecast.md`: running a forecast from real data (GRIB in, GRIB out), overlap, timings, limits.
@@ -23,14 +24,15 @@
 
 ## Hard rules
 
-- The engine (`src/`, `apps/`, `tests/*.cpp|cu`) is C++17/CUDA only: standard library,
+- The engine (`src/`, `apps/`, `tests/*.cpp|cu`) uses C++17/CUDA (Objective-C++ for Metal): standard library,
   OpenMP, BLAS (cblas), CUDA runtime, cuBLAS/cuBLASLt, and the vendored
-  `third_party/nlohmann/json.hpp`. No Python, no libtorch, no other dependency without
+  `third_party/nlohmann/json.hpp`, plus Apple's Foundation/Metal/MetalPerformanceShaders on macOS.
+  No Python, no libtorch, no other dependency without
   asking the integrator.
 - `python/` holds tools only (converter, golden export, reference drivers). They run in
   `.venv` (torch 2.10 CPU, numpy, pyyaml). Never unpickle the checkpoint into real anemoi
   classes in `.venv`: use the restricted unpickler (stubs every non-torch global).
-- The CPU fp32 path is the readable oracle. Optimisations go in the CUDA backend and are
+- The CPU fp32 path is the readable oracle. Optimisations go in the CUDA or Metal backend and are
   verified against golden data at `tolerances/<model>.json`. Never loosen a tolerance
   without saying so explicitly.
 - A parity claim needs numbers: `rel_absmax` and `max_abs` per key, plus device, precision

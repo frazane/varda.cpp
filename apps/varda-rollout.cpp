@@ -1,7 +1,7 @@
 // Autoregressive rollout (src/varda/rollout.h, src/varda/cuda/rollout_cuda.h, docs/rollout-engine.md).
 //
 //   varda-rollout --model M.safetensors --input IN [--key K] [--date ISO] [--steps N]
-//                 [--device cpu|cuda] [--precision fp32|fp16] [--threads N] [--cuda-device I]
+//                 [--device cpu|cuda|metal] [--precision fp32|fp16] [--threads N] [--cuda-device I]
 //                 [--engine host|device] [--no-cuda-graph]
 //                 [--forcings computed|replay] [--replay-from ROLLOUT]
 //                 [--compare REF]... [--tolerances FILE] [--check-forcings]
@@ -76,7 +76,7 @@ namespace {
 
 [[noreturn]] void usage() {
     std::fprintf(stderr,
-                 "usage: varda-rollout --model M --input IN [--key K] [--date ISO] [--steps N] [--device cpu|cuda]\n"
+                 "usage: varda-rollout --model M --input IN [--key K] [--date ISO] [--steps N] [--device cpu|cuda|metal]\n"
                  "         [--precision fp32|fp16] [--threads N] [--cuda-device I] [--engine host|device]\n"
                  "         [--no-cuda-graph] [--forcings computed|replay] [--replay-from ROLLOUT] [--compare REF]...\n"
                  "         [--tolerances FILE] [--check-forcings] [--verify-replay] [--verify-host] [--verify-constants]\n"
@@ -453,7 +453,11 @@ int main(int argc, char** argv) {
         else if (a == "--key") key = next();
         else if (a == "--date") date_s = next();
         else if (a == "--steps") steps = std::stoi(next());
-        else if (a == "--device") { std::string d = next(); if (d != "cpu" && d != "cuda") usage(); opts.device = d == "cuda" ? varda::Device::CUDA : varda::Device::CPU; }
+        else if (a == "--device") {
+            const std::string d = next();
+            if (d != "cpu" && d != "cuda" && d != "metal") usage();
+            opts.device = d == "cuda" ? varda::Device::CUDA : d == "metal" ? varda::Device::Metal : varda::Device::CPU;
+        }
         else if (a == "--precision") { std::string p = next(); if (p != "fp32" && p != "fp16") usage(); opts.precision = p == "fp16" ? varda::Precision::FP16 : varda::Precision::FP32; }
         else if (a == "--threads") opts.num_threads = std::stoi(next());
         else if (a == "--cuda-device") opts.cuda_device = std::stoi(next());

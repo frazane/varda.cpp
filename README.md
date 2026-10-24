@@ -1,6 +1,6 @@
 # varda.cpp
 
-A from-scratch C++/CUDA inference engine for the **forecaster** of
+A from-scratch C++/CUDA/Metal inference engine for the **forecaster** of
 [MeteoSwiss Varda-single-1.0](https://huggingface.co/MeteoSwiss/Varda-single-1.0)
 (`varda-forecaster-det-sgm/model.ckpt`): an anemoi GraphTransformer
 encoder–processor–decoder on a stretched grid (1 688 650 data nodes: 1 km over the Alps,
@@ -120,7 +120,8 @@ anemoi-inference does); it needs ecCodes (`-DVARDA_GRIB=ON`, `tools/env.sh`): `d
 
 Apple Silicon: the CPU fp32 backend builds natively on macOS arm64 with OpenMP and OpenBLAS.
 Build, GRIB dependencies and verification: [docs/apple-silicon.md](docs/apple-silicon.md).
-There is no Apple GPU backend; CUDA requires an NVIDIA GPU.
+The optional [Metal/MPS backend](docs/metal.md) runs on the Apple GPU with
+`--device metal --precision fp32`; CUDA requires an NVIDIA GPU.
 
 ## Licence and disclaimer
 
