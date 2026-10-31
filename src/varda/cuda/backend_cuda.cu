@@ -488,6 +488,9 @@ Engine<T>::Engine(const Config& cfg, SafeTensorsFile& file, const Options& opts)
 
 template <class T>
 Engine<T>::~Engine() {
+    // this engine's device for the graph, stream and (after this body) the members' buffers and cuBLASLt
+    // handle: the destroying thread's current device may be another one (a second model on another GPU)
+    cudaSetDevice(dev_);
     if (graph_exec_) cudaGraphExecDestroy(graph_exec_);
     if (stream_) cudaStreamDestroy(stream_);
 }

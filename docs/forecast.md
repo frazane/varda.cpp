@@ -59,6 +59,8 @@ build-out/varda-forecast --assets $VARDA_SCRATCH/assets/varda-single-1.0 \
 # Then OUT/outputs/varda-single_<dateTime>_{0..24}.grib (lam, ICON templates; 66 messages at hour 0, 67 per hour: 35 files,
 # 2350 messages for 24 h) are written too, forecast.json gains a "downscaler" entry, and --dump-y also writes
 # OUT/hourly.safetensors (y.<hour>) and puts x0 and the input names into y.safetensors.
+# --downscaler-device cuda:1 (or 1): the downscaler on a second GPU (default: the forecaster's device, cuda:0);
+# forecast.json records it as downscaler.device (docs/downscaler.md §7)
 # any date:  --date 2026-10-22T15:00:00 --kenda DIR --ifs-prev F --ifs F --ifs-constants F
 # without the bundle: --model M --io-config J --regrid-matrix R --templates DIR [--definitions D] (table above)
 ```

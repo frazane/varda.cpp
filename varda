@@ -4,13 +4,16 @@
 #   ./varda setup                       build (build/, CUDA + GRIB) and check the assets bundle (create it here)
 #   ./varda fetch DATE|latest           download the inputs of one date into the input cache
 #   ./varda forecast DATE|latest [--lead-time H] [--precision fp16|fp32] [--device cuda|cpu|metal] [--out DIR]
-#                                [--no-downscaler] [-- extra varda-forecast options]
+#                                [--no-downscaler] [--gpus 1|2] [-- extra varda-forecast options]
 #
 # DATE is the initial time in UTC, e.g. 2026-10-22T15 (hour 00, 03, ..., 21); `latest` is the newest KENDA-CH1
 # analysis with t-6h also published. Outputs: DIR/outputs/*.grib (default DIR: ./varda-out/<YYYYmmddTHH>):
 # the 6-hourly forecaster files and, when the bundle holds the temporal downscaler (./varda setup adds it when
 # the HF download has it), the hourly varda-single_*.grib files (--no-downscaler: forecaster only);
 # DIR/forecast.json, DIR/varda-forecast.log.
+# --gpus 2 runs the temporal downscaler on a second GPU (varda-forecast --downscaler-device cuda:1): srun gets
+# --gres=gpu:2 (replacing a --gres=gpu:N of the srun options), and inside an allocation two GPUs must be visible.
+# Default 1: both models share one GPU.
 #
 # Environment (all optional):
 #   VARDA_ENV        file sourced first (default: tools/env.sh of this repo; "none": nothing)
@@ -148,7 +151,7 @@ cmd_forecast() {
     [[ "$1" == -h || "$1" == --help ]] && usage 0
     local date="$1"
     shift
-    local lead="" precision=fp16 device=cuda out="" extra=() no_td=()
+    local lead="" precision=fp16 device=cuda out="" extra=() no_td=() gpus=1
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --lead-time) lead="${2:?--lead-time needs hours}"; shift 2 ;;
@@ -156,6 +159,7 @@ cmd_forecast() {
             --device) device="${2:?}"; shift 2 ;;
             --out) out="${2:?}"; shift 2 ;;
             --no-downscaler) no_td=(--no-downscaler); shift ;;
+            --gpus) gpus="${2:?--gpus needs 1 or 2}"; shift 2 ;;
             --) shift; extra=("$@"); break ;;
             -h|--help) usage 0 ;;
             *) die "forecast: unknown option $1 (varda-forecast options go after --)" ;;
@@ -163,6 +167,11 @@ cmd_forecast() {
     done
     case "$precision" in fp16|fp32) ;; *) die "--precision must be fp16 or fp32" ;; esac
     case "$device" in cuda|cpu|metal) ;; *) die "--device must be cuda, cpu or metal" ;; esac
+    case "$gpus" in 1|2) ;; *) die "--gpus must be 1 or 2" ;; esac
+    if [[ $gpus == 2 ]]; then
+        [[ "$device" == cuda ]] || die "--gpus 2 needs --device cuda"
+        [[ ${#no_td[@]} == 0 ]] || die "--gpus 2 runs the temporal downscaler on the second GPU: not with --no-downscaler"
+    fi
     if [[ -n "$lead" ]]; then
         case "$lead" in
             *d) lead=$(( ${lead%d} * 24 )) ;;
@@ -174,6 +183,8 @@ cmd_forecast() {
 
     [[ -x "$BUILD/varda-forecast" ]] || die "no $BUILD/varda-forecast: run ./varda setup first"
     [[ -f "$ASSETS/manifest.json" ]] || die "no assets bundle at $ASSETS: run ./varda setup first"
+    [[ $gpus == 1 || -f "$ASSETS/downscaler.safetensors" ]] ||
+        die "--gpus 2 runs the temporal downscaler on the second GPU, but the bundle $ASSETS has none"
 
     # where to run: here inside an allocation (or VARDA_SRUN=0), else through srun (decided before any download)
     local launch=()
@@ -189,12 +200,27 @@ cmd_forecast() {
         [[ -n "${VARDA_SRUN_ARGS:-$def}" ]] ||
             die "not in a Slurm allocation and no srun options: set VARDA_SRUN_ARGS, or VARDA_SLURM_GPU /" \
                 "VARDA_SLURM_CPU in tools/env.local.sh, or run on a GPU machine with VARDA_SRUN=0"
+        local sargs="${VARDA_SRUN_ARGS:-$def}"
+        if [[ $gpus != 1 ]]; then
+            # --gres=gpu:N or --gres=gpu:TYPE:N -> $gpus GPUs, else appended
+            if [[ " $sargs " =~ \ --gres=gpu:([A-Za-z0-9_.-]+:)?[0-9]+\  ]]; then
+                sargs="$(sed -E "s/--gres=gpu:([A-Za-z0-9_.-]+:)?[0-9]+/--gres=gpu:\\1$gpus/" <<<"$sargs")"
+            else
+                sargs="$sargs --gres=gpu:$gpus"
+            fi
+        fi
         # shellcheck disable=SC2206
-        launch=(srun ${VARDA_SRUN_ARGS:-$def} --job-name=varda-forecast)
+        launch=(srun $sargs --job-name=varda-forecast)
     elif [[ "$device" == cuda ]]; then
-        if ! nvidia-smi -L 2>/dev/null | grep -q GPU; then
+        local ngpu
+        ngpu="$(nvidia-smi -L 2>/dev/null | grep -c '^GPU' || true)"
+        if [[ "${ngpu:-0}" == 0 ]]; then
             die "no GPU visible on $(hostname)${SLURM_JOB_ID:+ (allocation $SLURM_JOB_ID)}: request one" \
                 "(--gres=gpu:1), leave the allocation so ./varda uses srun, or pass --device cpu"
+        fi
+        if [[ $ngpu -lt $gpus ]]; then
+            die "--gpus $gpus: $ngpu GPU visible on $(hostname)${SLURM_JOB_ID:+ (allocation $SLURM_JOB_ID)}: request" \
+                "$gpus (--gres=gpu:$gpus), leave the allocation so ./varda uses srun, or use --gpus 1"
         fi
     fi
     # 1. inputs, on this node (it needs the network unless the date is already cached)
@@ -215,6 +241,7 @@ cmd_forecast() {
     local args=(--assets "$ASSETS" --realdata "$indir" --out "$out" --device "$device" --precision "$precision"
                 --quiet)
     [[ -n "$lead" ]] && args+=(--lead-time-hours "$lead")
+    [[ $gpus == 2 ]] && args+=(--downscaler-device cuda:1)
     args+=("${no_td[@]}" "${extra[@]}")
 
     [[ ${#launch[@]} -gt 0 ]] && say "running on a compute node: ${launch[*]}"
@@ -229,7 +256,8 @@ cmd_forecast() {
     rc=${PIPESTATUS[0]}
     set -e
     if [[ $rc != 0 ]]; then
-        if grep -qiE 'no CUDA|cuda.*(device|driver)|CUDA error' "$log"; then
+        # (the log's first line, the command, names --device cuda and --downscaler-device: not searched)
+        if tail -n +2 "$log" | grep -qiE 'no CUDA|cuda.*(device|driver)|CUDA error'; then
             die "varda-forecast failed: no usable GPU on the node (log: $log). Check VARDA_SRUN_ARGS or use --device cpu"
         fi
         die "varda-forecast failed (exit $rc); log: $log"
@@ -254,7 +282,9 @@ steps = ", ".join(f"{x:.0f}" for x in r["step_ms"])
 c = p["constant_forcings_run"]
 dates = ", ".join(f"{k[11:13]}Z <- {v['init'][:13].replace('T', ' ')}Z+{v['step']}h" for k, v in p["input_dates"].items())
 print()
-print(f"Varda forecast from {r['date']}, {r['n_steps']} steps of 6 h, {r['device']} {r['precision']}")
+tdev = td.get("device", "") if td else ""
+on2 = f", temporal downscaler on {tdev} (second GPU)" if tdev.startswith("cuda:") and tdev != "cuda:0" else ""
+print(f"Varda forecast from {r['date']}, {r['n_steps']} steps of 6 h, {r['device']} {r['precision']}{on2}")
 msgs = s['grib']['messages'] + (td['seconds']['grib']['messages'] if td else 0)
 print(f"  outputs   {out}/outputs/  ({len(files) + len(hourly)} GRIB files, {size / 1e9:.2f} GB, {msgs} messages)")
 print(f"            lam (ICON-CH1 grid): {os.path.basename(min(f for f in files if 'global-' not in os.path.basename(f)))} ...")

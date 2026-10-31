@@ -20,6 +20,7 @@ The result is a directory of GRIB files, `./varda-out/<YYYYmmddTHH>/outputs/`, p
 | `--precision fp16\|fp32` | fp16 | fp16 is the checkpoint's precision (`16-mixed`, what anemoi-inference runs) |
 | `--device cuda\|cpu` | cuda | CPU: about 60 s per step (fp32) |
 | `--no-downscaler` | | forecaster only: skip the temporal downscaler even if the bundle holds it (section 1) |
+| `--gpus 1\|2` | 1 | 2: the temporal downscaler runs on a second GPU (`varda-forecast --downscaler-device cuda:1`): `srun` gets `--gres=gpu:2` (it replaces a `--gres=gpu:N` of the srun options, else it is added); inside an allocation two GPUs must be visible (`nvidia-smi -L`). Needs `--device cuda` and a bundle with the downscaler. 1: both models share one GPU |
 | `--out DIR` | `./varda-out/<YYYYmmddTHH>` | |
 | `-- ...` | | any further `varda-forecast` option (`docs/forecast.md` section 2), e.g. `-- --allow-nans` |
 
@@ -171,6 +172,7 @@ interpolation matrix into a private MIR cache) and `python/export_regrid_matrix.
 | `older than the 12 ECMWF runs kept` | the date is more than 3 days before the latest IFS run |
 | `the initial time must be ... hour % 3 == 0` | KENDA-CH1 is hourly but the IFS open data are 3-hourly |
 | `no GPU visible on <node>` | inside an allocation without a GPU: request `--gres=gpu:1`, run `./varda` outside the allocation (it then uses `srun`), or `--device cpu` |
+| `--gpus 2: 1 GPU visible on <node>` | inside an allocation with one GPU: request `--gres=gpu:2`, run `./varda` outside the allocation, or `--gpus 1` |
 | `no assets bundle` / `bundle is incomplete or altered` | `./varda setup`; for a damaged bundle move the directory away first |
 | `has pins.json but misses N file(s)` | an input directory was changed by hand: remove it and fetch again (if the date is still published) |
 | `NaN in ...` from varda-forecast | an input field has NaN; the reference allows it (`-- --allow-nans`) |

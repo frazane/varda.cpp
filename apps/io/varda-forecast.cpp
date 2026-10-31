@@ -6,6 +6,7 @@
 //   varda-forecast ( --assets BUNDLE | --model M.safetensors --io-config varda-io.json
 //                    --regrid-matrix R.safetensors --templates HF_TEMPLATES_DIR [--definitions D] )
 //                  [--downscaler TD.safetensors --downscaler-io-config varda-td-io.json | --no-downscaler]
+//                  [--downscaler-device cuda:N]
 //                  --out DIR
 //                  ( --realdata DIR | --date T --kenda DIR --ifs-prev F.. --ifs F.. --ifs-constants F.. )
 //                  [--lead-time-hours H] [--device cuda|cpu|metal] [--precision fp16|fp32] [--no-graph]
@@ -28,6 +29,10 @@
 // buffers, default 2; VARDA_TD_PINNED=1 page-locks them), not copied. The hourly writer encodes
 // VARDA_TD_WRITER_STATES hours at once (default 3, VARDA_TD_WRITER_THREADS OpenMP threads each; the tp
 // accumulation stays in hour order), byte-identical to one hour at a time (docs/downscaler.md §7).
+// --downscaler-device cuda:N (or N) runs the downscaler on CUDA device N, e.g. a second GPU (default: the
+// forecaster's device, 0): the two models then neither time-slice one GPU nor share its memory. The rollout's
+// steps still reach the downscaler through host memory (StepFeed), unchanged; the start-up sequencing
+// (downscaler loaded after the forecaster's set-up) is kept. forecast.json records the device.
 // --quiet leaves the input log (every file and message used) out of stdout; it stays in forecast.json.
 //
 // DIR receives the GRIB files under the configured relative paths (outputs/<dateTime>_<step>.grib); DIR/forecast.json the provenance and
@@ -85,9 +90,11 @@ using namespace varda::io;
                  "         [--host-loop] [--definitions D] [--allow-nans] [--threads N] [--dump-y]\n"
                  "         [--write-queue N] [--quiet]\n"
                  "         [--downscaler TD.safetensors --downscaler-io-config varda-td-io.json | --no-downscaler]\n"
+                 "         [--downscaler-device cuda:N]\n"
                  "  --assets BUNDLE: model.safetensors, varda-io.json, regrid-ifs0p25-n320.safetensors, templates/,\n"
                  "                   definitions/ and, if present, downscaler.safetensors + varda-td-io.json of BUNDLE\n"
-                 "                   (explicit options override)\n");
+                 "                   (explicit options override)\n"
+                 "  --downscaler-device cuda:N (or N): the downscaler's CUDA device (default: the forecaster's)\n");
     std::exit(2);
 }
 
@@ -369,11 +376,52 @@ private:
     double alloc_s_ = 0;
 };
 
+// --downscaler-device: "cuda:N" or "N" (a CUDA device ordinal), "cuda" (the forecaster's device: -1).
+int parse_cuda_device(const std::string& s) {
+    std::string n = s;
+    if (n == "cuda") return -1;
+    if (n.rfind("cuda:", 0) == 0) n = n.substr(5);
+    if (n.empty() || n.find_first_not_of("0123456789") != std::string::npos || n.size() > 4)
+        throw std::runtime_error("--downscaler-device '" + s + "': expected cuda:N or a device index N");
+    return std::stoi(n);
+}
+
+// Makes `dev` the calling thread's current CUDA device for the scope and restores the previous one
+// (cudaSetDevice is per thread). Inactive (no CUDA call at all) when `active` is false.
+class DeviceScope {
+public:
+    DeviceScope(int dev, bool active) {
+#ifdef VARDA_WITH_CUDA
+        if (!active) return;
+        cudaError_t e = cudaGetDevice(&prev_);
+        if (e == cudaSuccess && prev_ != dev) e = cudaSetDevice(dev);
+        if (e != cudaSuccess)
+            throw std::runtime_error("CUDA device " + std::to_string(dev) + ": " + cudaGetErrorString(e));
+        set_ = prev_ != dev;
+#else
+        (void)dev;
+        (void)active;
+#endif
+    }
+    ~DeviceScope() {
+#ifdef VARDA_WITH_CUDA
+        if (set_) cudaSetDevice(prev_);
+#endif
+    }
+    DeviceScope(const DeviceScope&) = delete;
+    DeviceScope& operator=(const DeviceScope&) = delete;
+
+private:
+    int prev_ = 0;
+    bool set_ = false;
+};
+
 }  // namespace
 
 int main(int argc, char** argv) {
     std::string model_path, io_config_path, templates, out_dir, realdata, assets, device = "cuda", precision = "fp16";
     std::string td_path, td_io_path;  // temporal downscaler (optional)
+    std::string td_device_arg;        // --downscaler-device (empty: the forecaster's device)
     InputFiles files;
     int lead_hours = 0, threads = 0;
     bool graph = true, host_loop = false, dump_y = false, quiet = false, no_downscaler = false;
@@ -410,6 +458,7 @@ int main(int argc, char** argv) {
         else if (a == "--downscaler") td_path = next();
         else if (a == "--downscaler-io-config") td_io_path = next();
         else if (a == "--no-downscaler") no_downscaler = true;
+        else if (a == "--downscaler-device") td_device_arg = next();
         else usage();
     }
     if (no_downscaler) td_path = td_io_path = "";
@@ -486,6 +535,30 @@ int main(int argc, char** argv) {
         opts.device = app::parse_device(device);
         opts.precision = app::parse_precision(precision);
         opts.cuda_graph = graph;
+        // The downscaler's options: the forecaster's, on --downscaler-device if given.
+        varda::Options td_opts = opts;
+        const bool td_cuda = with_td && opts.device == varda::Device::CUDA;
+        if (!td_device_arg.empty()) {
+            const int d = parse_cuda_device(td_device_arg);
+            if (opts.device != varda::Device::CUDA)
+                throw std::runtime_error("--downscaler-device " + td_device_arg + " needs --device cuda");
+            if (d >= 0) td_opts.cuda_device = d;
+#ifdef VARDA_WITH_CUDA
+            int n_dev = 0;
+            if (cudaGetDeviceCount(&n_dev) != cudaSuccess) {
+                (void)cudaGetLastError();
+                n_dev = 0;
+            }
+            if (td_opts.cuda_device >= n_dev)
+                throw std::runtime_error("--downscaler-device " + td_device_arg + ": no CUDA device " +
+                                         std::to_string(td_opts.cuda_device) + " (" + std::to_string(n_dev) +
+                                         " visible" + (n_dev ? ": 0.." + std::to_string(n_dev - 1) : std::string()) +
+                                         "; CUDA_VISIBLE_DEVICES / --gres=gpu:N)");
+#endif
+            if (!with_td) std::printf("note: --downscaler-device without a downscaler: ignored\n");
+        }
+        const std::string td_device_name =
+            td_cuda ? "cuda:" + std::to_string(td_opts.cuda_device) : device;  // forecast.json
 
         // Start-up in parallel: the input is prepared on its own thread from the converted file's
         // config, grid and masks only, while this thread loads the weights onto the device and sets
@@ -553,8 +626,10 @@ int main(int argc, char** argv) {
         // initialise cuBLASLt / capture graphs concurrently on one device (a second thread's allocations
         // invalidate a capture in progress). The input preparation still overlaps it.
         if (with_td) {
+            // the downscaler's device for this block (its load, stream), then back to the forecaster's
+            DeviceScope td_scope(td_opts.cuda_device, td_cuda);
             const double tt = app::now_s();
-            td_model = varda::Model::load(td_path, opts);
+            td_model = varda::Model::load(td_path, td_opts);
             td_load_s = app::now_s() - tt;
             // Everything about the downscaler that can be wrong is checked now, before the rollout.
             const varda::Config& tc = td_model->config();
@@ -646,9 +721,9 @@ int main(int argc, char** argv) {
         std::exception_ptr td_err;
         auto td_setup = [&] {
             td0 = app::now_s();
-            std::printf("downscaler %s (uuid %s) loaded in %.2f s; %d windows of %d h, %d outputs each%s\n",
-                        td_path.c_str(), td_model->config().uuid.c_str(), td_load_s, n_steps, W, T_out,
-                        td_overlap ? ", during the rollout" : "");
+            std::printf("downscaler %s (uuid %s) on %s, loaded in %.2f s; %d windows of %d h, %d outputs each%s\n",
+                        td_path.c_str(), td_model->config().uuid.c_str(), td_device_name.c_str(), td_load_s, n_steps,
+                        W, T_out, td_overlap ? ", during the rollout" : "");
             // Page-locked buffers make the 2.7 GB device-to-host copy of a window a DMA, but locking
             // 2 x 2.7 GB takes ~3 s of kernel time that stalls the other threads' page faults; off
             // by default (VARDA_TD_PINNED=1; docs/downscaler.md §7).
@@ -668,6 +743,8 @@ int main(int argc, char** argv) {
         };
         auto td_loop = [&] {
             try {
+                // every CUDA call of this loop (window buffers, predict_step) on the downscaler's device
+                DeviceScope td_scope(td_opts.cuda_device, td_cuda);
                 td_loop_t0 = app::now_s();
                 // Step 0: the analysis (the forecaster's newest input slot), the downscaler's initial-state
                 // fields (the prognostics that are also outputs, in its input order), as the runner writes it.
@@ -803,6 +880,7 @@ int main(int argc, char** argv) {
             const double blocked = wait_out + twriter->blocked_seconds();
             td_rep = {{"model", td_path},
                       {"io_config", td_io_path},
+                      {"device", td_device_name},
                       {"checkpoint_uuid", tc.uuid},
                       {"n_windows", n_steps},
                       {"window_hours", W},

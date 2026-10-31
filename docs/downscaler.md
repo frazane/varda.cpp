@@ -376,6 +376,32 @@ other threads wherever it is done: on the downscaler's thread before window 0 (`
 background from the start, or after the rollout set-up, 18.0-19.1 s (ready 6.6-7.2 s instead of 4.0 s), and the process
 exit then spends 1.7-4 s unpinning; none is kept.
 
+**The downscaler on a second GPU** (`varda-forecast --downscaler-device cuda:1`, `./varda forecast --gpus 2`). The
+downscaler's backend gets its own CUDA device; everything else is unchanged (the rollout's steps reach it through host
+memory, the start-up order stays as above, the files are byte-identical). Every CUDA call of the downscaler runs with
+its device current: the backend's entry points set it, `varda-forecast` sets it around the downscaler's load and loop
+(window buffers included) and restores the forecaster's on the main thread, and a CUDA engine's destructor sets its
+own device. Measured in one job, 2 GPUs and 32 CPUs, one GPU and two GPUs in alternation after a discarded first run
+(A100-SXM4 96 GB "PG506-232", 2026-10-22T15 and, for 120 h, 2026-10-30T15; `$VARDA_SCRATCH/jobs/gpu2/a`; seconds, process
+wall clock / `forecast.json` total):
+
+| | one GPU | two GPUs |
+|---|---|---|
+| fp16, 24 h | 16.89 / 16.18, 17.12 / 16.40 | 17.13 / 16.33, 17.22 / 16.41 |
+| fp16, 120 h | 59.57 / 58.85 | 59.52 / 58.70 |
+| fp32, 24 h | 68.36 / 67.44 | **48.25 / 47.26** |
+| fp32, 24 h, A100-SXM4-80GB (`gpu2/b`) | cudaMalloc out of memory | **54.44 / 53.61** |
+
+In fp16 a second GPU changes nothing: the rollout is no longer slowed (`step_ms` 647-659 instead of 648 / 1310
+alternating, rollout 2.9-3.2 s instead of 4.5-4.9 s), but the downscaler loop, which sets the total, stays at 10.0 s
+for 24 h (51.8 s for 120 h): its windows take 1.7-2.7 s for 0.7 s of GPU work, the rest being the pageable host copies
+(1 GB in, 2.7 GB out) while the hourly writer loads every CPU (above); window 0 is even 0.3-0.6 s slower on the second
+GPU (1.5-1.8 s against 1.1-1.3 s; not lazy kernel loading: an eager warm-up forward on that GPU before window 0 left it
+at 1.8 s and changed the total by -0.2 s at 24 h and +1.5 s at 120 h, `gpu2/c`, not kept). In fp32 the two models no longer
+share one GPU (rollout 26.3 s instead of 45.8 s, 6.0 s instead of 23.3 s of the loop waiting for the forecaster): 30%
+faster, and both models fit on 80 GB GPUs. Every run byte-identical: 24 h runs to the reference runs above (35 files),
+120 h two GPUs to one GPU (163 files), also through `./varda forecast --gpus 2` (`gpu2/v`, 80 GB node).
+
 ## 8. Open points
 
 - With the concurrent hourly writer, the fp16 critical path is the downscaler loop on a CPU-saturated node: ~4 s ready,
