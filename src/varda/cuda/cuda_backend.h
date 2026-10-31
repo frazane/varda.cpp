@@ -55,6 +55,19 @@ public:
     // forward passes, never during a capture. Results are unchanged (same kernels, same order).
     virtual void use_high_priority_stream() = 0;
 
+    // predict_step without the host copies, for callers that assemble the input and consume the
+    // output on the device (the temporal downscaler's device loop, docs/downscaler.md §2):
+    // device_input() is the backend's own input buffer x (input_numel floats), device_output() its
+    // output buffer y (output_numel floats), stream() the stream predict_step runs on (it changes with
+    // use_high_priority_stream). enqueue_predict() enqueues on stream() exactly what predict_step runs
+    // between its two copies (eager on the first call, then the backend's CUDA graph when enabled):
+    // y = predict_step(x) bitwise. Nothing is synchronised: write x before it and read y after it in
+    // stream order (or with events); the next enqueue_predict overwrites y.
+    virtual float* device_input() = 0;
+    virtual const float* device_output() const = 0;
+    virtual cudaStream_t stream() const = 0;
+    virtual void enqueue_predict() = 0;
+
     virtual int device() const = 0;               // CUDA device ordinal
     virtual size_t weight_bytes() const = 0;      // device bytes held by weights and graphs
     virtual size_t activation_bytes() const = 0;  // device bytes of activation buffers

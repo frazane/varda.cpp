@@ -11,13 +11,29 @@
 //     leap day; a general (input [0, 3], output [1, 2], 2 h) configuration;
 //  5. DownscaleTimes::from_config / DownscaleAssembly::from_config on a hand-built interpolator Config,
 //     including the grid and the node-count checks of ForecasterInfo.
+//  6. CUDA builds, with VARDA_TEST_TD_MODEL=<an interpolator's converted file> (e.g. the synthetic model g,
+//     tests/run_synthetic.sh) and a GPU: the device-resident loop (cuda/downscale_cuda.h) against the host
+//     loop on the same CUDA model, with a deterministic synthetic forecaster (names from the downscaler's
+//     own, as varda-downscale --smoke): every window's assembled input and every output bitwise equal,
+//     with the states fed from the host (y_at) and from device buffers (push_device, as the device rollout
+//     does, with the producer reusing its two buffers only after the returned event), with and without the
+//     hold buffer, with staging chunks that do not divide a state, a ring of one and of two states, fp32 and
+//     fp16; with two GPUs also with the producer on the other GPU (peer copies). Skipped (with a note) otherwise.
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "varda/downscale.h"
+#ifdef VARDA_WITH_CUDA
+#include <cuda_runtime_api.h>
+
+#include "varda/cuda/cuda_backend.h"
+#include "varda/cuda/downscale_cuda.h"
+#endif
 
 using namespace varda;
 
@@ -59,6 +75,149 @@ constexpr int64_t G = 5;
 float xval(int64_t g, int v) { return 10.0f * g + v + 0.25f; }              // x0 newest slot
 float yval(int s, int64_t g, int v) { return -1000.0f * (s + 1) - 10.0f * g - v - 0.5f; }  // y_s
 float fval(int e, int64_t g, int k) { return 7.0f * e + g + 0.125f * k + 0.5f; }  // forcing, edge e
+
+#ifdef VARDA_WITH_CUDA
+#define CK(e)                                                                                       \
+    do {                                                                                            \
+        cudaError_t _e = (e);                                                                       \
+        if (_e != cudaSuccess) throw std::runtime_error(std::string(#e) + ": " + cudaGetErrorString(_e)); \
+    } while (0)
+
+float sval(int64_t s, int64_t g, int64_t v) {  // deterministic, distinct per (state, point, variable)
+    uint64_t h = uint64_t(s + 1) * 0x9E3779B97F4A7C15ull ^ uint64_t(g + 1) * 0xBF58476D1CE4E5B9ull ^
+                 uint64_t(v + 1) * 0x94D049BB133111EBull;
+    h ^= h >> 29;
+    h *= 0xBF58476D1CE4E5B9ull;
+    h ^= h >> 32;
+    return float(double(h % 2000001) / 1000000.0 - 1.0);
+}
+
+// Section 6: the device loop against the host loop on one model file.
+void test_device_loop(const std::string& path, Precision prec) {
+    Options opts;
+    opts.device = Device::CUDA;
+    opts.precision = prec;
+    auto model = Model::load(path, opts);
+    const Config& cfg = model->config();
+    if (!cfg.has_forcings) {
+        std::printf("note: %s has no `forcings` section (no assembly table): device loop test skipped\n", path.c_str());
+        return;
+    }
+    ForecasterInfo fi;
+    fi.in_names = cfg.var_input;
+    fi.out_names = cfg.var_output;
+    fi.n_data_nodes = cfg.n_data_nodes;
+    fi.lat = model->latitudes();
+    fi.lon = model->longitudes();
+    Downscaler ds(*model, fi);
+    const int64_t Gm = cfg.n_data_nodes, V_fin = int64_t(fi.in_names.size()), V_fout = int64_t(fi.out_names.size());
+    const int N = 4, T_f = 2;
+    std::vector<float> x0(size_t(T_f * Gm * V_fin));
+    for (int t = 0; t < T_f; ++t)
+        for (int64_t g = 0; g < Gm; ++g)
+            for (int64_t v = 0; v < V_fin; ++v) x0[size_t((t * Gm + g) * V_fin + v)] = sval(1000 + t, g, v);
+    std::vector<std::vector<float>> ys(N, std::vector<float>(size_t(Gm * V_fout)));
+    for (int s = 0; s < N; ++s)
+        for (int64_t g = 0; g < Gm; ++g)
+            for (int64_t v = 0; v < V_fout; ++v) ys[size_t(s)][size_t(g * V_fout + v)] = sval(s, g, v);
+    const DateTime date0 = parse_iso8601_utc("2024-02-28T18:00:00");  // crosses the leap day
+    struct Run {
+        std::vector<std::vector<float>> x, y;
+        std::vector<int> steps;
+    };
+    auto request = [&](Run& r) {
+        DownscaleRequest rq;
+        rq.x0 = x0.data();
+        rq.forecaster_T = T_f;
+        rq.date0 = date0;
+        rq.n_windows = N;
+        rq.y_at = [&](int s) { return ys[size_t(s)].data(); };
+        const size_t xn = size_t(2 * Gm * cfg.n_input_vars), yn = size_t(Gm * cfg.n_output_vars);
+        rq.on_input = [&r, xn](int, const float* x) { r.x.emplace_back(x, x + xn); };
+        rq.on_output = [&r, yn](int, int, int step_h, const DateTime&, const float* y) {
+            r.y.emplace_back(y, y + yn);
+            r.steps.push_back(step_h);
+        };
+        return rq;
+    };
+    Run host;
+    ds.run(request(host));
+    const std::string tag = std::string(prec == Precision::FP32 ? "fp32" : "fp16") + " ";
+    auto same = [&](const Run& r, const std::string& what) {
+        bool okx = r.x.size() == host.x.size(), oky = r.y.size() == host.y.size() && r.steps == host.steps;
+        for (size_t i = 0; okx && i < r.x.size(); ++i) okx = r.x[i] == host.x[i];
+        for (size_t i = 0; oky && i < r.y.size(); ++i) oky = r.y[i] == host.y[i];
+        expect(okx, tag + what + ": assembled inputs bitwise equal to the host loop's");
+        expect(oky, tag + what + ": outputs and step hours bitwise equal to the host loop's");
+        std::printf("  device loop %s%s: inputs %s, outputs %s\n", tag.c_str(), what.c_str(), okx ? "bitwise" : "DIFFER",
+                    oky ? "bitwise" : "DIFFER");
+    };
+    const int dev = cuda::as_cuda(*model)->device();
+    const size_t out_floats = size_t(cfg.n_output_steps * Gm * cfg.n_output_vars);
+    for (int variant = 0; variant < 4; ++variant) {
+        cuda::DeviceLoopOptions o;
+        o.hold_output = variant % 2;                    // without / with the hold buffer
+        o.ring_states = variant < 2 ? 2 : 1;
+        o.staging_slots = 3;
+        // chunks that do not divide a state (nor the window): 2/5 of a state + 13 floats, >= 1024 floats
+        o.staging_bytes = 4 * std::max<size_t>(1024, out_floats / size_t(cfg.n_output_steps) * 2 / 5 + 13);
+        o.copy_threads = 3;
+        const std::string what = std::string(o.hold_output ? "hold" : "no hold") + ", ring " + std::to_string(o.ring_states);
+        {  // states from the host
+            cuda::DeviceDownscaler dl(ds, -1, o);
+            Run r;
+            dl.run(request(r));
+            same(r, what + ", host feed");
+        }
+        // states from device buffers, as the device rollout hands them on: on the downscaler's device and,
+        // with two GPUs, on another one (cudaMemcpyPeerAsync, the --downscaler-device case)
+        int n_dev = 1;
+        CK(cudaGetDeviceCount(&n_dev));
+        std::vector<int> producers = {dev};
+        if (n_dev > 1) producers.push_back((dev + 1) % n_dev);
+        for (int pd : producers) {
+            cuda::DeviceDownscaler dl(ds, pd, o);
+            CK(cudaSetDevice(pd));
+            float* dy[2] = {nullptr, nullptr};
+            cudaStream_t ps = nullptr;
+            cudaEvent_t ready[2], back[2] = {nullptr, nullptr};
+            const size_t bytes = size_t(Gm * V_fout) * sizeof(float);
+            for (int i = 0; i < 2; ++i) {
+                CK(cudaMalloc(reinterpret_cast<void**>(&dy[i]), bytes));
+                CK(cudaEventCreateWithFlags(&ready[i], cudaEventDisableTiming));
+            }
+            CK(cudaStreamCreateWithFlags(&ps, cudaStreamNonBlocking));
+            Run r;
+            std::exception_ptr err;
+            std::thread consumer([&] {
+                try {
+                    dl.run(request(r));
+                } catch (...) {
+                    err = std::current_exception();
+                    dl.cancel();
+                }
+            });
+            for (int s = 0; s < N; ++s) {
+                const int b = s % 2;
+                if (back[b]) CK(cudaStreamWaitEvent(ps, back[b], 0));  // the loop has copied state s - 2 out
+                CK(cudaMemcpyAsync(dy[b], ys[size_t(s)].data(), bytes, cudaMemcpyHostToDevice, ps));
+                CK(cudaEventRecord(ready[b], ps));
+                back[b] = dl.push_device(s, dy[b], ready[b]);
+            }
+            consumer.join();
+            CK(cudaStreamSynchronize(ps));
+            for (int i = 0; i < 2; ++i) {
+                cudaFree(dy[i]);
+                cudaEventDestroy(ready[i]);
+            }
+            cudaStreamDestroy(ps);
+            CK(cudaSetDevice(dev));
+            if (err) std::rethrow_exception(err);
+            same(r, what + ", device feed (" + dl.feed_path() + ")");
+        }
+    }
+}
+#endif
 
 }  // namespace
 
@@ -203,6 +362,28 @@ int main() {
         ds.has_forcings = false;
         expect(throws_with([&] { DownscaleAssembly::from_config(ds, fc); }, "no `forcings` section"), "no forcings section rejected");
     }
+
+    // ---- 6. the device loop (CUDA builds, VARDA_TEST_TD_MODEL)
+#ifdef VARDA_WITH_CUDA
+    {
+        const char* td = std::getenv("VARDA_TEST_TD_MODEL");
+        int n_dev = 0;
+        if (cudaGetDeviceCount(&n_dev) != cudaSuccess) n_dev = 0;
+        if (!td || !*td) {
+            std::printf("note: VARDA_TEST_TD_MODEL not set: device loop test skipped\n");
+        } else if (n_dev == 0) {
+            std::printf("note: no CUDA device: device loop test skipped\n");
+        } else {
+            for (Precision p : {Precision::FP32, Precision::FP16}) {
+                try {
+                    test_device_loop(td, p);
+                } catch (const std::exception& e) {
+                    expect(false, std::string("device loop test threw: ") + e.what());
+                }
+            }
+        }
+    }
+#endif
 
     if (failures) {
         std::printf("%d failure(s)\n", failures);

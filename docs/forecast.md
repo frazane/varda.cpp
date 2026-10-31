@@ -133,8 +133,15 @@ rollout only), `VARDA_TD_BUFFERS` (window output buffers handed to the hourly wr
 (1: page-locked window buffers; slower start, kept as an experiment), `VARDA_TD_PRIORITY` (0: default-priority CUDA
 stream for the downscaler), `VARDA_FC_WRITER_THREADS` (OpenMP threads of the 6-hourly writer while overlapping, default
 8), `VARDA_TD_WRITER_STATES` (hourly states the downscaler's writer encodes at once, default 3; 1 = one at a time) and
-`VARDA_TD_WRITER_THREADS` (OpenMP threads per such state, default threads / states; `docs/io-output.md` §2). None
-changes a result.
+`VARDA_TD_WRITER_THREADS` (OpenMP threads per such state, default threads / states; `docs/io-output.md` §2). On CUDA
+with the device rollout the downscaler's loop is device-resident (`docs/downscaler.md` §2): `VARDA_TD_DEVICE_LOOP=0`
+forces the host loop (inputs assembled on the host and uploaded, outputs through `predict_step`'s own copy);
+`VARDA_TD_STAGING_MB` / `VARDA_TD_STAGING_SLOTS` (page-locked staging ring of the outputs, default 4 slots of 64 MB),
+`VARDA_TD_COPY_THREADS` (OpenMP threads copying out of it, default 8), `VARDA_TD_RING` (forecaster states in flight on
+the device, default 2), `VARDA_TD_HOLD` (0 / 1: never / always copy a window's output to a hold buffer; default when
+the GPU has room), `VARDA_TD_CHECK_INPUTS=1` (compare every device-assembled window input with the host assembly,
+bitwise; prints one line per window, exit code 3 on a difference; slower), and `VARDA_FC_COPY_THREADS` (OpenMP
+threads of the rollout callback's copy of each step into host memory, default 8). None changes a result.
 
 One GPU job, A100-SXM4-80GB, 32 CPUs, 2026-10-23, `varda-forecast --realdata ... --precision fp16`
 (device rollout, CUDA graph on, 4 steps, write queue 4, 32 OpenMP threads), the same command run three times in the

@@ -89,6 +89,68 @@ block (the loop assembles the start slot and the forcings before calling it); th
 between that call's return and the call of `y_at(s + 1)`. `WindowTimes` also reports `wait_input` (blocked in
 `y_at`) and `wait_output` (blocked in `out_buffer`). The buffers are allocated on first use.
 
+### The device-resident loop (CUDA)
+
+`varda::cuda::DeviceDownscaler` (`src/varda/cuda/downscale_cuda.h/.cpp`) runs the same loop, with the same
+`DownscaleRequest` and bitwise the same inputs and outputs, without moving the window inputs through the host. It is
+what `varda-forecast` uses on CUDA with the device rollout (§7); `--host-loop`, the CPU and Metal backends,
+`VARDA_TD_DEVICE_LOOP=0` and `varda-downscale` (which feeds host states) keep `Downscaler::run`.
+
+```cpp
+varda::Downscaler ds(*td, fc);                                  // as above: checks, assembly table
+varda::cuda::DeviceDownscaler dl(ds, forecaster_device);        // device buffers, pinned ring, streams, events
+rollout.set_step_hook([&](int s, const float* d_y, cudaEvent_t ready) { return dl.push_device(s, d_y, ready); });
+std::thread t([&] { dl.run(rq); });                             // rq as for ds.run (y_at unused with a producer)
+rollout.run(q); t.join();
+```
+
+- **Forecaster states on the device.** `DeviceRollout::set_step_hook` (`docs/rollout-engine.md`) calls the hook on the
+  rollout's thread right after step s is enqueued, with `y_[s % 2]` (the rollout's device output of step s) and the event
+  that ends step s. `push_device` enqueues, on a stream of the forecaster's device, a wait for that event and a copy of
+  `y_s` (452 MB) into a ring of `ring_states` (2) device slots on the downscaler's device, and returns the event recorded
+  after the copy; the rollout's step s + 2, the next writer of `y_[s % 2]` (its state update writes the window, never
+  `y`), waits for that event on the GPU, as it already waits for its own device-to-host copy of `y_s`. No host
+  synchronisation on the rollout's streams. On one device the copy is a `cudaMemcpyAsync` (device to device); across
+  devices (`Options::cuda_device` of the downscaler differing from the forecaster's) a `cudaMemcpyPeerAsync`, direct when
+  `cudaDeviceCanAccessPeer` allows enabling peer access, otherwise staged through the host by the driver (`forecast.json`:
+  `device_loop.feed` = `same-device`, `peer` or `peer-staged-by-driver`). `push_device` blocks the rollout's host thread
+  only while its ring slot still holds a state that no window has consumed (window s - 2 not yet assembled).
+- **Inputs assembled on the device**, on the downscaler backend's (high-priority) stream:
+  - slot 0 of window 0: assembled on the host from `x0` by `DownscaleAssembly::fill_slot` (as the host loop) and uploaded
+    once before the first window, with the constant forcings compacted to `(G, 6)` (resident for the run);
+  - slot 0 of window k >= 1: a device copy of window k - 1's slot 1. Both are `y_{k-1}`, the same constants, and the
+    forcings of the same date (the host loop's `f_start <- f_end`), so the copy is bitwise what assembling it gives;
+  - slot 1: the kernel `gather_columns` (`kernels.h`) from the ring slot of `y_k`, the constants and the forcings, with
+    `DownscaleAssembly`'s per-channel table (source and column). It only copies values;
+  - the dynamic forcings of the window end are computed on the host by `compute_forcings` into page-locked memory and
+    uploaded (34 MB), as `DeviceRollout` does for its own forcings (there is no device forcing code; host and device
+    forcings are the same array, bitwise).
+- **Forward pass**: `CudaBackend::enqueue_predict` (the backend's own input/output buffers and CUDA graph: what
+  `predict_step` runs between its two copies), then a device copy of the `(6, G, 67)` output (2.7 GB) to a hold buffer, so
+  that window k + 1's forward pass can overwrite the backend's output while window k is being copied out. The hold buffer
+  is allocated when the device has room for it plus 2 GB (`VARDA_TD_HOLD=0|1` forces it); without it window k + 1's
+  forward waits for window k's copy.
+- **Outputs through a page-locked staging ring.** A drain thread copies each window's outputs device-to-host in chunks of
+  64 MB through 4 pinned slots (256 MB, allocated once; `VARDA_TD_STAGING_MB`, `VARDA_TD_STAGING_SLOTS`), each chunk then
+  copied by an OpenMP team of 8 threads (`VARDA_TD_COPY_THREADS`) into the caller's pageable `out_buffer(k)`, and calls
+  `on_output(k, t, ..)` as soon as state t is complete. `on_output` and `out_buffer` are called on the drain thread, in
+  order. The window buffers stay pageable (page-locking them is what costs seconds, §7).
+- **Lifetimes and events.** Ring slot s % R: written by `push_device(s)` after the copy stream waited for
+  `ev_consumed[slot]` (window s - R's gather), read by window s's gather after the downscaler stream waited for
+  `ev_copied[slot]`. Backend input: slot 0 is overwritten (window k's copy) only after window k - 1's forward pass in stream
+  order. Backend output: copied to the hold buffer in stream order; the hold buffer is overwritten by window k + 1 only
+  after the downscaler stream waited for `ev_drain_done` (the last device-to-host chunk of window k). Every
+  cross-thread wait on an event is preceded by a host-side check that the event was recorded (`cudaStreamWaitEvent` on a
+  not yet recorded event would not wait); those host waits are on enqueue order, not on GPU completion.
+- Everything is allocated in the constructor (device buffers, about 3.7 GB for Varda with the hold buffer; 336 MB pinned),
+  before the rollout starts, so no allocation happens while another thread captures a CUDA graph.
+
+`DeviceDownscaler::window_times()` gives the `WindowTimes` fields with `assemble` = GPU time of the forcing upload, slot
+copy and gather, `predict` = GPU time of the forward pass alone, `d2h` = GPU time from the first to the last staging chunk,
+`host_copy` = summed copies out of the staging slots, `window` = wall time from the window's first enqueue to its last
+`on_output` (`forecast.json`: `window_assemble_ms`, `window_predict_ms`, `window_d2h_ms`, `window_host_copy_ms`,
+`window_ms`). Verification: `tests/test_downscale.cpp` §6 (§4) and `VARDA_TD_CHECK_INPUTS=1` on real data (§7).
+
 ## 3. The app (`varda-downscale`)
 
 ```
@@ -140,6 +202,14 @@ The window counts, dates and `--date` come from the files (`date`/`date0` metada
   (input `[0, 3]`, output `[1, 2]`, 2 h).
 - `varda-downscale --smoke` on the synthetic interpolator `g` (`python/tests/synthetic.py`) and on Varda-td with
   the real forecaster's names and grid: see §6.
+- The device loop (§2), `tests/test_downscale.cpp` §6, with `VARDA_TEST_TD_MODEL=<converted interpolator>` and a GPU
+  (skipped otherwise; the synthetic `g`; `h` has no `forcings` section and is skipped): against `Downscaler::run` on the
+  same CUDA model, every window's assembled input and every output bitwise equal, with the states fed from the host
+  (`y_at`) and from device buffers (`push_device`, the producer reusing its two buffers only after the returned event, as
+  the device rollout), with and without the hold buffer, a ring of one and of two states, staging chunks that do not
+  divide a state, fp32 and fp16. `tests/test_cuda_kernels.cu`: `gather_columns` against `fill_slot`, bitwise (NaN
+  payloads, -0, denormals, inf included). On real data `varda-forecast` with `VARDA_TD_CHECK_INPUTS=1` compares every
+  device-assembled window input with the host assembly from the same states (§7).
 - Reference comparison: §6 (judged: §7).
 
 ## 5. Memory inputs versus anemoi-inference's GRIB inputs
@@ -376,16 +446,65 @@ other threads wherever it is done: on the downscaler's thread before window 0 (`
 background from the start, or after the rollout set-up, 18.0-19.1 s (ready 6.6-7.2 s instead of 4.0 s), and the process
 exit then spends 1.7-4 s unpinning; none is kept.
 
+**Device-resident loop** (§2; since the concurrent hourly encoding above). Measured in one job (A100-SXM4 96 GB
+"PG506-232", 32 CPUs, CUDA graph on, `--assets`, warm file caches, no other job on the node during the runs;
+`$VARDA_SCRATCH/jobs/td-devloop-2`), the committed binary (host loop) against this one, alternating after one discarded
+run; fp32 and three more fp16 pairs in `td-devloop-4` (same node type; other jobs on the node, so noisier). Seconds;
+`forecast.json` unless "process":
+
+| | fp16 24 h before | fp16 24 h after | fp16 120 h before | fp16 120 h after | fp32 24 h before | fp32 24 h after |
+|---|---|---|---|---|---|---|
+| process wall clock | 17.36 / 17.18; 17.92 / 17.67 / 17.39 | **16.40 / 17.09; 17.32 / 16.63 / 16.76** | 59.26 / 59.98 | 59.03 / 60.15 | 67.14 / 65.52 | 71.97 (cold load 7.7 s) / 65.48 |
+| total | 16.58 / 16.55; 16.92 / 16.77 / 16.58 | **15.71 / 16.40; 16.46 / 15.79 / 15.71** | 58.61 / 59.01 | 58.05 / 58.73 | 65.83 / 64.65 | 70.82 / 64.39 |
+| downscaler loop | 10.31-10.46 | 7.95-8.53 | 51.67 / 52.31 | 49.54 / 49.89 | 52.75 / 52.94 | 52.54 / 52.83 |
+| loop blocked on the writer | 0 | 2.54-2.88 | 0 | 30.9 / 31.1 | 0 | 0 |
+| writing after the last window | 1.91-1.95 | 3.31-3.67 | 1.97 / 2.04 | 3.61 / 3.71 | 1.94 / 1.97 | 1.79 / 1.78 |
+| per-window `predict` (ms) | 1144-3490 (incl. copies), mean 2180 | 657-674 (GPU, forward only) | mean 2372-2389 | 654-677 | 6893-7320 | 6529-6552 |
+| per-window assembly (ms) | 114-192 (host) | 16-22 (GPU; window 0: 658 before the kernel preload below) | 121-194 | 2-36 | 117-131 | 2-3 |
+| per-window device-to-host (ms) | in `predict` | 382-955, mean 610-760 | | 444-983, mean 770 | | 334-453 |
+| per-window host copy out of the ring (ms) | | 419-1018 | | 468-1050 | | 359-509 |
+| rollout callback copy of y (total) | 0.74-0.97 | 0.30-0.36 | 5.96 / 5.95 | 0.98 / 0.99 | 0.14-0.15 | 0.09 |
+| rollout (s) | 4.39-4.81 | 4.96-5.19 | 17.0 / 17.1 | 40.0 / 40.3 (held back by the ring, below) | 45.8 / 46.0 | 45.7 / 45.9 |
+
+Every run is byte-identical: fp16 24 h to `td-final/out-fp16-2` (35 files, `cmp`; `varda-grib-compare --require-bytes`
+on one), fp16 120 h to the committed binary's 120 h run (163 files), fp32 to `td-final/out-fp32` (35 files,
+`--require-bytes` on one); so are the variants below. `VARDA_TD_CHECK_INPUTS=1` (`td-devloop-1`, fp16 24 h): the 4
+windows' device-assembled inputs (both slots) bitwise equal to the host assembly from the same states. The hold buffer
+was allocated in every run (free device memory at set-up: 49.9 GB fp16, 13.8 GB fp32, both models on one GPU); device
+buffers 3.7 GB, pinned 336 MB.
+
+What it changes: the window's own GPU work is the forward pass (0.66 s, against 1.1-3.5 s for `predict_step` with its
+pageable copies), the assembly is 16-22 ms on the GPU (against 0.12-0.19 s on the host), and the outputs reach the
+window buffers in 0.4-1.0 s on the drain thread while the next window runs. But the end-to-end gain is small: fp16 24 h
+0.6-0.9 s (process 16.4-17.3 s against 17.2-17.9 s), 120 h none (59.0 / 60.2 s against 59.3 / 60.0 s), fp32 none
+(GPU-bound). The loop's copies were not what set the total: **the hourly GRIB writer is the critical path** once the copies
+are gone. The loop now waits for free window buffers (2.5-2.9 s at 24 h, 31 s at 120 h: `window_wait_buffer_ms`, 0.66-1.6 s
+per window) and the writer needs 3.3-3.7 s after the last window (two rounds of three hours). At 120 h the writer encodes 121
+hours at ~0.45 s per hour (encode 95 s and write 31 s summed over its 3 workers), the same pace at which the old loop
+produced them (2.4 s per window of 6 hours), so the old loop and the writer were already matched: removing the copies only
+moved the waiting into "blocked on the writer". The rollout then runs further behind (40 s instead of 17 s for 20 steps):
+its hook blocks while the ring still holds a state no window has consumed, which costs nothing (the 6-hourly files finish
+2.9 s after the rollout instead of 12.8 s, well before the hourly ones).
+
+Variants (fp16 24 h, one run each, same job): `VARDA_TD_COPY_THREADS=4` 18.98 s process (ready 5.6 s: a slow start, not the
+copy; host copy 0.8-1.3 s per window), 16 threads 16.50 s, `VARDA_TD_BUFFERS=3` 16.88 s (loop 6.7 s, 0 s blocked, but 5.2 s of
+writing after it: the same writer), `VARDA_TD_DEVICE_LOOP=0` (host loop) 17.14 s. None is clearly better than the default
+(8 threads, 2 buffers). The first window's assembly took 0.66 s of GPU time in `td-devloop-1`: the first launch of the
+gather kernel, under the default lazy module loading, waited for the rollout's work; the constructor now launches it once
+(16-22 ms since).
+
 ## 8. Open points
 
-- With the concurrent hourly writer, the fp16 critical path is the downscaler loop on a CPU-saturated node: ~4 s ready,
-  window 0 at ~0.7 s after the rollout starts, 4 windows of 1.2-3.5 s (forward 0.73 s; the rest is the pageable copies of
-  1 GB in and 2.7 GB out per window, slowed by the encoders' CPU load), then 1.9 s of hourly writing. Ways forward, not
-  done: (a) a device-resident loop (inputs assembled on the GPU from the rollout's device outputs, as `DeviceRollout`)
-  and outputs copied through a small page-locked staging ring with a parallel host copy, which removes both the 1 GB
-  upload and the driver's single-threaded staging without locking 5.4 GB; (b) cheaper hourly encoding: the keys part
-  (~40 CPU s: template clone and `set_key_vals` per message) and the column gathers (~23 CPU s) are repeated identically
-  every hour; (c) more CPUs per GPU (the job uses 32 of the node's 128).
+- The fp16 critical path is now the hourly GRIB writer (§7, device-resident loop): ~140 CPU s of encoding per 24 h on
+  32 CPUs (gather 23, keys 37-47, CCSDS packing 70-76, check 3), ~0.45 s per hour with three hours at once. The loop's
+  window is 0.66 s of GPU work and its copies are off the critical path; the loop waits for the writer (2.5-2.9 s at 24 h,
+  31 s at 120 h). Ways forward, not done: (b) cheaper hourly encoding: the keys part (~40 CPU s: template clone and
+  `set_key_vals` per message) and the column gathers (~23 CPU s) are repeated identically every hour; (c) more CPUs per
+  GPU (the job uses 32 of the node's 128). ((a), the device-resident loop, is done: §2, §7.)
+- The device loop across two GPUs (`Options::cuda_device` of the downscaler differing from the forecaster's) is verified by
+  `tests/test_downscale.cpp` §6 on the synthetic model (two A100-SXM4-80GB on NVLink, peer access enabled: `feed` =
+  `peer`, every variant bitwise; `$VARDA_SCRATCH/jobs/td-devloop-5`). The driver-staged path (no peer access) and
+  `varda-forecast` on two GPUs are not exercised here.
 - The overlap is used with the device rollout only; `--host-loop`, CPU and Metal run the downscaler after the rollout.
 - Only downscalers with two input states (window start and end) are supported.
 - Two dates are verified at 24 h. On 2026-10-30T15 every judged table holds without change, 24/24 each:

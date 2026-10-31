@@ -25,6 +25,18 @@ template <class T>
 void assemble_x_data(const float* xn, const float* attr, int T_in, int64_t G, int V, int A, T* out, int ld,
                      cudaStream_t s);
 
+// ---------------------------------------------------------------- downscaler input
+
+// The temporal downscaler's input slot on the device (docs/downscaler.md §2): out[g, c] (leading
+// dimension n_cols) for every grid point g < G and column c < n_cols, taken from the source sel[c]:
+//   0: a[g * lda + col[c]]   (a forecaster state: an output y_k, or x0's newest input slot)
+//   1: b[g * ldb + col[c]]   (the constant forcings, compacted)
+//   2: f[g * ldf + col[c]]   (the dynamic forcings at the slot's date)
+// sel / col are device arrays of n_cols entries. Pure copies, no arithmetic: bitwise the host
+// DownscaleAssembly::fill_slot given the same tables. A source that no column selects may be null.
+void gather_columns(float* out, int n_cols, int64_t G, const int8_t* sel, const int* col, const float* a, int lda,
+                    const float* b, int ldb, const float* f, int ldf, cudaStream_t s);
+
 // ---------------------------------------------------------------- conversions
 
 // dst[r, c] = (Tout) src[r, c] for c < cols; rows x cols with leading dimensions.
