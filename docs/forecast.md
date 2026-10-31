@@ -132,7 +132,9 @@ faulted in as one serial stream at ~100 MB/s), `VARDA_INPUT_IO_THREADS` (input G
 rollout only), `VARDA_TD_BUFFERS` (window output buffers handed to the hourly writer, default 2), `VARDA_TD_PINNED`
 (1: page-locked window buffers; slower start, kept as an experiment), `VARDA_TD_PRIORITY` (0: default-priority CUDA
 stream for the downscaler), `VARDA_FC_WRITER_THREADS` (OpenMP threads of the 6-hourly writer while overlapping, default
-8). None changes a result.
+8), `VARDA_TD_WRITER_STATES` (hourly states the downscaler's writer encodes at once, default 3; 1 = one at a time) and
+`VARDA_TD_WRITER_THREADS` (OpenMP threads per such state, default threads / states; `docs/io-output.md` §2). None
+changes a result.
 
 One GPU job, A100-SXM4-80GB, 32 CPUs, 2026-10-23, `varda-forecast --realdata ... --precision fp16`
 (device rollout, CUDA graph on, 4 steps, write queue 4, 32 OpenMP threads), the same command run three times in the

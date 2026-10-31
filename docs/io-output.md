@@ -61,6 +61,8 @@ C++: `IoConfig::load(path)`; typed structs in `src/varda/io/io_config.h` (`IoVar
 GribOutput(const Model& model, const IoConfig& cfg, templates_dir, out_dir, const DateTime& t);
 void write_initial(names, values /* each G floats on the merged grid */);   // step 0, 70 messages per file
 void write_step(int step_hours, const float* y /* (G, V_out) physical */);   // 67 messages per file
+void write_step(int step_hours, const float* y, const float* forecaster_y, std::function<void()> release);
+void set_concurrency(int states, int threads = 0);   // optional, before the first write
 void close();                      // files appear under their final names only here (written as .part)
 ```
 `out_dir` is the root of the configured relative paths (`out_dir/outputs/...`). The constructor reads
@@ -82,6 +84,30 @@ What it does, in anemoi's order:
    one `set_key_vals` (falls back to key by key, as anemoi does), `values` as float64, write + flush per
    message, then `check_encoding` (every key read back; fails the run on mismatch).
 4. File name from the encoded handle (`dateTime`, `step`), `{step}` unpadded.
+
+**Concurrency.** By default one state is encoded at a time: its messages in parallel (OpenMP, one ecCodes handle per
+message), then written in field order on a helper thread while the next state is encoded (`close()`, `stats()` and
+`files()` wait for those writes and rethrow their errors). `set_concurrency(states, threads)` encodes whole states at
+the same time; the only thing a state carries to the next is the top-level `accumulate` (tp), so:
+
+- the calling thread runs step 1 (top-level post-processors: the tp accumulation and rescale, reading the tp column
+  straight from `y`) and the template look-ups, in call order, then queues the state (at most `states` encoding and
+  one waiting; the call blocks while that is full);
+- `states` worker threads, each with an OpenMP team of `threads` (default: the caller's `omp_get_max_threads() /
+  states`; separate std::threads, so the teams do not nest), take states in call order, gather the state (transpose
+  `y`, and the forecaster's state when an output copies from it, into the worker's own buffers), call `release` (the
+  caller may now reuse `y`), encode steps 2-4 as above and write;
+- file order: each state takes, in call order and per output, a registration turn in which it creates the files it
+  writes that are new (so `files()` lists them in call order, as the sequential mode) and queues itself on each file;
+  it writes a file once it is first in that file's queue, so every file receives its messages in call order and states
+  that write different files (the hourly output: one file per hour) write at the same time;
+- errors: the first error of a state is kept; the next `write_initial` / `write_step` and `close()`, `stats()`,
+  `files()` rethrow it, and states queued after it are dropped (their `y` still released). The destructor drops queued
+  states.
+
+The messages and files are byte-identical in both modes (`test_io_output` compares them; `varda-forecast` runs are
+compared with `--require-bytes`). `varda-forecast` uses it for the downscaler's hourly output (`VARDA_TD_WRITER_STATES`,
+`VARDA_TD_WRITER_THREADS`; `docs/downscaler.md` §7); the 6-hourly writer stays sequential.
 
 Keys, e.g. (checked in `tests/io/test_io_output.cpp`):
 ```

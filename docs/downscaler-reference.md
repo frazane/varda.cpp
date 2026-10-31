@@ -4,8 +4,8 @@ The second model of Varda-single-1.0 is the 1-hourly temporal downscaler
 (`varda-temporal-downscaler-det-sgm/model.ckpt`, sha256 `452fda53b073…`, uuid `00e40f03-2f7e-4c1c-8e6d-91ed9062249f`).
 This page records what the original runner does, and the reference files the C++ side is judged against. The
 data come from the forecaster reference outputs of `docs/realdata-reference.md` (2026-10-22T15, steps 0 .. 24 h
-every 6 h). Code (tools only): `python/reference/realdata/{run_reference_downscaler.py, job_reference_downscaler.sh,
-compare_downscaler.py}`. Artefacts: `$VARDA_SCRATCH/downscale/ref/20261022T15/<tag>/`.
+every 6 h; a second date, 2026-10-30T15, in §6.4). Code (tools only): `python/reference/realdata/{run_reference_downscaler.py, job_reference_downscaler.sh,
+compare_downscaler.py}`. Artefacts: `$VARDA_SCRATCH/downscale/ref/<YYYYmmddTHH>/<tag>/`.
 
 ## 1. Results at a glance
 
@@ -353,9 +353,65 @@ or zero (the same forecaster run), and the worst message is tp for the same-inpu
 | 23 | 1.10e-05 (V@isobaricInhPa:50) | 5.45e-03 (U@isobaricInhPa:50) | 1.02e-02 (V@isobaricInhPa:500) |
 | 24 | 5.56e-06 (TOT_PREC@surface:0) | 3.91e-03 (TOT_PREC@surface:0) | 1.09e-02 (V@isobaricInhPa:400) |
 
+### 6.4 A second date: 2026-10-30T15
+
+The same four runs were made on a second forecaster reference run, with `DATE=2026-10-30T15`. They land in
+`$VARDA_SCRATCH/downscale/ref/20261030T15/{fp16,fp32,fp16-fp32in,cpu-fp32}/` and `spreads.json` there; the forecaster
+runs are `$VARDA_SCRATCH/realdata/20261030T15/ref-fp{16,32}`.
+
+**Inputs.** The inputs were frozen by `python/fetch_inputs.py` (`$VARDA_SCRATCH/inputs/20261030T15/`). That layout keeps
+only the IFS messages the run reads (`*.subset.grib2`, byte ranges of the published files) and the 11 KENDA variables
+the run reads. The replay of `run_reference_realdata.py` serves the published `.index` and reads byte ranges of the
+full IFS files, so it needs `fetch_realdata.py`'s layout.
+- The KENDA part (11 variables, all 61 STAC items, the two constant assets) was copied.
+- The full IFS files were fetched a day later, with `fetch_realdata.py ecmwf --date 2026-10-30T15 --latest
+  2026-10-30T12:00:00`, the run `fetch_inputs.py` had pinned. Prognostics t-6h = 06Z+3h and t = 12Z+3h, constants
+  12Z+0h.
+- The 136 subset messages equal the corresponding byte ranges of the full files, and the `.index` files are identical.
+- `varda-forecast` writes byte-identical files from either layout (35 files).
+
+**Runs** (A100-SXM4-80GB for the GPU runs; fp16 and fp32 ran concurrently on one node):
+
+| run | windows 0..3 (s) | execute (s) |
+|---|---|---|
+| `fp32` | 12.95, 8.50, 8.50, 8.51 | 241 |
+| `fp16-fp32in` | 6.23, 3.95, 1.75, 1.73 | 218 |
+| `fp16` | 6.40, 1.74, 1.75, 1.75 | 213 |
+| `cpu-fp32` (EPYC 7713, 64 threads, `pyg`) | 243.3, 190.9, 192.2, 191.3 | 1079 (62 GB RSS) |
+
+**Checks.**
+- `tp_check`: 24/24 in all four runs.
+- `copy_check`: steps 6/12/18/24 have 66/66 non-tp messages bitwise equal to the forecaster's; step 0 has 66/66
+  bitwise (62/66 on 10-22).
+- Packing loss: 1.19e-7 (`u_400`), `z` max_abs 0.002.
+
+**Spreads**, worst variable or message over all windows and hours, against the first date:
+
+| spread | 2026-10-22T15 | 2026-10-30T15 |
+|---|---|---|
+| raw `y`, cpu-fp32 vs fp32 | 5.2e-6 (`tp`, w1 h6) | 6.3e-6 (`tp`, w0 h1) |
+| raw `y`, fp16-fp32in vs fp32 | 7.3e-3 (`tp`, w0 h2) | 6.9e-3 (`q_200`, w3 h3) |
+| raw `y`, fp16 vs fp32 (whole chain) | 1.04e-2 (`tp`, w0 h4) | 1.69e-2 (`u_300`, w3 h6) |
+| model input, fp16 vs fp32 (the forecaster's fp16 effect) | 5.6e-3 (`v_300`, w3 slot 1) | 1.71e-2 (`u_300`, w3 slot 1) |
+| decoded GRIB, cpu-fp32 vs fp32 | 1.4e-5 | 1.05e-5 |
+| decoded GRIB, fp16-fp32in vs fp32 | 8.9e-3 | 9.9e-3 (V@50, step 9) |
+| decoded GRIB, fp16 vs fp32 | 1.09e-2 | 3.13e-2 (U@400, step 24; 5 messages above 2e-2) |
+
+What the spreads show:
+- The downscaler's own fp16 effect on identical inputs is about the same on both dates (7e-3).
+- The forecaster's fp16 trajectory diverges about 3x more on the second date. The whole-chain spreads grow with it,
+  most at the boundary hours, whose fields are the forecaster's.
+- Per window and hour the original's own spreads differ by up to 1.9x between the dates (cpu-fp32 vs fp32 at w0 h1:
+  2.9e-6 and 6.3e-6; fp16-fp32in vs fp32 at w3 h3: 4.2e-3 and 6.9e-3).
+- `python/reference/calibrate_downscale_tolerances.py` on the second date's spreads would raise 13 of the 24 fp16
+  `y_var` limits (up to 1.76x) and 7 of the 24 fp32 ones (up to 1.90x), and lower others. On the first date's spreads it
+  reproduces `tolerances/downscale/varda-td.json` exactly. The tolerance file is unchanged; the verdicts are in
+  `docs/results.md` §6.
+
 ## 7. Not done / limits
 
-- One date (2026-10-22T15) and one lead time (24 h, 4 windows); no ensemble. The hourly GRIB files were checked with ecCodes keys
+- Two dates (2026-10-22T15, the calibration date, and 2026-10-30T15) and one lead time (24 h, 4 windows); no
+  ensemble. The tolerances are calibrated on the first date only (§6.4). The hourly GRIB files were checked with ecCodes keys
   and by value, not with an independent encoder.
 - `uuid` in `model_io.safetensors` metadata reads `None` in the four runs (the checkpoint object does not expose it; the
   driver now writes the known uuid for future runs); `checkpoint_sha256` in each `manifest.json` is `452fda53b073…`.

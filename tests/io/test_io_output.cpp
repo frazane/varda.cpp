@@ -6,12 +6,18 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <limits>
+#include <mutex>
 #include <string>
+#include <vector>
 
 #include "varda/io/grib.h"
 #include "varda/io/io_config.h"
@@ -338,6 +344,139 @@ static void test_td_end_to_end(const std::string& cfgpath, const std::string& td
     fs::remove_all(out);
 }
 
+static std::string file_bytes(const std::string& p) {
+    std::ifstream f(p, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+}
+
+// Concurrent mode (GribOutput::set_concurrency): the same files, bytes and creation order as the sequential
+// mode, every y released exactly once (through a pool of two buffers, as varda-forecast's window buffers), the
+// three-argument write_step, and an error of a state rethrown by close().
+static void test_td_concurrent(const std::string& cfgpath, const std::string& tdir) {
+    IoConfig c = IoConfig::load(cfgpath);
+    const int64_t n0 = 1147980, n1 = 540670, N320 = 542080;
+    std::vector<GridSource> src(2);
+    src[0].name = "lam_0";
+    src[0].mask.assign(size_t(n0), 1);
+    src[1].name = "global";
+    src[1].mask.assign(size_t(N320), 1);
+    for (int64_t k = 0; k < 1410; ++k) src[1].mask[size_t(62219 + 20 * k)] = 0;
+    const int64_t G = n0 + n1;
+    const size_t V = c.output_variables.size();
+    namespace fs = std::filesystem;
+    const std::string root = env_or("TMPDIR", "/tmp") + "/varda-test-td-conc-" + std::to_string(::getpid());
+    const DateTime t{2026, 10, 22, 15, 0, 0};
+    size_t jtp = 0;
+    for (size_t j = 0; j < V; ++j)
+        if (c.output_variables[j] == "tp") jtp = j;
+    std::vector<float> fy(size_t(G) * V);
+    for (int64_t g = 0; g < G; ++g)
+        for (size_t j = 0; j < V; ++j) fy[size_t(g) * V + j] = 5000.0f + float(j) + 0.003f * float(g % 777);
+    std::vector<std::vector<float>> init;
+    for (size_t k = 0; k < c.initial_state_fields.size(); ++k) {
+        std::vector<float> f(static_cast<size_t>(G));
+        for (int64_t g = 0; g < G; ++g) f[size_t(g)] = 100.0f + float(k) + 0.001f * float(g % 1000);
+        init.push_back(std::move(f));
+    }
+    auto fill = [&](std::vector<float>& y, int s) {
+        y.resize(size_t(G) * V);
+        for (int64_t g = 0; g < G; ++g)
+            for (size_t j = 0; j < V; ++j) y[size_t(g) * V + j] = float(j) + 0.37f * float(s) + 0.01f * float((g + s) % 100);
+        y[jtp] = -1.0f;
+        y[size_t(G / 2) * V + jtp] = -0.5f * float(s);  // clamped too
+    };
+    const int H = 7;  // hours 0 .. 7: hour 6 copies the forecaster
+    std::vector<std::string> files_seq, files_conc;
+    {
+        GribOutput go(src, c.output_variables, c, tdir, root + "/seq", t);
+        go.write_initial(c.initial_state_fields, init);
+        std::vector<float> y;
+        for (int s = 1; s <= H; ++s) {
+            fill(y, s);
+            go.write_step(s, y.data(), s == 6 ? fy.data() : nullptr);
+        }
+        go.close();
+        files_seq = go.files();
+    }
+    int releases = 0, max_out = 0;
+    bool conc_ok = true;
+    GribOutput::Stats st;
+    {
+        GribOutput go(src, c.output_variables, c, tdir, root + "/conc", t);
+        go.set_concurrency(3, 2);
+        bool threw = false;
+        try {
+            go.set_concurrency(2);
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        expect(threw && go.concurrency() == 3, "concurrent: set_concurrency only once, before the first write");
+        go.write_initial(c.initial_state_fields, init);
+        // two buffers handed over by pointer, as varda-forecast's window buffers
+        std::vector<float> buf[2];
+        bool busy[2] = {false, false};
+        std::mutex mu;
+        std::condition_variable cv;
+        int out = 0;
+        for (int s = 1; s <= H; ++s) {
+            if (s == 4) {  // the three-argument form: y only valid during the call
+                std::vector<float> y;
+                fill(y, s);
+                go.write_step(s, y.data(), nullptr);
+                std::fill(y.begin(), y.end(), -7.0f);  // must not reach the file
+                continue;
+            }
+            int b;
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                cv.wait(lk, [&] { return !busy[0] || !busy[1]; });
+                b = busy[0] ? 1 : 0;
+                busy[b] = true;
+                max_out = std::max(max_out, ++out);
+            }
+            fill(buf[b], s);
+            go.write_step(s, buf[b].data(), s == 6 ? fy.data() : nullptr, [&, b] {
+                std::fill(buf[b].begin(), buf[b].end(), -9.0f);  // released: the caller may overwrite it
+                std::lock_guard<std::mutex> lk(mu);
+                busy[b] = false;
+                --out;
+                ++releases;
+                cv.notify_all();
+            });
+        }
+        go.close();
+        files_conc = go.files();
+        st = go.stats();
+    }
+    expect(releases == H - 1, "concurrent: every y released once (" + std::to_string(releases) + ")");
+    expect(st.max_states_in_flight >= 2, "concurrent: states encoded at the same time (max " +
+                                             std::to_string(st.max_states_in_flight) + ")");
+    expect(files_seq.size() == size_t(H + 1) && files_conc.size() == files_seq.size(), "concurrent: file count");
+    for (size_t i = 0; i < files_seq.size() && i < files_conc.size(); ++i) {
+        const std::string a = files_seq[i].substr((root + "/seq").size()), b = files_conc[i].substr((root + "/conc").size());
+        conc_ok &= a == b && file_bytes(files_seq[i]) == file_bytes(files_conc[i]) && !file_bytes(files_seq[i]).empty();
+    }
+    expect(conc_ok, "concurrent: files in the same creation order and byte-identical to the sequential mode");
+    // an error of a state (hour 12 without the forecaster's state) is rethrown by close(), its y still released
+    bool threw = false;
+    std::atomic<int> rel{0};
+    {
+        GribOutput go(src, c.output_variables, c, tdir, root + "/err", t);
+        go.set_concurrency(2);
+        std::vector<float> y;
+        fill(y, 12);
+        try {
+            go.write_step(11, y.data(), nullptr, [&] { ++rel; });
+            go.write_step(12, y.data(), nullptr, [&] { ++rel; });
+            go.close();
+        } catch (const std::exception&) {
+            threw = true;
+        }
+    }
+    expect(threw && rel.load() == 2, "concurrent: a state's error rethrown by close(), every y released");
+    fs::remove_all(root);  // created by this test
+}
+
 int main() {
     test_pure();
     test_copy_rule_pure();
@@ -365,5 +504,6 @@ int main() {
     }
     test_td_config(tcfg);
     test_td_end_to_end(tcfg, tdir);
+    test_td_concurrent(tcfg, tdir);
     return fails ? 1 : 0;
 }

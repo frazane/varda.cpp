@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -90,21 +91,46 @@ public:
     // be given at every step the post-processor applies to (a positive multiple of its
     // common_leadtime_hours) and is ignored otherwise. nullptr when no output copies.
     void write_step(int step_hours, const float* y, const float* forecaster_y = nullptr);
+    // The same, handing y back: `release` is called exactly once, as soon as y and forecaster_y are no
+    // longer read (sequential mode: before this call returns, also when it throws; concurrent mode: on a
+    // worker thread once the state is gathered, before its messages are encoded, or here if the call
+    // throws). Both must stay valid and unchanged until then.
+    void write_step(int step_hours, const float* y, const float* forecaster_y, std::function<void()> release);
+
+    // Concurrent encoding of whole states (default: off, one state at a time). With states > 1,
+    // write_initial / write_step run the top-level post-processors on the calling thread, in call order
+    // (the tp accumulation is the only state carried from one call to the next), and return as soon as
+    // the state is queued (at most `states` encoding and one waiting; the call blocks while that is
+    // full); `states` worker threads encode whole states at the same time, each with an OpenMP team of
+    // `threads` (0: omp_get_max_threads() of the calling thread / states, at least 1). Files are created
+    // in call order and every file receives its messages in call order, so the files, their bytes and
+    // files() are those of the sequential mode. write_initial copies its values. Call before the first
+    // write; calls must come from one thread at a time. An error of a state is rethrown by the next
+    // write_initial / write_step, by close(), stats() and files(); after it, queued states are dropped.
+    void set_concurrency(int states, int threads = 0);
+    int concurrency() const;
+
     // Closes the files (a file appears under its final name only here; written as <name>.part before).
     // The file writes of the last state are left pending by write_initial/write_step so that they overlap
-    // the next state's encoding; close(), stats() and files() wait for them (and rethrow a write error).
+    // the next state's encoding (concurrent mode: every queued state); close(), stats() and files() wait
+    // for them (and rethrow an encoding or write error).
     void close();
 
     // Files created so far (final names), in creation order, per output.
     std::vector<std::string> files() const;
 
-    // Cumulative wall seconds since construction: top-level post-processors, message encoding
-    // (parallel over the messages of a state), and file writes (in order).
+    // Cumulative seconds since construction: top-level post-processors (calling thread), message
+    // encoding (wall time of each state's parallel encoding, summed over states: in concurrent mode the
+    // states overlap, so it exceeds the elapsed time), and file writes (summed likewise).
     struct Stats {
         double post = 0, encode = 0, write = 0;
         // CPU seconds summed over threads, per part of a message's encoding
         double cpu_gather = 0, cpu_keys = 0, cpu_pack = 0, cpu_check = 0;
         int64_t messages = 0, bytes = 0;
+        // concurrent mode: seconds the writes of a state waited for an earlier state's writes to the same
+        // file (summed), and the most states encoding at once
+        double write_wait = 0;
+        int max_states_in_flight = 0;
     };
     Stats stats() const;
     int64_t n_points() const { return G_; }

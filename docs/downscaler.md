@@ -260,7 +260,7 @@ inputs, 4 windows x 6 hours, both metrics `y` and `y_var`; `$VARDA_SCRATCH/jobs/
 | CPU fp32, 64 threads | original cpu fp32, `fast-fp32-vs-ref` | 0.34 | PASS 24/24 |
 | CUDA fp32 | original cuda fp32 / cpu fp32, `fast-fp32-vs-ref` | 0.33 / 0.47 | PASS 24/24 |
 | CUDA fp16 | original fp16 on the same inputs, `fast-fp16-vs-ref-fp16` | 0.85 | PASS 24/24 |
-| CUDA fp16 | original cuda fp32, `fast-fp16-vs-ref` | 1.02 (`tp`, window 1 hour 6) | 23/24 within; one entry 2% above |
+| CUDA fp16 | original cuda fp32, `fast-fp16-vs-ref` | 1.02 (window 2, hour 1, metric `y`: 4.41e-5 vs 4.3e-5) | 23/24 within; one entry 2% above |
 
 The fp16-vs-fp32 table is 1.75 x one fp16 trajectory of the original, which `docs/rollout.md` §4 showed is not a noise
 floor (equally valid fp16 runs do not track each other closely on single entries); against the original's own fp16 run
@@ -282,8 +282,8 @@ not `--host-loop`) the downscaler no longer waits for the whole rollout:
   ahead of the rollout's steps on the GPU: the hourly writer is the critical path, the 6-hourly files have time to spare.
 - *No copy into the writer queue.* `DownscaleRequest::out_buffer` lets the caller give each window's output buffer
   `(6, G, 67)`; `varda-forecast` hands the six states to the hourly writer by pointer (`StepWriter::push_ref`) and gets
-  the buffer back once the window's last state is written (2 buffers by default, `VARDA_TD_BUFFERS`); the loop waits only
-  when both are in flight. The 6-hourly writer also takes the forecaster's states by pointer when they are kept for the
+  the buffer back once the writer no longer reads any of the six states (2 buffers by default, `VARDA_TD_BUFFERS`); the
+  loop waits only when both are in flight. The 6-hourly writer also takes the forecaster's states by pointer when they are kept for the
   downscaler.
 - *The hourly writer starts with the rollout* (the analysis, hour 0, first), and the 6-hourly writer encodes with 8
   OpenMP threads while the downscaler runs (`VARDA_FC_WRITER_THREADS`), leaving the cores to the hourly one.
@@ -331,16 +331,76 @@ first run in the allocation and 17.29 s warm** (process wall 23.2 / 17.9 s; hour
 summed on the writer thread, 3.2 s after the last window), fp32 63.9 s; every run byte-identical to the reference runs
 (35 files); `--no-downscaler` 7.40 s (10 files, unchanged).
 
+**Concurrent hourly encoding** (since the final binary above). The hourly writer encodes several hours at once
+(`GribOutput::set_concurrency`, `docs/io-output.md` §2): the writer thread runs the top-level post-processors in hour
+order (the `tp` accumulation, the only state carried from hour to hour) and queues the state; 3 worker threads
+(`VARDA_TD_WRITER_STATES`), each with an OpenMP team of threads / 3 (`VARDA_TD_WRITER_THREADS`), transpose, encode and
+write whole hours, each hour's file created in hour order and written by its own worker. A worker releases the window
+buffer's state once it has transposed it; the buffer returns to the pool when all six states of the window are released
+(they may be released in any order). The files are byte-identical. The 6-hourly writer is unchanged (one state at a time).
+
+Measured in one job (A100-SXM4 96 GB "PG506-232", 32 CPUs, CUDA graph on, 2026-10-22T15, 24 h, `--assets`, warm file
+caches; `$VARDA_SCRATCH/jobs/perf2-final2`), the final binary above (`td-final/bin`) against this one, three runs each in
+alternation after one discarded first run (seconds; `forecast.json` unless "process"):
+
+| | fp16 before | fp16 after |
+|---|---|---|
+| process wall clock | 18.00 / 18.03 / 18.14 | **17.47 / 17.20 / 17.12** |
+| total | 17.37 / 17.35 / 17.44 | **16.68 / 16.50 / 16.43** |
+| ready | 3.91-3.96 | 3.98-4.21 |
+| rollout (4 steps, GPU shared with the downscaler) | 4.56-4.58 | 4.30-4.69 |
+| downscaler loop (4 windows) | 10.03-10.10 | 10.34-10.43 |
+| loop blocked on the writer | 0.47-0.95 | **0** |
+| writing after the last window | 3.21-3.25 | **1.92-1.94** |
+| per-window `predict_step` (ms) | 1151-1223, 2950-3375, 1675-1784, 1516-1534 | 1183-1398, 3295-3482, 2033-2207, 1987-2033 |
+| hourly GRIB encode / write (summed over hours) | 7.2-7.4 / 10.1-10.4 | 14.2-15.8 / 6.7-7.5 (3 hours at once) |
+
+Every run byte-identical to the reference runs (`cmp` of all 35 files; `varda-grib-compare --require-bytes` on one fp16
+and one fp32 run); `--no-downscaler` byte-identical, 7.35-7.80 s (`$VARDA_SCRATCH/jobs/perf2-final{,2}`, unchanged path);
+fp32 63.71 s against 63.87 s (`perf2-final`; GPU-bound, the two models need the 96 GB GPU in fp32); `--no-graph` fp16
+16.35-16.90 s. The writer no longer holds the loop back (0 s blocked, 1.9 s after the last window: the last window's six
+hours, two rounds of three), but the gain is only ~0.9 s because the loop itself became slower: windows 2 and 3 take
+~2.0 s instead of ~1.6 s. The hourly encoding costs ~140 CPU seconds per 24 h (gather 23, keys 37-47, CCSDS packing
+70-76, check 3), so with 32 CPUs it occupies the machine while the loop runs, and the window's pageable copies (1 GB
+host-to-device, 2.7 GB device-to-host, staged by the driver on the calling thread) slow down. Two states (instead of 3)
+16.9 s, four 16.6 s, one (sequential) 17.6 s; 8 or 6 threads per state 16.9-17.0 s (same job type, `perf2-s{1,2}`).
+
+What the second window costs, measured (`perf2-s2`, `perf2-s3`): the second window takes ~3.3 s against ~1.2 s for the
+first, also with `--no-graph`, so it is not the graph capture. A warm-up that ran an eager forward on zeros and captured
+the downscaler's graph before its first window (on the downscaler's thread or before the rollout; result discarded)
+measured the capture, instantiation and upload at 1-2 ms and made the run slower (17.1-17.2 s against 16.5 s: one
+extra forward on the shared GPU), so it is not kept. With page-locked window buffers the spike disappears (windows
+0.9-1.7 s): it is the device-to-host copy into pageable memory while both writers load every CPU (the hourly writer
+encoding window 0, the 6-hourly one steps 1-2). Page-locking the 2 x 2.7 GB costs 3.0-3.9 s of kernel time that stalls the
+other threads wherever it is done: on the downscaler's thread before window 0 (`VARDA_TD_PINNED=1`) 18.3-20.3 s; in the
+background from the start, or after the rollout set-up, 18.0-19.1 s (ready 6.6-7.2 s instead of 4.0 s), and the process
+exit then spends 1.7-4 s unpinning; none is kept.
+
 ## 8. Open points
 
-- The hourly GRIB writer (one thread, ~0.45 s per hour: CCSDS encoding in parallel, the file write overlapping the next
-  hour's encoding) is the critical path of an fp16 forecast with the downscaler: 24 h take ~11 s of it after window 0.
-  Encoding the hourly states of different hours concurrently (the `tp` accumulation is the only state carried from hour
-  to hour) would shorten it.
-- The loop is still host-level: each window copies the inputs (1 GB) to the backend and the 2.7 GB of outputs back
-  (pageable memory). A device-resident loop (inputs assembled on the GPU from the rollout's device outputs, as
-  `DeviceRollout`) is not implemented; the writer, not the loop, is the limit in fp16.
+- With the concurrent hourly writer, the fp16 critical path is the downscaler loop on a CPU-saturated node: ~4 s ready,
+  window 0 at ~0.7 s after the rollout starts, 4 windows of 1.2-3.5 s (forward 0.73 s; the rest is the pageable copies of
+  1 GB in and 2.7 GB out per window, slowed by the encoders' CPU load), then 1.9 s of hourly writing. Ways forward, not
+  done: (a) a device-resident loop (inputs assembled on the GPU from the rollout's device outputs, as `DeviceRollout`)
+  and outputs copied through a small page-locked staging ring with a parallel host copy, which removes both the 1 GB
+  upload and the driver's single-threaded staging without locking 5.4 GB; (b) cheaper hourly encoding: the keys part
+  (~40 CPU s: template clone and `set_key_vals` per message) and the column gathers (~23 CPU s) are repeated identically
+  every hour; (c) more CPUs per GPU (the job uses 32 of the node's 128).
 - The overlap is used with the device rollout only; `--host-loop`, CPU and Metal run the downscaler after the rollout.
 - Only downscalers with two input states (window start and end) are supported.
-- One date and one lead time are verified; the fp16 tolerances rest on one reference trajectory (above).
+- Two dates are verified at 24 h. On 2026-10-30T15 every judged table holds without change, 24/24 each:
+  CPU fp32 0.42, CUDA fp32 0.43 / 0.78 (vs the original's cuda / cpu fp32), CUDA fp16 0.89 vs the original's fp32 and
+  0.85 vs its fp16 on the same inputs, and 0.68-0.81 for the loop assembled in memory from the original's rollouts.
+  The hourly files match within 2.2e-5 (fp32) and 2.35e-2 (fp16). The fp16 figure is set by the forecaster's copied
+  fields at hour 24; the original's own fp16 chain differs from its fp32 chain by 3.13e-2 there. Hour 0 is 66/66
+  messages byte-identical (`docs/results.md` §6, `docs/downscaler-reference.md` §6.4). The first date's one entry above
+  tolerance (1.02, `fast-fp16-vs-ref`, §7) is window 2 (0-based), hour 1, metric `y` (overall rel_absmax 4.41e-5
+  against 4.3e-5).
+- Two dates are verified at 24 h; at 120 h (20 windows) only self-consistency is checked (`docs/results.md` §6: the
+  first 24 h byte-identical to a 24 h run, the copy rule at every 6 h, `tp` monotone), as no reference exists there.
+- The tolerances are still calibrated on one date (2026-10-22T15). The original's own spreads differ by up to 1.9x
+  between the two dates. The same rules applied to the 10-30 spreads give larger limits on 13 of 24 fp16 `y_var`
+  entries (up to 1.76x) and on 7 of 24 fp32 ones (up to 1.90x), and smaller ones elsewhere. The 10-22 runs would
+  exceed such a table (1.31) while the 10-30 runs pass the current one. Calibrating on the element-wise maximum of several
+  dates is not done (tolerances are not loosened without the integrator).
 - Metal: the backend is not yet generalised to T_out > 1 (`docs/metal.md`).

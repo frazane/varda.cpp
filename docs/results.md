@@ -289,18 +289,97 @@ For scale, the original's own spreads on the same states: CPU fp32 vs CUDA fp32 
 7.3e-3, fp16 vs fp32 (whole chain) 1.04e-2 (`docs/downscaler-reference.md`). The error is flat over the six hours and
 the four windows. Judged with `tolerances/downscale/varda-td.json` (per window and hour, from those spreads by the
 one-step rules): CPU fp32 0.34, CUDA fp32 0.33 (vs cuda fp32) / 0.47 (vs cpu fp32), CUDA fp16 0.85 vs the original's
-fp16 on the same inputs, all 24/24 within; CUDA fp16 vs the original's fp32: 1.02 on one entry (`tp`, window 1 hour 6),
-23/24 within, reported (one fp16 trajectory is not a noise floor, `docs/rollout.md`).
+fp16 on the same inputs, all 24/24 within; CUDA fp16 vs the original's fp32: 1.02 on one entry (window 2, hour 1, the overall
+metric `y`: 4.41e-5 against 4.3e-5), 23/24 within, reported (one fp16 trajectory is not a noise floor, `docs/rollout.md`).
 
 **Real-data forecast with the downscaler** (`varda-forecast --downscaler`, 2026-10-22T15, 24 h, A100-SXM4-80GB,
 32 threads, fp16 graph on; `docs/downscaler.md` §7): the 25 hourly GRIB files against anemoi-inference's: worst message
 `rel_absmax` 1.5e-2 fp16 (the original's own whole-chain fp16-vs-fp32 difference is 1.04e-2), 1.4e-5 fp32; hour 0:
 62 of 66 messages byte-identical (the other 4 differ at re-quantisation level, as the original's own re-encode does);
 two runs byte-identical (2350 messages). Process wall clock
-**17.3 s warm, 18.8 s for the first run in the allocation** with the final binary (the downscaler overlapping the
-rollout, outputs handed to the hourly writer by pointer, file writes overlapping the encoding; `docs/downscaler.md` §7),
-and 63.9 s fp32; 23.3-24.3 s / 73-94 s before those changes. Same job, same
+**17.1-17.5 s warm, 18.8 s for the first run in the allocation** with the final binary (the downscaler overlapping the
+rollout, outputs handed to the hourly writer by pointer, the hourly writer encoding three hours at once: 18.0-18.1 s
+with one hour at a time, three alternating runs each in one job; `docs/downscaler.md` §7), and 63.7-63.9 s fp32;
+23.3-24.3 s / 73-94 s before those changes. Same job, same
 GPU, the original (the notebook's two anemoi-inference commands): fp16 215-247 s + 192-194 s against 23.7 s for the
 binary of that job, about 17x (about 23x with the final binary's 17.3 s, measured in a later job); fp32 250 s + 217 s
 against 75.3 s, 6.2x (7.3x with the final 63.9 s). The node was shared with another job of ours; the forecaster-only
 136 s vs 8.2 s of section 5 was on an idle node.
+
+### Second date: 2026-10-30T15
+
+**Setup.** Same pipeline on a second real-data date. The inputs were frozen by `python/fetch_inputs.py`; the full IFS
+files the reference replay needs were fetched separately (`docs/downscaler-reference.md` §6.4). References:
+- anemoi-inference's forecaster (`realdata/20261030T15/ref-fp{16,32}`);
+- its `temporal_downscaler` runner (`downscale/ref/20261030T15/{fp32,fp16-fp32in,fp16,cpu-fp32}`).
+
+varda.cpp was the same binary as above, on an A100 96 GB with 32 threads and the CUDA graph on, plus EPYC 7713 with
+64 threads for the CPU row. The windows are numbered from 0, the hours 1..6. The tolerances are unchanged
+(`tolerances/downscale/varda-td.json`, calibrated on 2026-10-22T15).
+
+| engine, inputs | reference, table | worst x tolerance (entry) | within | 2026-10-22T15 |
+|---|---|---|---|---|
+| CPU fp32, reference inputs | original cpu fp32, `fast-fp32-vs-ref` | 0.42 (w0 h1, `tp` 4.2e-6) | 24/24 | 0.34 |
+| CUDA fp32, reference inputs | original cuda fp32 / cpu fp32, `fast-fp32-vs-ref` | 0.43 (w3 h2, `q_700`) / 0.78 (w0 h1, `tp` 7.8e-6) | 24/24 | 0.33 / 0.47 |
+| CUDA fp16, reference inputs | original cuda fp32, `fast-fp16-vs-ref` | 0.89 (w3 h3, `q_200` 6.6e-3) | 24/24 | 1.02 (w2 h1, `y`), 23/24 |
+| CUDA fp16, reference inputs | original fp16 on the same inputs, `fast-fp16-vs-ref-fp16` | 0.85 (w0 h1, `y`) | 24/24 | 0.85 |
+| CUDA fp32 / fp16, loop assembled in memory from the original's fp32 / fp16 rollout | original fp32 / fp16, same tables | 0.68 / 0.81 | 24/24 | |
+| loop from varda.cpp's own forecast | original fp32 / fp16 | 3.1 / 5.0, reported only | 4/24, 16/24 | 3.3 / 1.8 |
+
+How to read the table:
+- The full loop fed by varda.cpp's own forecaster run differs from the reference by the forecasters' own difference.
+  That difference is fp16 2.3e-2 (`v_300`) and fp32 2.2e-5 at step 4. The forecaster rollout itself passes
+  `fast-fp16-vs-ref-fp16` at 0.67 on this date, with `x0` bitwise equal to the reference's.
+- The assembled inputs differ from the reference's GRIB-decoded ones by at most 1.2e-7 (24-bit packing). Forcings,
+  `lsm` and lat/lon are bitwise equal, as on the first date.
+
+**Hourly GRIB files** against anemoi-inference's (25 files):
+- Worst message `rel_absmax`: fp32 2.2e-5, fp16 2.35e-2 (`V@300`, hour 24). Values above 2e-2 occur only at hour 23
+  (4 messages) and hour 24 (6 messages).
+- Hour 24's non-tp fields are the forecaster's state, and the original's own fp16-vs-fp32 chain difference at that hour
+  is 3.13e-2. On this date both fp16 forecaster trajectories, varda.cpp's and the original's, diverge from fp32 about
+  3x more than on 10-22.
+- Hour 0: 66/66 messages byte-identical (62/66 on 10-22). Hours 6k: 66/66 non-tp messages equal to the 6-hourly files.
+- Runs are byte-identical to each other (35 files, 2350 messages). They are also byte-identical to the files made from
+  `fetch_inputs.py`'s subset layout.
+
+**Process wall clock**, fp16: 18.0 s warm and 25.5 s for the first run in the allocation; fp32 64.9 s. These ran on a node
+shared with the two anemoi forecaster runs, so they are not a benchmark.
+
+**The tolerances.** All tolerances hold on the second date. They still rest on one calibration date. The original's own
+spreads vary by up to 1.9x per window and hour between the two dates: the same rules applied to the 10-30 spreads would
+give limits up to 1.76x (fp16) and 1.90x (fp32) larger on some entries. Nothing was recalibrated or loosened.
+
+### Lead time 120 h (20 windows)
+
+**Setup.** `varda-forecast --lead-time-hours 120`, fp16, A100, CUDA graph on, 32 threads, inputs of 2026-10-30T15,
+the same binary as the 24 h runs above, one job (a 24 h run of the same inputs in the same job for comparison). No
+anemoi reference exists for this lead time (the HF config's `lead_time` is 1 d): the checks are self-consistency.
+
+| run | process wall | ready | rollout | downscaler loop (blocked on the writer) | hourly files written after the last window | files |
+|---|---|---|---|---|---|---|
+| 120 h, 20 windows | 55.6 s | 5.9 s | 18.8 s | 41.3 s (4.6 s) | 1.9 s | 163 (42 six-hourly, 121 hourly), 24 GB |
+| 24 h, 4 windows | 15.0 s | 3.8 s | 4.2 s | 8.6 s (0.0 s) | 1.7 s | 35 |
+
+Windows: 1172-2568 ms, mean 1617 ms (24 h: mean 1801 ms); the hourly GRIB encode and write summed to 28.7 s and 33.6 s
+over the 121 files. Checks of the 120 h run:
+- the 35 files of the first 24 h are byte-identical to the 24 h run's (the window count does not change the loop);
+- hours 6, 12, ..., 120: all 66 non-tp messages of every hourly file are byte-identical to the forecaster's file of that
+  step (the copy-from-forecaster rule, 20 of 20 steps); hour 0: 66/66 byte-identical to the forecaster's step 0;
+- `tp` is monotone over the 120 hourly files. The downscaler's own accumulation and the forecaster's 6-hourly one
+  diverge with lead time (up to 60 mm apart at day 5, where the forecaster's accumulation reaches 139 mm), as in the
+  original pipeline, which also keeps the downscaler's `tp` and copies every other field.
+
+At this lead time the hourly writer was the limit: the downscaler loop ended 22 s after the rollout, with the writer
+busy throughout. With the concurrent hourly writer (`docs/downscaler.md` §7: three hours encoded at once), in one
+job on another node, alternating binaries, two runs each, fp16, same inputs:
+
+| binary | process wall | rollout | downscaler loop (blocked on the writer) | after the last window | window ms mean |
+|---|---|---|---|---|---|
+| one hour at a time | 63.8 / 63.8 s | 16.9 / 17.8 s | 54.7 / 55.1 s (12.4 / 12.4 s) | 3.3 s | 1903 / 1901 |
+| three hours at once | 59.3 / 60.5 s | 17.8 / 17.0 s | 51.9 / 52.7 s (0.0 / 0.0 s) | 2.0 s | 2377 / 2414 |
+
+All 163 files byte-identical between the two binaries, and between the two runs of the new one. The loop no longer
+waits for the writer, but its windows get slower (the encoders' CPU load slows the loop's pageable copies, as at 24 h),
+so the loop itself is now the critical path at 2.6 s per window for a 0.73 s forward pass: the device-resident loop of
+`docs/downscaler.md` §8 is the next lever.

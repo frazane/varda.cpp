@@ -3,7 +3,8 @@ its GRIB-decoded inputs. Runs in the reference env ($VARDA_SCRATCH/ref-oper-td/.
 
   $PY -I python/reference/realdata/compare_downscaler.py REF_DIR [--runs fp16,fp32,cpu-fp32] [--forecaster-root R]
 
-REF_DIR = $VARDA_SCRATCH/downscale/ref/20261022T15 (holds one directory per tag). Metric (docs/format.md section 2),
+REF_DIR = $VARDA_SCRATCH/downscale/ref/<YYYYmmddTHH> (holds one directory per tag; the date is taken from its name,
+or --date). Metric (docs/format.md section 2),
 float64, per key: max_abs = max|a - r|, absmax = max|r|, rel_absmax = max_abs / absmax. NaN positions must agree.
 
 Writes REF_DIR/spreads.json (atomically) with
@@ -23,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -133,7 +135,7 @@ def pair_model(a_run: Path, b_run: Path) -> dict:
 def pair_grib(a_run: Path, b_run: Path, steps) -> dict:
     res, summ = {}, {}
     for s in steps:
-        pa, pb = a_run / "outputs" / f"varda-single_202610221500_{s}.grib", b_run / "outputs" / f"varda-single_202610221500_{s}.grib"
+        pa, pb = a_run / "outputs" / f"varda-single_{DATE_STAMP}_{s}.grib", b_run / "outputs" / f"varda-single_{DATE_STAMP}_{s}.grib"
         if not (pa.exists() and pb.exists()):
             continue
         A, B = grib_messages(pa), grib_messages(pb)
@@ -217,8 +219,8 @@ def tp_check(run: Path, fc_run: Path) -> dict:
 def copy_check(run: Path, fc_run: Path, steps=(0, 6, 12, 18, 24)) -> dict:
     res = {}
     for s in steps:
-        pa = run / "outputs" / f"varda-single_202610221500_{s}.grib"
-        pb = fc_run / "outputs" / f"202610221500_{s}.grib"
+        pa = run / "outputs" / f"varda-single_{DATE_STAMP}_{s}.grib"
+        pb = fc_run / "outputs" / f"{DATE_STAMP}_{s}.grib"
         if not (pa.exists() and pb.exists()):
             continue
         A, B = grib_messages(pa), grib_messages(pb)
@@ -230,11 +232,16 @@ def copy_check(run: Path, fc_run: Path, steps=(0, 6, 12, 18, 24)) -> dict:
     return res
 
 
+DATE_STAMP = "202610221500"  # YYYYmmddHHMM of the run, set in main() from the reference directory name or --date
+
+
 def main() -> None:
+    global DATE_STAMP
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("ref_dir")
     ap.add_argument("--runs", default="fp16,fp32,cpu-fp32,fp16-fp32in")
-    ap.add_argument("--forecaster-root", default=None, help="default $VARDA_SCRATCH/realdata/20261022T15")
+    ap.add_argument("--date", default=None, help="YYYY-mm-ddTHH or YYYYmmddTHH (default: the name of REF_DIR)")
+    ap.add_argument("--forecaster-root", default=None, help="default $VARDA_SCRATCH/realdata/<YYYYmmddTHH>")
     ap.add_argument("--steps", default=",".join(str(i) for i in range(25)))
     ap.add_argument("--skip-grib", action="store_true")
     ap.add_argument("--pairs", default=None, help="a:b,c:d (default: all known pairs of the available runs; '' = none)")
@@ -256,7 +263,12 @@ def main() -> None:
         os.replace(tmp, ref / "spreads.json")
         print("merged", args.merge)
         return
-    froot = Path(args.forecaster_root or Path(os.environ["VARDA_SCRATCH"]) / "realdata" / "20261022T15")
+    tag = re.sub(r"[-:T]", "", args.date or ref.resolve().name)[:10]  # YYYYmmddHH
+    if not re.fullmatch(r"\d{10}", tag):
+        ap.error(f"cannot read a date from {args.date or ref.resolve().name!r}: give --date YYYY-mm-ddTHH")
+    tag = f"{tag[:8]}T{tag[8:]}"
+    DATE_STAMP = tag.replace("T", "") + "00"
+    froot = Path(args.forecaster_root or Path(os.environ["VARDA_SCRATCH"]) / "realdata" / tag)
     tags = [t for t in args.runs.split(",") if (ref / t / "model_io.safetensors").exists()]
     fc_of = {"fp16": froot / "ref-fp16", "fp32": froot / "ref-fp32", "cpu-fp32": froot / "ref-fp32",
              "fp16-fp32in": froot / "ref-fp32"}

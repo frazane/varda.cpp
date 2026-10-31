@@ -25,8 +25,9 @@
 // window k starts as soon as step k is out, on a high-priority stream of the same GPU, and the hourly
 // writer thread starts with the rollout (VARDA_TD_OVERLAP=0: after the rollout, as on the other
 // engines). Each window's six states reach the hourly writer by pointer (VARDA_TD_BUFFERS window
-// buffers, default 2; VARDA_TD_PINNED=1 page-locks them), not copied. The hourly GRIB writer is the
-// critical path (docs/downscaler.md §7).
+// buffers, default 2; VARDA_TD_PINNED=1 page-locks them), not copied. The hourly writer encodes
+// VARDA_TD_WRITER_STATES hours at once (default 3, VARDA_TD_WRITER_THREADS OpenMP threads each; the tp
+// accumulation stays in hour order), byte-identical to one hour at a time (docs/downscaler.md §7).
 // --quiet leaves the input log (every file and message used) out of stdout; it stays in forecast.json.
 //
 // DIR receives the GRIB files under the configured relative paths (outputs/<dateTime>_<step>.grib); DIR/forecast.json the provenance and
@@ -45,6 +46,7 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <atomic>
 #include <deque>
 #include <memory>
 #include <exception>
@@ -142,8 +144,9 @@ public:
         enqueue(std::move(it));
     }
     // The same without the copy: `y` is used in place and must stay alive and unchanged until `done`
-    // has been called (on the writer thread, once the step is written, or dropped after an error;
-    // here if the item is refused). This is how the downscaler's window buffers reach the writer.
+    // has been called (once GribOutput no longer reads y: on the writer thread, or on one of its
+    // encoding workers in concurrent mode; or dropped after an error; here if the item is refused).
+    // This is how the downscaler's window buffers reach the writer.
     void push_ref(int step_hours, const float* y, const float* forecaster_y, std::function<void()> done = {}) {
         Item it;
         it.step_hours = step_hours;
@@ -158,6 +161,8 @@ public:
         if (err_) std::rethrow_exception(err_);
     }
     double initial_seconds() const { return initial_s_; }
+    // seconds the writer thread spent in each write_step (concurrent GribOutput: the top-level
+    // post-processors and the wait for a free encoding slot, not the encoding)
     const std::vector<double>& step_seconds() const { return secs_; }
     double blocked_seconds() const { return blocked_s_; }  // time the rollout waited for a free slot
     double copy_seconds() const { return copy_s_; }        // time the rollout callback spent copying y
@@ -209,7 +214,19 @@ private:
                         out_.write_initial(*it.names, *it.values);
                         initial_s_ = app::now_s() - t0;
                     } else {
-                        out_.write_step(it.step_hours, it.yref ? it.yref : it.y.data(), it.forecaster_y);
+                        // GribOutput calls `done` once y is no longer read (its concurrent mode encodes
+                        // the state after this call returns); a copied y lives until then.
+                        std::function<void()> done;
+                        done.swap(it.done);
+                        if (it.yref) {
+                            out_.write_step(it.step_hours, it.yref, it.forecaster_y, std::move(done));
+                        } else {
+                            auto keep = std::make_shared<std::vector<float>>(std::move(it.y));
+                            out_.write_step(it.step_hours, keep->data(), it.forecaster_y,
+                                            [keep, d = std::move(done)] {
+                                                if (d) d();
+                                            });
+                        }
                         secs_.push_back(app::now_s() - t0);
                     }
                 } catch (...) {
@@ -612,12 +629,16 @@ int main(int argc, char** argv) {
         // writer by pointer (WindowBuffers), not copied.
         int td_buffers = 2;  // window buffers: the writer encodes window k while the GPU computes window k+1
         if (const char* e = std::getenv("VARDA_TD_BUFFERS")) td_buffers = std::max(1, std::atoi(e));
+        int td_writer_states = 3, td_writer_threads = 0;
         StepFeed feed;
         std::vector<float> hourly;  // --dump-y: every hourly y (G, V_out), hour 1 .. lead time
         // Declared before the writer that points at them (destroyed after it has stopped).
         std::vector<std::string> init_names;
         std::vector<std::vector<float>> init_values;
         std::vector<float*> win_buf(size_t(n_steps), nullptr);
+        // per window: states not yet released by the hourly writer (its encoding workers release them in
+        // any order); the buffer goes back to the pool at zero
+        std::vector<std::shared_ptr<std::atomic<int>>> win_left(static_cast<size_t>(n_steps));
         std::unique_ptr<WindowBuffers> tbufs;
         std::unique_ptr<GribOutput> tout;
         std::unique_ptr<StepWriter> twriter;
@@ -629,12 +650,18 @@ int main(int argc, char** argv) {
                         td_path.c_str(), td_model->config().uuid.c_str(), td_load_s, n_steps, W, T_out,
                         td_overlap ? ", during the rollout" : "");
             // Page-locked buffers make the 2.7 GB device-to-host copy of a window a DMA, but locking
-            // 2 x 2.7 GB takes ~2.7 s of kernel time that stalls the other threads' page faults; off
-            // by default (VARDA_TD_PINNED=1).
+            // 2 x 2.7 GB takes ~3 s of kernel time that stalls the other threads' page faults; off
+            // by default (VARDA_TD_PINNED=1; docs/downscaler.md §7).
             const char* pin_env = std::getenv("VARDA_TD_PINNED");
             const bool pin = opts.device == varda::Device::CUDA && pin_env && std::string(pin_env) == "1";
             tbufs = std::make_unique<WindowBuffers>(td_out_n * size_t(T_out), std::min(td_buffers, n_steps), pin);
             tout = std::make_unique<GribOutput>(*td_model, *tcfg, templates, out_dir, in.date0);
+            // The hourly writer encodes several hours at once (their only link, the tp accumulation, runs
+            // in hour order on the writer thread): VARDA_TD_WRITER_STATES states (default 3; 1 = one hour
+            // at a time), each with an OpenMP team of VARDA_TD_WRITER_THREADS (default: threads / states).
+            if (const char* e = std::getenv("VARDA_TD_WRITER_STATES")) td_writer_states = std::max(1, std::atoi(e));
+            if (const char* e = std::getenv("VARDA_TD_WRITER_THREADS")) td_writer_threads = std::max(0, std::atoi(e));
+            tout->set_concurrency(td_writer_states, td_writer_threads);
             // every state of the buffers in flight fits in the queue: the buffers are the bound
             twriter = std::make_unique<StepWriter>(*tout, td_out_n, size_t(tbufs->count() * T_out + 1));
             td_setup_s = app::now_s() - td0;
@@ -674,12 +701,11 @@ int main(int argc, char** argv) {
                         std::memcpy(&hourly[(size_t(k) * size_t(T_out) + size_t(t)) * td_out_n], y_t, td_out_n * 4);
                     // the forecaster's state of this hour, for the copy-prognostic-from-forecaster post-processor
                     const float* fy = (step_h % W == 0) ? &ys[size_t(step_h / W - 1) * out_n] : nullptr;
-                    std::function<void()> done;  // the window's last state written: its buffer is free again
-                    if (t + 1 == T_out) {
-                        float* b = win_buf[size_t(k)];
-                        WindowBuffers* pool = tbufs.get();
-                        done = [pool, b] { pool->release(b); };
-                    }
+                    // every state of the window released (no longer read): its buffer is free again
+                    if (t == 0) win_left[size_t(k)] = std::make_shared<std::atomic<int>>(T_out);
+                    std::function<void()> done = [pool = tbufs.get(), b = win_buf[size_t(k)], left = win_left[size_t(k)]] {
+                        if (left->fetch_sub(1) == 1) pool->release(b);
+                    };
                     twriter->push_ref(step_h, y_t, fy, std::move(done));
                     if (t + 1 == T_out) {
                         std::printf("hours %d-%d (window %d, to %s) computed\n", k * W + 1, step_h, k + 1,
@@ -784,6 +810,9 @@ int main(int argc, char** argv) {
                       {"during_rollout", td_overlap},
                       {"window_buffers", tbufs->count()},
                       {"window_buffers_pinned", tbufs->pinned()},
+                      {"writer_states", tout->concurrency()},
+                      {"writer_threads", td_writer_threads > 0 ? td_writer_threads
+                                                               : std::max(1, omp_get_max_threads() / tout->concurrency())},
                       {"files", tout->files()},
                       {"seconds",
                        {{"load", td_load_s},
@@ -799,6 +828,9 @@ int main(int argc, char** argv) {
                         {"write_after_loop", td_tail_s},
                         {"step_write", twriter->step_seconds()},
                         {"grib", {{"post", ts.post}, {"encode", ts.encode}, {"write", ts.write},
+                                  {"write_wait", ts.write_wait}, {"cpu_gather", ts.cpu_gather},
+                                  {"cpu_keys", ts.cpu_keys}, {"cpu_pack", ts.cpu_pack}, {"cpu_check", ts.cpu_check},
+                                  {"states", tout->concurrency()}, {"max_states_in_flight", ts.max_states_in_flight},
                                   {"messages", ts.messages}, {"bytes", ts.bytes}}},
                         {"total", td_end - td0}}},
                       {"window_predict_ms", predict_ms},

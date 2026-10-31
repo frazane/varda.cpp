@@ -7,11 +7,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <condition_variable>
+#include <deque>
 #include <future>
 #include <mutex>
 #include <regex>
 #include <set>
 #include <stdexcept>
+#include <thread>
+
+#include <omp.h>
 
 namespace varda::io {
 
@@ -313,6 +318,7 @@ struct OutStream {
     std::map<std::string, const TemplateIndexEntry*> entry_of;      // by variable name
     std::map<std::string, std::unique_ptr<GribFileWriter>> writers; // by final path
     std::vector<std::string> created;
+    std::map<std::string, std::deque<int64_t>> turns;               // concurrent mode: jobs due to write each file, in order
 };
 
 }  // namespace
@@ -433,14 +439,14 @@ struct GribOutput::Impl {
     };
 
     // One message, encoded as anemoi-inference's encode_message does; no shared state is modified, so
-    // messages of a state are encoded in parallel and written afterwards in order.
-    Encoded encode_field(const OutStream& s, const IoVariable& v, std::vector<float> values, int step_hours,
-                         const Top& top, double* cpu) const {
+    // messages of a state (and messages of different states) are encoded in parallel and written
+    // afterwards in order. `tmpl` is the variable's template (template_for).
+    Encoded encode_field(const OutStream& s, const IoVariable& v, const GribHandle& tmpl, std::vector<float> values,
+                         int step_hours, const Top& top, double* cpu) const {
         using clock = std::chrono::steady_clock;
         auto secs = [](clock::time_point a) { return std::chrono::duration<double>(clock::now() - a).count(); };
         auto t0 = clock::now();
         const OutputDef& d = *s.def;
-        const GribHandle& tmpl = template_of(s, v);
         auto sit = top.start_steps.find(v.name);
         ScalarMap keys = build_keys(v, d.encoding, tmpl.get_long("edition"), base, step_hours,
                                     sit == top.start_steps.end() ? std::nullopt : std::optional<int>(sit->second));
@@ -519,6 +525,72 @@ struct GribOutput::Impl {
         return nullptr;
     }
 
+    // The messages of one output for one state: fields[f] is the index (in `names`) of message f (computed
+    // forcings left out), tmpl[f] its template.
+    struct StreamPlan {
+        std::vector<size_t> fields;
+        std::vector<const GribHandle*> tmpl;
+        const PostProcessorDef* copy = nullptr;
+    };
+    // Looks up (and loads, first time) the templates: write_initial_state first checks that every field
+    // has one. Modifies the stream's template maps: calling thread only, never concurrently with itself.
+    StreamPlan plan_stream(OutStream& s, const std::vector<std::string>& names, int step_hours) {
+        StreamPlan p;
+        p.copy = copy_rule(*s.def, step_hours);
+        for (size_t i = 0; i < names.size(); ++i) {
+            const IoVariable& v = cfg.variable(names[i]);
+            if (v.computed_forcing) continue;
+            p.tmpl.push_back(&template_for(s, v));  // std::map: the reference stays valid
+            p.fields.push_back(i);
+        }
+        return p;
+    }
+
+    // Encodes one output's messages of a state, in parallel over the messages (the calling thread's
+    // OpenMP team). Reads only shared const state. Errors are left in Encoded::error.
+    template <class Col, class FCol>
+    std::vector<Encoded> encode_stream(const OutStream& s, const StreamPlan& p, const std::vector<std::string>& names,
+                                       Col&& column, int step_hours, FCol&& fcol, const Top& top) {
+        using clock = std::chrono::steady_clock;
+        auto secs = [](clock::time_point a) { return std::chrono::duration<double>(clock::now() - a).count(); };
+        std::vector<Encoded> enc(p.fields.size());
+#pragma omp parallel for schedule(dynamic, 1)
+        for (size_t f = 0; f < p.fields.size(); ++f) {
+            const size_t i = p.fields[f];
+            double cpu[4] = {0, 0, 0, 0};
+            try {
+                const auto tg = clock::now();
+                const IoVariable& v = cfg.variable(names[i]);
+                auto it = top.changed.find(names[i]);
+                std::vector<float> a;
+                if (p.copy && p.copy->copies(names[i])) {
+                    // the forecaster's value of this step replaces the field (the filter runs after the
+                    // top-level post-processors, which only touch the kept tp)
+                    a = fcol(i);
+                    if (a.empty())
+                        throw std::runtime_error("GribOutput: output " + s.def->name + " copies " + names[i] +
+                                                 " from the forecaster at step " + std::to_string(step_hours) +
+                                                 " h, but no forecaster state was given");
+                } else {
+                    a = it != top.changed.end() ? std::vector<float>(it->second) : column(i);
+                }
+                a = run_output_pps(*s.def, std::move(a));
+                cpu[0] += secs(tg);
+                enc[f] = encode_field(s, v, *p.tmpl[f], std::move(a), step_hours, top, cpu);
+            } catch (const std::exception& ex) {
+                enc[f].error = ex.what();
+            }
+            std::lock_guard<std::mutex> lock(stats_mutex);
+            stats.cpu_gather += cpu[0];
+            stats.cpu_keys += cpu[1];
+            stats.cpu_pack += cpu[2];
+            stats.cpu_check += cpu[3];
+        }
+        return enc;
+    }
+
+    // ---- sequential mode ----------------------------------------------------------------------------
+
     // `fcol(i)`: the forecaster's merged-grid column of field i (CopyFromForecaster), or an empty
     // vector when no forecaster state was given.
     template <class Col, class FCol>
@@ -529,50 +601,13 @@ struct GribOutput::Impl {
         Top top = run_top(names, column);
         stats.post += secs(t0);
         for (auto& s : streams) {
-            const PostProcessorDef* copy = copy_rule(*s.def, step_hours);
-            // write_initial_state first checks that every field has a template
-            std::vector<size_t> fields;
-            for (size_t i = 0; i < names.size(); ++i) {
-                const IoVariable& v = cfg.variable(names[i]);
-                if (v.computed_forcing) continue;
-                template_for(s, v);
-                fields.push_back(i);
-            }
-            std::vector<Encoded> enc(fields.size());
+            const StreamPlan p = plan_stream(s, names, step_hours);
             t0 = clock::now();
-#pragma omp parallel for schedule(dynamic, 1)
-            for (size_t f = 0; f < fields.size(); ++f) {
-                const size_t i = fields[f];
-                double cpu[4] = {0, 0, 0, 0};
-                try {
-                    const auto tg = clock::now();
-                    const IoVariable& v = cfg.variable(names[i]);
-                    auto it = top.changed.find(names[i]);
-                    std::vector<float> a;
-                    if (copy && copy->copies(names[i])) {
-                        // the forecaster's value of this step replaces the field (the filter runs after the
-                        // top-level post-processors, which only touch the kept tp)
-                        a = fcol(i);
-                        if (a.empty())
-                            throw std::runtime_error("GribOutput: output " + s.def->name + " copies " + names[i] +
-                                                     " from the forecaster at step " + std::to_string(step_hours) +
-                                                     " h, but no forecaster state was given");
-                    } else {
-                        a = it != top.changed.end() ? it->second : column(i);
-                    }
-                    a = run_output_pps(*s.def, std::move(a));
-                    cpu[0] += secs(tg);
-                    enc[f] = encode_field(s, v, std::move(a), step_hours, top, cpu);
-                } catch (const std::exception& ex) {
-                    enc[f].error = ex.what();
-                }
+            std::vector<Encoded> enc = encode_stream(s, p, names, column, step_hours, fcol, top);
+            {
                 std::lock_guard<std::mutex> lock(stats_mutex);
-                stats.cpu_gather += cpu[0];
-                stats.cpu_keys += cpu[1];
-                stats.cpu_pack += cpu[2];
-                stats.cpu_check += cpu[3];
+                stats.encode += secs(t0);
             }
-            stats.encode += secs(t0);
             for (const Encoded& e : enc)
                 if (!e.error.empty()) {
                     wait_pending();
@@ -583,10 +618,13 @@ struct GribOutput::Impl {
             wait_pending();
             pending = std::async(std::launch::async, [this, &s, secs, enc = std::move(enc)]() {
                 const auto tw = clock::now();
+                int64_t bytes = 0;
                 for (const Encoded& e : enc) {
                     write_encoded(s, e);
-                    stats.bytes += int64_t(e.h.message().second);
+                    bytes += int64_t(e.h.message().second);
                 }
+                std::lock_guard<std::mutex> lock(stats_mutex);
+                stats.bytes += bytes;
                 stats.messages += int64_t(enc.size());
                 stats.write += secs(tw);
             });
@@ -599,6 +637,263 @@ struct GribOutput::Impl {
     mutable std::future<void> pending;  // the previous output's file writes
     void wait_pending() const {
         if (pending.valid()) pending.get();  // rethrows a write error
+    }
+
+    // ---- concurrent mode (set_concurrency) ----------------------------------------------------------
+    //
+    // The calling thread runs, per state and in call order: the top-level post-processors (the only
+    // state carried between calls), the template look-ups, and queues a Job with a sequence number.
+    // A worker takes the job (FIFO), gathers the state (transposes y into its own buffer; the caller's y
+    // is then released), encodes each output's messages with its OpenMP team, and writes them:
+    //   - registration, in sequence order per output (a job waits for its turn, next_reg[s] == seq): the
+    //     files the job writes are created now if new (so creation order = call order, as files()
+    //     reports) and the job is appended to each file's turn queue;
+    //   - writes: a job writes a file once it is first in that file's turn queue, so every file gets its
+    //     messages in call order; jobs writing different files write at the same time.
+    // A job only ever waits for jobs with smaller sequence numbers, which started before it (FIFO), so
+    // the oldest job always progresses. Every job passes the registration of every output, even after an
+    // error (it then registers nothing), so later jobs never wait forever.
+    struct Job {
+        int64_t seq = 0;
+        int step_hours = 0;
+        const std::vector<std::string>* names = nullptr;  // message order (step_order / out_names, or init_names)
+        std::vector<std::string> init_names;
+        std::vector<float> init_values;  // write_initial: field i at [i * G, (i + 1) * G)
+        const float* y = nullptr;        // write_step: (G, V), until release
+        const float* fy = nullptr;
+        std::function<void()> release;
+        Top top;
+        std::vector<StreamPlan> plans;  // per output
+    };
+
+    int n_states = 1, team = 0;  // set_concurrency
+    std::vector<std::thread> workers;
+    std::deque<std::unique_ptr<Job>> queue;
+    int running = 0;
+    int64_t next_seq = 0;
+    mutable std::mutex jmu;
+    mutable std::condition_variable jcv;
+    bool stopping = false;
+    std::exception_ptr job_err;
+    std::vector<int64_t> next_reg;  // per output: the sequence number whose registration is next
+    std::mutex wmu;
+    std::condition_variable wcv;
+
+    bool concurrent() const { return n_states > 1; }
+    bool cancelled = false;  // the destructor drops queued states
+    bool failed() const {
+        std::lock_guard<std::mutex> lk(jmu);
+        return bool(job_err) || cancelled;
+    }
+    void set_job_error(std::exception_ptr e) {
+        std::lock_guard<std::mutex> lk(jmu);
+        if (!job_err) job_err = e;
+        jcv.notify_all();
+    }
+    // Waits until every queued state is encoded and written; rethrows the first error.
+    void wait_jobs() const {
+        if (!concurrent()) return;
+        std::unique_lock<std::mutex> lk(jmu);
+        jcv.wait(lk, [&] { return queue.empty() && running == 0; });
+        if (job_err) std::rethrow_exception(job_err);
+    }
+    void wait_all() const {
+        wait_pending();
+        wait_jobs();
+    }
+
+    void start_workers() {
+        next_reg.assign(streams.size(), 0);
+        for (int w = 0; w < n_states; ++w) workers.emplace_back([this] { worker(); });
+    }
+    void stop_workers() {
+        {
+            std::lock_guard<std::mutex> lk(jmu);
+            stopping = true;
+            jcv.notify_all();
+        }
+        for (auto& t : workers)
+            if (t.joinable()) t.join();
+        workers.clear();
+    }
+
+    // Queues a job (calling thread). Blocks while n_states jobs run and one waits. Throws (after
+    // releasing the job's input) if an earlier state failed.
+    void submit(std::unique_ptr<Job> j) {
+        std::unique_lock<std::mutex> lk(jmu);
+        jcv.wait(lk, [&] { return int(queue.size()) + running < n_states + 1 || job_err; });
+        if (job_err) {
+            lk.unlock();
+            if (j->release) j->release();
+            std::rethrow_exception(job_err);
+        }
+        j->seq = next_seq++;
+        queue.push_back(std::move(j));
+        jcv.notify_all();
+    }
+    void throw_if_failed() const {
+        std::lock_guard<std::mutex> lk(jmu);
+        if (job_err) std::rethrow_exception(job_err);
+    }
+
+    void worker() {
+        if (team > 0) omp_set_num_threads(team);
+        std::vector<float> yt, ft;  // this worker's transposed y and forecaster state, reused
+        for (;;) {
+            std::unique_ptr<Job> j;
+            {
+                std::unique_lock<std::mutex> lk(jmu);
+                jcv.wait(lk, [&] { return !queue.empty() || stopping; });
+                if (queue.empty()) return;
+                j = std::move(queue.front());
+                queue.pop_front();
+                ++running;
+                {
+                    std::lock_guard<std::mutex> ls(stats_mutex);
+                    stats.max_states_in_flight = std::max(stats.max_states_in_flight, running);
+                }
+            }
+            run_job(*j, yt, ft);
+            j.reset();
+            std::lock_guard<std::mutex> lk(jmu);
+            --running;
+            jcv.notify_all();
+        }
+    }
+
+    // (G, V) -> (V, G) in cache-sized blocks, so that every message reads its variable contiguously.
+    void transpose(const float* y, std::vector<float>& yt) const {
+        const size_t V = out_names.size(), Gs = size_t(G);
+        yt.resize(Gs * V);
+        float* t = yt.data();
+        constexpr size_t B = 256;
+#pragma omp parallel for schedule(static)
+        for (size_t g0 = 0; g0 < Gs; g0 += B) {
+            const size_t g1 = std::min(Gs, g0 + B);
+            for (size_t j = 0; j < V; ++j)
+                for (size_t g = g0; g < g1; ++g) t[j * Gs + g] = y[g * V + j];
+        }
+    }
+
+    // A worker's whole job; never throws (errors go to job_err), always calls release once.
+    void run_job(Job& j, std::vector<float>& yt, std::vector<float>& ft) {
+        using clock = std::chrono::steady_clock;
+        auto secs = [](clock::time_point a) { return std::chrono::duration<double>(clock::now() - a).count(); };
+        const size_t Gs = size_t(G);
+        std::exception_ptr err;
+        bool skip = failed();  // an earlier state failed: drop this one (still pass every registration)
+        bool have_f = false;
+        if (!skip && j.y) {
+            try {
+                transpose(j.y, yt);
+                for (const auto& p : j.plans) have_f |= p.copy != nullptr;
+                have_f = have_f && j.fy;
+                if (have_f) transpose(j.fy, ft);
+            } catch (...) {
+                err = std::current_exception();
+            }
+        }
+        if (j.release) {
+            try {
+                j.release();
+            } catch (...) {
+                if (!err) err = std::current_exception();
+            }
+            j.release = nullptr;
+        }
+        const std::vector<std::string>& names = *j.names;
+        const bool init = j.y == nullptr;
+        const std::vector<size_t>& col = step_col;
+        auto column = [&](size_t i) {
+            if (init) return std::vector<float>(j.init_values.begin() + i * Gs, j.init_values.begin() + (i + 1) * Gs);
+            const size_t c = col[i];
+            return std::vector<float>(yt.begin() + c * Gs, yt.begin() + (c + 1) * Gs);
+        };
+        auto fcol = [&](size_t i) {
+            if (!have_f) return std::vector<float>();
+            const size_t c = col[i];
+            return std::vector<float>(ft.begin() + c * Gs, ft.begin() + (c + 1) * Gs);
+        };
+        for (size_t si = 0; si < streams.size(); ++si) {
+            OutStream& s = streams[si];
+            std::vector<Encoded> enc;
+            if (!skip && !err) {
+                const auto t0 = clock::now();
+                enc = encode_stream(s, j.plans[si], names, column, j.step_hours, fcol, j.top);
+                {
+                    std::lock_guard<std::mutex> lock(stats_mutex);
+                    stats.encode += secs(t0);
+                }
+                for (const Encoded& e : enc)
+                    if (!e.error.empty()) {
+                        err = std::make_exception_ptr(std::runtime_error(e.error));
+                        enc.clear();
+                        break;
+                    }
+            }
+            // Registration turn of this output (always taken, in sequence order).
+            std::vector<std::string> paths;  // distinct, first-appearance order
+            for (const Encoded& e : enc)
+                if (std::find(paths.begin(), paths.end(), e.path) == paths.end()) paths.push_back(e.path);
+            std::vector<GribFileWriter*> fw(paths.size(), nullptr);
+            {
+                std::unique_lock<std::mutex> lk(wmu);
+                wcv.wait(lk, [&] { return next_reg[si] == j.seq; });
+                try {
+                    for (size_t k = 0; k < paths.size(); ++k) {
+                        auto w = s.writers.find(paths[k]);
+                        if (w == s.writers.end()) {
+                            fs::create_directories(fs::path(paths[k]).parent_path());
+                            w = s.writers.emplace(paths[k], std::make_unique<GribFileWriter>(paths[k])).first;
+                            s.created.push_back(paths[k]);
+                        }
+                        s.turns[paths[k]].push_back(j.seq);
+                        fw[k] = w->second.get();
+                    }
+                } catch (...) {
+                    if (!err) err = std::current_exception();
+                    // registered nothing beyond the files whose turn queue holds this job: see below
+                }
+                ++next_reg[si];
+                wcv.notify_all();
+            }
+            // Writes, file by file, each once this job is first in its turn queue.
+            double wait_s = 0, write_s = 0;
+            int64_t bytes = 0, messages = 0;
+            for (size_t k = 0; k < paths.size(); ++k) {
+                if (!fw[k]) break;  // registration failed from here on
+                {
+                    const auto tw = clock::now();
+                    std::unique_lock<std::mutex> lk(wmu);
+                    std::deque<int64_t>& q = s.turns[paths[k]];
+                    wcv.wait(lk, [&] { return q.front() == j.seq; });
+                    wait_s += secs(tw);
+                }
+                const auto tw = clock::now();
+                if (!err && !failed()) {
+                    try {
+                        for (const Encoded& e : enc)
+                            if (e.path == paths[k]) {
+                                fw[k]->write(e.h);
+                                bytes += int64_t(e.h.message().second);
+                                ++messages;
+                            }
+                    } catch (...) {
+                        if (!err) err = std::current_exception();
+                    }
+                }
+                write_s += secs(tw);
+                std::lock_guard<std::mutex> lk(wmu);
+                s.turns[paths[k]].pop_front();
+                wcv.notify_all();
+            }
+            std::lock_guard<std::mutex> lock(stats_mutex);
+            stats.write += write_s;
+            stats.write_wait += wait_s;
+            stats.bytes += bytes;
+            stats.messages += messages;
+        }
+        if (err) set_job_error(err);
     }
 
     mutable std::mutex clone_mutex;
@@ -671,34 +966,70 @@ GribOutput::GribOutput(std::vector<GridSource> sources, std::vector<std::string>
 }
 
 GribOutput::~GribOutput() {
+    if (p_->concurrent()) {
+        {
+            std::lock_guard<std::mutex> lk(p_->jmu);
+            p_->cancelled = true;  // queued states are dropped (their inputs released), not encoded
+        }
+        p_->stop_workers();
+    }
     try {
         p_->wait_pending();
     } catch (...) {
     }
 }
 
+void GribOutput::set_concurrency(int states, int threads) {
+    if (!p_->workers.empty() || p_->next_seq > 0 || p_->pending.valid() || p_->stats.messages > 0)
+        throw std::runtime_error("GribOutput::set_concurrency: call it once, before the first write");
+    if (states <= 1) return;
+    p_->n_states = states;
+    p_->team = threads > 0 ? threads : std::max(1, omp_get_max_threads() / states);
+    p_->start_workers();
+}
+
+int GribOutput::concurrency() const { return p_->n_states; }
+
 void GribOutput::write_initial(const std::vector<std::string>& names, const std::vector<std::vector<float>>& values) {
     if (!p_->cfg.write_initial_state) return;
     if (names.size() != values.size()) throw std::runtime_error("write_initial: names and values differ in length");
     for (const auto& v : values)
         if (int64_t(v.size()) != p_->G) throw std::runtime_error("write_initial: a field does not have G values");
-    p_->write_state(names, [&](size_t i) { return values[i]; }, 0, [](size_t) { return std::vector<float>(); });
+    if (!p_->concurrent()) {
+        p_->write_state(names, [&](size_t i) { return values[i]; }, 0, [](size_t) { return std::vector<float>(); });
+        return;
+    }
+    p_->throw_if_failed();
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
+    auto j = std::make_unique<Impl::Job>();
+    j->step_hours = 0;
+    j->init_names = names;
+    j->names = &j->init_names;
+    const size_t G = size_t(p_->G);
+    j->init_values.resize(values.size() * G);
+    for (size_t i = 0; i < values.size(); ++i) std::copy(values[i].begin(), values[i].end(), j->init_values.begin() + i * G);
+    j->top = p_->run_top(names, [&](size_t i) { return values[i]; });
+    for (auto& s : p_->streams) j->plans.push_back(p_->plan_stream(s, names, 0));
+    p_->stats.post += std::chrono::duration<double>(clock::now() - t0).count();
+    p_->submit(std::move(j));
 }
 
 void GribOutput::write_step(int step_hours, const float* y, const float* forecaster_y) {
     const size_t V = p_->out_names.size();
     const size_t G = size_t(p_->G);
+    if (p_->concurrent()) {
+        // without a release callback, y is only valid during the call: wait until the state is gathered
+        std::promise<void> gathered;
+        std::future<void> f = gathered.get_future();
+        write_step(step_hours, y, forecaster_y, [&gathered] { gathered.set_value(); });
+        f.wait();
+        return;
+    }
     // y is (G, V): transpose it once, in cache-sized blocks, so that every message reads its variable
     // contiguously (a strided gather per message streams all of y through memory V times).
     std::vector<float>& yt = p_->transposed;
-    yt.resize(G * V);
-    constexpr size_t B = 256;
-#pragma omp parallel for schedule(static)
-    for (size_t g0 = 0; g0 < G; g0 += B) {
-        const size_t g1 = std::min(G, g0 + B);
-        for (size_t j = 0; j < V; ++j)
-            for (size_t g = g0; g < g1; ++g) yt[j * G + g] = y[g * V + j];
-    }
+    p_->transpose(y, yt);
     // Message order: the output order, or the io config's step_field_order (same set); `col[i]` is the y
     // column of the i-th message.
     const std::vector<std::string>& names = p_->step_order.empty() ? p_->out_names : p_->step_order;
@@ -720,19 +1051,63 @@ void GribOutput::write_step(int step_hours, const float* y, const float* forecas
         });
 }
 
+void GribOutput::write_step(int step_hours, const float* y, const float* forecaster_y, std::function<void()> release) {
+    // `release` runs exactly once: here (on every exit) unless the job took it.
+    struct Release {
+        std::function<void()>* f;
+        ~Release() {
+            if (f && *f) {
+                std::function<void()> g;
+                g.swap(*f);
+                try {
+                    g();
+                } catch (...) {
+                }
+            }
+        }
+    } rel{&release};
+    if (!p_->concurrent()) {
+        write_step(step_hours, y, forecaster_y);
+        return;
+    }
+    p_->throw_if_failed();
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
+    const size_t V = p_->out_names.size();
+    const size_t G = size_t(p_->G);
+    const std::vector<std::string>& names = p_->step_order.empty() ? p_->out_names : p_->step_order;
+    const std::vector<size_t>& col = p_->step_col;
+    auto j = std::make_unique<Impl::Job>();
+    j->step_hours = step_hours;
+    j->names = &names;
+    // The top-level post-processors read the few columns they change (tp) straight from y, in call order.
+    j->top = p_->run_top(names, [&](size_t i) {
+        std::vector<float> c(G);
+        const size_t jc = col[i];
+        for (size_t g = 0; g < G; ++g) c[g] = y[g * V + jc];
+        return c;
+    });
+    for (auto& s : p_->streams) j->plans.push_back(p_->plan_stream(s, names, step_hours));
+    p_->stats.post += std::chrono::duration<double>(clock::now() - t0).count();
+    j->y = y;
+    j->fy = forecaster_y;
+    j->release.swap(release);  // the job (or submit, if it refuses the job) calls it now
+    p_->submit(std::move(j));
+}
+
 void GribOutput::close() {
-    p_->wait_pending();
+    p_->wait_all();
     for (auto& s : p_->streams)
         for (auto& [path, w] : s.writers) w->close();
 }
 
 GribOutput::Stats GribOutput::stats() const {
-    p_->wait_pending();
+    p_->wait_all();
     return p_->stats;
 }
 
 std::vector<std::string> GribOutput::files() const {
-    p_->wait_pending();
+    p_->wait_all();
     std::vector<std::string> out;
     for (const auto& s : p_->streams) out.insert(out.end(), s.created.begin(), s.created.end());
     return out;
