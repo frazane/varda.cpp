@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "varda/cuda/common.h"
+#include "varda/cuda/downscale_cuda.h"
 #include "varda/cuda/kernels.h"
 #include "varda/downscale.h"
 #include "varda/format.h"
@@ -456,6 +457,28 @@ void test_gather_columns(std::mt19937& rng) {
 
 }  // namespace
 
+// The device loop's transposing host copy (downscale_cuda.cpp, vmajor_output): (T, G, V) copied in chunks of
+// any size (across rows and states, as the staging ring cuts them) into (T, V, G), bitwise.
+void test_transposed_copy(std::mt19937& rng) {
+    const size_t T = 3, G = 1237, V = 67, n = T * G * V;
+    std::vector<float> a(n), want(n);
+    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+    for (auto& x : a) x = u(rng);
+    for (size_t t = 0; t < T; ++t)
+        for (size_t g = 0; g < G; ++g)
+            for (size_t v = 0; v < V; ++v) want[t * G * V + v * G + g] = a[t * G * V + g * V + v];
+    for (size_t chunk : {size_t(1), size_t(13), size_t(67), size_t(4099), size_t(64 * 67 + 5), G * V, G * V + 1, n}) {
+        std::vector<float> out(n, std::nanf(""));
+        for (size_t off = 0; off < n; off += chunk) {
+            const size_t len = std::min(chunk, n - off);
+            std::vector<float> stg(a.begin() + off, a.begin() + off + len);  // the staging slot
+            varda::cuda::transposed_copy(out.data(), stg.data(), off, len, G, V);
+        }
+        const bool ok = std::memcmp(out.data(), want.data(), n * sizeof(float)) == 0;
+        check(ok, "transposed_copy chunk " + std::to_string(chunk), ok ? 0.0 : 1.0, 0.0);
+    }
+}
+
 int main() {
     int n_dev = 0;
     if (cudaGetDeviceCount(&n_dev) != cudaSuccess || n_dev == 0) {
@@ -484,6 +507,7 @@ int main() {
         test_output<__half>(rng, T_out);
     }
     test_gather_columns(rng);
+    test_transposed_copy(rng);
     std::printf("%s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

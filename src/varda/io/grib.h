@@ -74,6 +74,7 @@ public:
     // by ecCodes' parse_keyval_string, then one grib_set_values call (docs/spec-io.md §4.3).
     void set_key_vals(const KeyVals& kvs);
     void set_double_array(const std::string& key, const std::vector<double>& v);
+    void set_double_array(const std::string& key, const double* v, size_t n);
 
     // The encoded message (valid until the handle changes).
     std::pair<const void*, size_t> message() const;

@@ -17,6 +17,7 @@
 #include <thread>
 
 #include <omp.h>
+#include <time.h>
 
 namespace varda::io {
 
@@ -274,6 +275,12 @@ bool nan_to_missing(std::vector<float>& x, float missing_value) {
 
 namespace {
 
+double thread_cpu_seconds() {
+    timespec t{};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+    return double(t.tv_sec) + 1e-9 * double(t.tv_nsec);
+}
+
 int64_t count_true(const std::vector<uint8_t>& m) {
     int64_t n = 0;
     for (uint8_t b : m) n += b != 0;
@@ -312,8 +319,35 @@ std::vector<std::string> mismatches(const GribHandle& h, const ScalarMap& keys) 
     return out;
 }
 
+// Prepared mode (VARDA_GRIB_PREPARED, default on): a variable's prepared handle, the template clone with
+// the first keys of its messages already set: every key before the first step-dependent one (step,
+// startStep, endStep) or value-dependent one (missingValue, bitmapPresent), in the order anemoi sets them.
+// Made once, by the first message that needs it; a message then clones it and sets the remaining keys.
+struct Prep {
+    std::mutex mu;
+    enum State { Unprepared, Ready, Unusable } state = Unprepared;
+    GribHandle h;   // Ready: never modified again (cloned under the clone mutex)
+    KeyVals prefix; // the keys set on h, as set_key_vals received them
+};
+
+// An output's post-processor chain (extract_from_state, extract_mask as a slice, assign_mask) as copies
+// from the merged-grid column: out[r.dst + k] = column[r.src + k]; positions outside every run are NaN
+// (assign_mask's fill). Built once by applying the chain to the point indices, so it selects exactly the
+// values run_output_pps selects.
+struct Segs {
+    bool ok = false;  // false: the chain is not expressible (the full path runs it, and reports its error)
+    size_t n = 0;     // values of a message
+    struct Run {
+        size_t dst, src, len;
+    };
+    std::vector<Run> runs;
+    bool gaps = false;  // some positions are NaN fill
+};
+
 struct OutStream {
     const OutputDef* def = nullptr;
+    Segs segs;                                                      // prepared mode
+    std::map<std::string, std::unique_ptr<Prep>> prep;              // prepared mode, by variable name
     std::map<std::string, GribHandle> templates;                    // by file
     std::map<std::string, const TemplateIndexEntry*> entry_of;      // by variable name
     std::map<std::string, std::unique_ptr<GribFileWriter>> writers; // by final path
@@ -336,6 +370,10 @@ struct GribOutput::Impl {
     std::vector<float> transposed;                  // write_step's (V, G) copy of y
     std::vector<std::string> step_order;            // cfg.step_field_order (empty: out_names)
     std::vector<size_t> step_col;                   // y column of each message of write_step
+    std::vector<float> ftransposed;                 // sequential write_step's (V, G) copy of forecaster_y
+    // Prepared handles and direct value gathers (VARDA_GRIB_PREPARED, default 1); 0: the full path for every
+    // message (template clone, every key, the values copied through run_output_pps), as before.
+    bool prepared = true;
 
     const GridSource& source(const std::string& name, size_t* idx = nullptr) const {
         for (size_t i = 0; i < sources.size(); ++i)
@@ -413,6 +451,89 @@ struct GribOutput::Impl {
         return a;
     }
 
+    // The chain of run_output_pps applied to the point indices (-1: NaN fill), compressed into runs.
+    Segs plan_segs(const OutputDef& d) const {
+        Segs sg;
+        std::vector<int64_t> a(static_cast<size_t>(G));
+        for (int64_t i = 0; i < G; ++i) a[size_t(i)] = i;
+        try {
+            for (const auto& pp : d.post_processors) {
+                switch (pp.type) {
+                    case PostProcessorDef::ExtractFromState: {
+                        size_t i = 0;
+                        source(pp.source, &i);
+                        a = std::vector<int64_t>(a.begin() + offset[i], a.begin() + offset[i] + count[i]);
+                        break;
+                    }
+                    case PostProcessorDef::ExtractMask: {
+                        if (!pp.as_slice) return sg;
+                        const int64_t n = count_true(mask_named(pp.mask));
+                        if (n > int64_t(a.size())) return sg;
+                        a = pp.inverse ? std::vector<int64_t>(a.begin() + n, a.end())
+                                       : std::vector<int64_t>(a.begin(), a.begin() + n);
+                        break;
+                    }
+                    case PostProcessorDef::AssignMask: {
+                        const std::vector<uint8_t>& m = mask_named(pp.mask);
+                        if (count_true(m) != int64_t(a.size())) return sg;
+                        std::vector<int64_t> o(m.size(), -1);
+                        size_t k = 0;
+                        for (size_t i = 0; i < m.size(); ++i)
+                            if (m[i]) o[i] = a[k++];
+                        a = std::move(o);
+                        break;
+                    }
+                    case PostProcessorDef::CopyFromForecaster:
+                        break;
+                    default:
+                        return sg;
+                }
+            }
+        } catch (const std::exception&) {
+            return sg;
+        }
+        sg.n = a.size();
+        for (size_t i = 0; i < a.size();) {
+            if (a[i] < 0) {
+                sg.gaps = true;
+                ++i;
+                continue;
+            }
+            size_t j = i + 1;
+            while (j < a.size() && a[j] == a[j - 1] + 1) ++j;
+            sg.runs.push_back({i, size_t(a[i]), j - i});
+            i = j;
+        }
+        sg.ok = true;
+        return sg;
+    }
+
+    // run_output_pps + encode_message's NaN handling + the float64 conversion in one pass: dv receives the
+    // message's values (NaN -> missing_value and +-inf -> +-FLT_MAX when any value is NaN, as
+    // nan_to_missing). Returns whether any value was NaN.
+    static bool fill_values(const Segs& sg, const float* col, double* dv, float missing_value) {
+        bool nan = sg.gaps;
+        if (sg.gaps) std::fill(dv, dv + sg.n, double(std::nanf("")));
+        for (const auto& r : sg.runs) {
+            const float* x = col + r.src;
+            double* o = dv + r.dst;
+            bool any = false;
+            for (size_t k = 0; k < r.len; ++k) {
+                o[k] = double(x[k]);
+                any |= std::isnan(x[k]);
+            }
+            nan |= any;
+        }
+        if (!nan) return false;
+        const double mv = double(missing_value), big = double(FLT_MAX);
+        for (size_t k = 0; k < sg.n; ++k) {
+            const double v = dv[k];
+            if (std::isnan(v)) dv[k] = mv;
+            else if (std::isinf(v)) dv[k] = v > 0 ? big : -big;
+        }
+        return true;
+    }
+
     const GribHandle& template_for(OutStream& s, const IoVariable& v) {
         auto it = s.entry_of.find(v.name);
         const TemplateIndexEntry* e;
@@ -460,13 +581,28 @@ struct GribOutput::Impl {
         }
         put_default(meta, "generatingProcessIdentifier", Scalar::integer(255));
         Encoded e;
-        {
-            std::lock_guard<std::mutex> lock(clone_mutex);  // reads the shared template handle
-            e.h = tmpl.clone();
-        }
-        GribHandle& h = e.h;
         KeyVals kv;
         for (const auto& [k, x] : meta) kv.emplace_back(k, x.str());
+        e.h = full_keys(tmpl, meta, kv);
+        GribHandle& h = e.h;
+        std::vector<double> dv(values.begin(), values.end());
+        cpu[1] += secs(t0);
+        t0 = clock::now();
+        h.set_double_array("values", dv.data(), dv.size());
+        cpu[2] += secs(t0);
+        t0 = clock::now();
+        finish_message(s, v, keys, e);
+        cpu[3] += secs(t0);
+        return e;
+    }
+
+    // The template clone with every key set as encode_message sets them: one set_key_vals, else key by key.
+    GribHandle full_keys(const GribHandle& tmpl, const ScalarMap& meta, const KeyVals& kv) const {
+        GribHandle h;
+        {
+            std::lock_guard<std::mutex> lock(clone_mutex);  // reads the shared template handle
+            h = tmpl.clone();
+        }
         try {
             h.set_key_vals(kv);
         } catch (const std::exception& ex) {
@@ -476,17 +612,15 @@ struct GribOutput::Impl {
                 else h.set_string(k, x.s);
             }
         }
-        std::vector<double> dv(values.begin(), values.end());
-        cpu[1] += secs(t0);
-        t0 = clock::now();
-        h.set_double_array("values", dv);
-        cpu[2] += secs(t0);
-        t0 = clock::now();
+        return h;
+    }
 
-        // target file
+    // The target file (from the encoded handle) and check_encoding.
+    void finish_message(const OutStream& s, const IoVariable& v, const ScalarMap& keys, Encoded& e) const {
+        const OutputDef& d = *s.def;
+        GribHandle& h = e.h;
         const std::string dt = h.get_string("dateTime");
         e.path = out_dir + "/" + render_path(d.path_effective, dt, h.get_long("step"));
-
         if (d.check_encoding) {
             auto mm = mismatches(h, keys);
             if (!mm.empty()) {
@@ -499,6 +633,88 @@ struct GribOutput::Impl {
                 throw std::runtime_error(msg);
             }
         }
+    }
+
+    // Number of leading keys a prepared handle holds: those before the first step-dependent or
+    // value-dependent key.
+    static size_t prefix_length(const KeyVals& kv) {
+        static const std::set<std::string> stop = {"step", "startStep", "endStep", "missingValue", "bitmapPresent"};
+        size_t k = 0;
+        while (k < kv.size() && !stop.count(kv[k].first)) ++k;
+        return k;
+    }
+
+    // Prepared mode: one message from the values already gathered into dv (fill_values). The same keys,
+    // in the same order, as encode_field; the keys before the first step-dependent one come from the
+    // variable's prepared handle (made here if it is the first message to need it). Any difference from
+    // the prepared keys, or any key that fails, takes encode_field's path (template clone, every key).
+    Encoded encode_prepared(const OutStream& s, const IoVariable& v, const GribHandle& tmpl, Prep* prep,
+                            const double* dv, size_t n, bool any_nan, int step_hours, const Top& top, double* cpu,
+                            bool* full_path) const {
+        using clock = std::chrono::steady_clock;
+        auto secs = [](clock::time_point a) { return std::chrono::duration<double>(clock::now() - a).count(); };
+        auto t0 = clock::now();
+        const OutputDef& d = *s.def;
+        auto sit = top.start_steps.find(v.name);
+        ScalarMap keys = build_keys(v, d.encoding, tmpl.get_long("edition"), base, step_hours,
+                                    sit == top.start_steps.end() ? std::nullopt : std::optional<int>(sit->second));
+        for (const auto& m : d.modifiers) keys = apply_patches(m, v.name, keys);
+        ScalarMap meta = keys;
+        if (any_nan) {
+            put(meta, "missingValue", Scalar::integer(int64_t(d.missing_value)));
+            put(meta, "bitmapPresent", Scalar::integer(1));
+        }
+        put_default(meta, "generatingProcessIdentifier", Scalar::integer(255));
+        KeyVals kv;
+        for (const auto& [k, x] : meta) kv.emplace_back(k, x.str());
+
+        Encoded e;
+        bool done = false;
+        const size_t k = prefix_length(kv);
+        if (prep && k > 0) {
+            const KeyVals head(kv.begin(), kv.begin() + std::ptrdiff_t(k));
+            const GribHandle* ph = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(prep->mu);
+                if (prep->state == Prep::Unprepared) {
+                    prep->state = Prep::Unusable;
+                    try {
+                        GribHandle h;
+                        {
+                            std::lock_guard<std::mutex> lc(clone_mutex);
+                            h = tmpl.clone();
+                        }
+                        h.set_key_vals(head);
+                        prep->h = std::move(h);
+                        prep->prefix = head;
+                        prep->state = Prep::Ready;
+                    } catch (const std::exception&) {
+                        // the full path sets these keys (and reports a failure) as before
+                    }
+                }
+                if (prep->state == Prep::Ready && prep->prefix == head) ph = &prep->h;
+            }
+            if (ph) {
+                try {
+                    {
+                        std::lock_guard<std::mutex> lc(clone_mutex);
+                        e.h = ph->clone();
+                    }
+                    if (k < kv.size()) e.h.set_key_vals(KeyVals(kv.begin() + std::ptrdiff_t(k), kv.end()));
+                    done = true;
+                } catch (const std::exception&) {
+                    done = false;
+                }
+            }
+        }
+        if (!done) e.h = full_keys(tmpl, meta, kv);
+        *full_path = !done;
+        cpu[1] += secs(t0);
+        t0 = clock::now();
+        e.h.set_double_array("values", dv, n);
+        cpu[2] += secs(t0);
+        t0 = clock::now();
+        finish_message(s, v, keys, e);
         cpu[3] += secs(t0);
         return e;
     }
@@ -530,6 +746,7 @@ struct GribOutput::Impl {
     struct StreamPlan {
         std::vector<size_t> fields;
         std::vector<const GribHandle*> tmpl;
+        std::vector<Prep*> prep;  // prepared mode
         const PostProcessorDef* copy = nullptr;
     };
     // Looks up (and loads, first time) the templates: write_initial_state first checks that every field
@@ -542,63 +759,90 @@ struct GribOutput::Impl {
             if (v.computed_forcing) continue;
             p.tmpl.push_back(&template_for(s, v));  // std::map: the reference stays valid
             p.fields.push_back(i);
+            if (prepared) {
+                std::unique_ptr<Prep>& pr = s.prep[v.name];  // created here only (calling thread)
+                if (!pr) pr = std::make_unique<Prep>();
+                p.prep.push_back(pr.get());
+            }
         }
         return p;
     }
 
     // Encodes one output's messages of a state, in parallel over the messages (the calling thread's
-    // OpenMP team). Reads only shared const state. Errors are left in Encoded::error.
+    // OpenMP team). Reads only shared const state (and the prepared handles, under their mutex). Errors
+    // are left in Encoded::error. `column(i)`: field i's G values on the merged grid (valid during the
+    // call); `fcol(i)`: the forecaster's (CopyFromForecaster), nullptr when no forecaster state was given.
     template <class Col, class FCol>
     std::vector<Encoded> encode_stream(const OutStream& s, const StreamPlan& p, const std::vector<std::string>& names,
                                        Col&& column, int step_hours, FCol&& fcol, const Top& top) {
         using clock = std::chrono::steady_clock;
         auto secs = [](clock::time_point a) { return std::chrono::duration<double>(clock::now() - a).count(); };
         std::vector<Encoded> enc(p.fields.size());
+        const bool direct = prepared && s.segs.ok;
 #pragma omp parallel for schedule(dynamic, 1)
         for (size_t f = 0; f < p.fields.size(); ++f) {
             const size_t i = p.fields[f];
             double cpu[4] = {0, 0, 0, 0};
+            bool full = true;
+            const double tc0 = thread_cpu_seconds();
             try {
                 const auto tg = clock::now();
                 const IoVariable& v = cfg.variable(names[i]);
                 auto it = top.changed.find(names[i]);
-                std::vector<float> a;
+                const float* src = nullptr;
                 if (p.copy && p.copy->copies(names[i])) {
                     // the forecaster's value of this step replaces the field (the filter runs after the
                     // top-level post-processors, which only touch the kept tp)
-                    a = fcol(i);
-                    if (a.empty())
+                    src = fcol(i);
+                    if (!src)
                         throw std::runtime_error("GribOutput: output " + s.def->name + " copies " + names[i] +
                                                  " from the forecaster at step " + std::to_string(step_hours) +
                                                  " h, but no forecaster state was given");
                 } else {
-                    a = it != top.changed.end() ? std::vector<float>(it->second) : column(i);
+                    src = it != top.changed.end() ? it->second.data() : column(i);
                 }
-                a = run_output_pps(*s.def, std::move(a));
-                cpu[0] += secs(tg);
-                enc[f] = encode_field(s, v, *p.tmpl[f], std::move(a), step_hours, top, cpu);
+                if (direct) {
+                    // the values straight into this thread's float64 buffer (no intermediate copies)
+                    thread_local std::vector<double> dv;
+                    if (dv.size() < s.segs.n) dv.resize(s.segs.n);
+                    const bool nan = fill_values(s.segs, src, dv.data(), float(s.def->missing_value));
+                    cpu[0] += secs(tg);
+                    enc[f] = encode_prepared(s, v, *p.tmpl[f], p.prep.empty() ? nullptr : p.prep[f], dv.data(),
+                                             s.segs.n, nan, step_hours, top, cpu, &full);
+                } else {
+                    std::vector<float> a(src, src + G);
+                    a = run_output_pps(*s.def, std::move(a));
+                    cpu[0] += secs(tg);
+                    enc[f] = encode_field(s, v, *p.tmpl[f], std::move(a), step_hours, top, cpu);
+                }
             } catch (const std::exception& ex) {
                 enc[f].error = ex.what();
             }
+            const double tc = thread_cpu_seconds() - tc0;
             std::lock_guard<std::mutex> lock(stats_mutex);
+            stats.thread_cpu += tc;
             stats.cpu_gather += cpu[0];
             stats.cpu_keys += cpu[1];
             stats.cpu_pack += cpu[2];
             stats.cpu_check += cpu[3];
+            if (direct) ++(full ? stats.full_path_messages : stats.prepared_messages);
         }
         return enc;
     }
 
     // ---- sequential mode ----------------------------------------------------------------------------
 
-    // `fcol(i)`: the forecaster's merged-grid column of field i (CopyFromForecaster), or an empty
-    // vector when no forecaster state was given.
+    // `column(i)`: field i's G values (merged grid); `fcol(i)`: the forecaster's merged-grid column of
+    // field i (CopyFromForecaster), or nullptr when no forecaster state was given.
     template <class Col, class FCol>
     void write_state(const std::vector<std::string>& names, Col&& column, int step_hours, FCol&& fcol) {
         using clock = std::chrono::steady_clock;
         auto secs = [](clock::time_point a) { return std::chrono::duration<double>(clock::now() - a).count(); };
         auto t0 = clock::now();
-        Top top = run_top(names, column);
+        Top top = run_top(names, [&](size_t i) {
+            const float* c = column(i);
+            return std::vector<float>(c, c + G);
+        });
         stats.post += secs(t0);
         for (auto& s : streams) {
             const StreamPlan p = plan_stream(s, names, step_hours);
@@ -660,6 +904,7 @@ struct GribOutput::Impl {
         std::vector<std::string> init_names;
         std::vector<float> init_values;  // write_initial: field i at [i * G, (i + 1) * G)
         const float* y = nullptr;        // write_step: (G, V), until release
+        bool vmajor = false;             // y is (V, G) instead (write_step_vmajor), read in place
         const float* fy = nullptr;
         std::function<void()> release;
         Top top;
@@ -762,7 +1007,14 @@ struct GribOutput::Impl {
     }
 
     // (G, V) -> (V, G) in cache-sized blocks, so that every message reads its variable contiguously.
-    void transpose(const float* y, std::vector<float>& yt) const {
+    void transpose(const float* y, std::vector<float>& yt) {
+        const auto t0 = std::chrono::steady_clock::now();
+        transpose_into(y, yt);
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::lock_guard<std::mutex> lock(stats_mutex);
+        stats.transpose += s;
+    }
+    void transpose_into(const float* y, std::vector<float>& yt) const {
         const size_t V = out_names.size(), Gs = size_t(G);
         yt.resize(Gs * V);
         float* t = yt.data();
@@ -785,7 +1037,7 @@ struct GribOutput::Impl {
         bool have_f = false;
         if (!skip && j.y) {
             try {
-                transpose(j.y, yt);
+                if (!j.vmajor) transpose(j.y, yt);
                 for (const auto& p : j.plans) have_f |= p.copy != nullptr;
                 have_f = have_f && j.fy;
                 if (have_f) transpose(j.fy, ft);
@@ -793,26 +1045,27 @@ struct GribOutput::Impl {
                 err = std::current_exception();
             }
         }
-        if (j.release) {
+        auto release = [&] {
+            if (!j.release) return;
             try {
                 j.release();
             } catch (...) {
                 if (!err) err = std::current_exception();
             }
             j.release = nullptr;
-        }
+        };
+        if (!j.vmajor) release();  // gathered; a variable-major y is read by the encoding itself
         const std::vector<std::string>& names = *j.names;
         const bool init = j.y == nullptr;
         const std::vector<size_t>& col = step_col;
-        auto column = [&](size_t i) {
-            if (init) return std::vector<float>(j.init_values.begin() + i * Gs, j.init_values.begin() + (i + 1) * Gs);
-            const size_t c = col[i];
-            return std::vector<float>(yt.begin() + c * Gs, yt.begin() + (c + 1) * Gs);
+        const float* ybase = j.vmajor ? j.y : yt.data();
+        auto column = [&](size_t i) -> const float* {
+            if (init) return j.init_values.data() + i * Gs;
+            return ybase + col[i] * Gs;
         };
-        auto fcol = [&](size_t i) {
-            if (!have_f) return std::vector<float>();
-            const size_t c = col[i];
-            return std::vector<float>(ft.begin() + c * Gs, ft.begin() + (c + 1) * Gs);
+        auto fcol = [&](size_t i) -> const float* {
+            if (!have_f) return nullptr;
+            return ft.data() + col[i] * Gs;
         };
         for (size_t si = 0; si < streams.size(); ++si) {
             OutStream& s = streams[si];
@@ -831,6 +1084,7 @@ struct GribOutput::Impl {
                         break;
                     }
             }
+            if (si + 1 == streams.size()) release();  // every message encoded: y is no longer read
             // Registration turn of this output (always taken, in sequence order).
             std::vector<std::string> paths;  // distinct, first-appearance order
             for (const Encoded& e : enc)
@@ -893,8 +1147,13 @@ struct GribOutput::Impl {
             stats.bytes += bytes;
             stats.messages += messages;
         }
+        release();  // no output at all
         if (err) set_job_error(err);
     }
+
+    void write_step_sequential(int step_hours, const float* y, bool vmajor, const float* forecaster_y);
+    void submit_step(int step_hours, const float* y, bool vmajor, const float* forecaster_y,
+                     std::function<void()> release);
 
     mutable std::mutex clone_mutex;
     std::mutex stats_mutex;
@@ -963,6 +1222,25 @@ GribOutput::GribOutput(std::vector<GridSource> sources, std::vector<std::string>
         if (it == p_->out_names.end()) throw std::runtime_error("GribOutput: step_field_order names unknown output " + n);
         p_->step_col.push_back(size_t(it - p_->out_names.begin()));
     }
+    if (const char* e = std::getenv("VARDA_GRIB_PREPARED")) p_->prepared = std::string(e) != "0";
+    if (p_->prepared) {
+        for (auto& s : p_->streams) {
+            s.segs = p_->plan_segs(*s.def);
+            // The runs select what run_output_pps selects: checked on the point indices themselves (exact in
+            // float32 below 2^24 points).
+            if (!s.segs.ok || G_ >= (int64_t(1) << 24)) continue;
+            std::vector<float> idx(static_cast<size_t>(G_));
+            for (int64_t i = 0; i < G_; ++i) idx[size_t(i)] = float(i);
+            const std::vector<float> ref = p_->run_output_pps(*s.def, idx);
+            std::vector<double> got(s.segs.n);
+            const float mv = -1.0f;  // NaN fill -> -1, distinct from every index
+            Impl::fill_values(s.segs, idx.data(), got.data(), mv);
+            bool same = ref.size() == got.size();
+            for (size_t k = 0; same && k < ref.size(); ++k)
+                same = std::isnan(ref[k]) ? got[k] == double(mv) : got[k] == double(ref[k]);
+            if (!same) throw std::logic_error("GribOutput: the value runs of output " + s.def->name + " differ from its post-processors");
+        }
+    }
 }
 
 GribOutput::~GribOutput() {
@@ -996,7 +1274,9 @@ void GribOutput::write_initial(const std::vector<std::string>& names, const std:
     for (const auto& v : values)
         if (int64_t(v.size()) != p_->G) throw std::runtime_error("write_initial: a field does not have G values");
     if (!p_->concurrent()) {
-        p_->write_state(names, [&](size_t i) { return values[i]; }, 0, [](size_t) { return std::vector<float>(); });
+        p_->write_state(
+            names, [&](size_t i) -> const float* { return values[i].data(); }, 0,
+            [](size_t) -> const float* { return nullptr; });
         return;
     }
     p_->throw_if_failed();
@@ -1016,8 +1296,6 @@ void GribOutput::write_initial(const std::vector<std::string>& names, const std:
 }
 
 void GribOutput::write_step(int step_hours, const float* y, const float* forecaster_y) {
-    const size_t V = p_->out_names.size();
-    const size_t G = size_t(p_->G);
     if (p_->concurrent()) {
         // without a release callback, y is only valid during the call: wait until the state is gathered
         std::promise<void> gathered;
@@ -1026,32 +1304,38 @@ void GribOutput::write_step(int step_hours, const float* y, const float* forecas
         f.wait();
         return;
     }
-    // y is (G, V): transpose it once, in cache-sized blocks, so that every message reads its variable
-    // contiguously (a strided gather per message streams all of y through memory V times).
-    std::vector<float>& yt = p_->transposed;
-    p_->transpose(y, yt);
-    // Message order: the output order, or the io config's step_field_order (same set); `col[i]` is the y
-    // column of the i-th message.
-    const std::vector<std::string>& names = p_->step_order.empty() ? p_->out_names : p_->step_order;
-    const std::vector<size_t>& col = p_->step_col;
-    p_->write_state(
-        names,
-        [&](size_t i) {
-            const size_t j = col[i];
-            return std::vector<float>(yt.begin() + j * G, yt.begin() + (j + 1) * G);
-        },
-        step_hours,
-        [&](size_t i) {
-            std::vector<float> c;
-            if (!forecaster_y) return c;
-            const size_t j = col[i];
-            c.resize(G);
-            for (size_t g = 0; g < G; ++g) c[g] = forecaster_y[g * V + j];
-            return c;
-        });
+    p_->write_step_sequential(step_hours, y, false, forecaster_y);
+}
+
+void GribOutput::write_step_vmajor(int step_hours, const float* y, const float* forecaster_y,
+                                   std::function<void()> release) {
+    p_->submit_step(step_hours, y, true, forecaster_y, std::move(release));
 }
 
 void GribOutput::write_step(int step_hours, const float* y, const float* forecaster_y, std::function<void()> release) {
+    p_->submit_step(step_hours, y, false, forecaster_y, std::move(release));
+}
+
+void GribOutput::Impl::write_step_sequential(int step_hours, const float* y, bool vmajor, const float* forecaster_y) {
+    const size_t Gs = size_t(G);
+    // y is (G, V): transpose it once, in cache-sized blocks, so that every message reads its variable
+    // contiguously (a strided gather per message streams all of y through memory V times).
+    if (!vmajor) transpose(y, transposed);
+    const float* yb = vmajor ? y : transposed.data();
+    // Message order: the output order, or the io config's step_field_order (same set); `col[i]` is the y
+    // column of the i-th message.
+    const std::vector<std::string>& names = step_order.empty() ? out_names : step_order;
+    const std::vector<size_t>& col = step_col;
+    if (forecaster_y) transpose(forecaster_y, ftransposed);
+    const float* ft = forecaster_y ? ftransposed.data() : nullptr;
+    write_state(
+        names, [&](size_t i) -> const float* { return yb + col[i] * Gs; }, step_hours,
+        [&](size_t i) -> const float* { return ft ? ft + col[i] * Gs : nullptr; });
+}
+
+void GribOutput::Impl::submit_step(int step_hours, const float* y, bool vmajor, const float* forecaster_y,
+                                   std::function<void()> release) {
+    Impl* p_ = this;
     // `release` runs exactly once: here (on every exit) unless the job took it.
     struct Release {
         std::function<void()>* f;
@@ -1067,7 +1351,7 @@ void GribOutput::write_step(int step_hours, const float* y, const float* forecas
         }
     } rel{&release};
     if (!p_->concurrent()) {
-        write_step(step_hours, y, forecaster_y);
+        p_->write_step_sequential(step_hours, y, vmajor, forecaster_y);
         return;
     }
     p_->throw_if_failed();
@@ -1082,14 +1366,16 @@ void GribOutput::write_step(int step_hours, const float* y, const float* forecas
     j->names = &names;
     // The top-level post-processors read the few columns they change (tp) straight from y, in call order.
     j->top = p_->run_top(names, [&](size_t i) {
-        std::vector<float> c(G);
         const size_t jc = col[i];
+        if (vmajor) return std::vector<float>(y + jc * G, y + (jc + 1) * G);
+        std::vector<float> c(G);
         for (size_t g = 0; g < G; ++g) c[g] = y[g * V + jc];
         return c;
     });
     for (auto& s : p_->streams) j->plans.push_back(p_->plan_stream(s, names, step_hours));
     p_->stats.post += std::chrono::duration<double>(clock::now() - t0).count();
     j->y = y;
+    j->vmajor = vmajor;
     j->fy = forecaster_y;
     j->release.swap(release);  // the job (or submit, if it refuses the job) calls it now
     p_->submit(std::move(j));

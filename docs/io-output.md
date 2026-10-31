@@ -109,6 +109,52 @@ The messages and files are byte-identical in both modes (`test_io_output` compar
 compared with `--require-bytes`). `varda-forecast` uses it for the downscaler's hourly output (`VARDA_TD_WRITER_STATES`,
 `VARDA_TD_WRITER_THREADS`; `docs/downscaler.md` §7); the 6-hourly writer stays sequential.
 
+**Prepared handles and direct gathers** (default; `VARDA_GRIB_PREPARED=0` restores the full path for A/B checks).
+For a given output and variable, `build_keys` gives the same keys at every step except the step keys: `step` (instant
+fields) or `startStep`/`endStep` (accumulations); the date and time keys come from the base time, fixed for the run, and
+the patches, the template and the encoding keys depend on the variable only. Two more keys depend on the values:
+`missingValue` and `bitmapPresent` (any NaN). In anemoi's order every one of these comes after all the others but
+`level`, `param` (global patches) and `generatingProcessIdentifier`:
+```
+lam t_500:   edition typeOfLevel stepType typeOfGeneratingProcess shortName dataType date time | step level gPI
+lam tp:      edition stepType productDefinitionTemplateNumber typeOfGeneratingProcess shortName dataType date time | startStep endStep gPI
+global z_500: edition typeOfLevel stepType typeOfGeneratingProcess shortName dataType date time | step level param missingValue bitmapPresent gPI
+```
+So the prepared handle of a variable is the template clone with the keys before the bar set (one `set_key_vals`, the
+prefix of the original sequence, so no key is reordered), made once by the first message that needs it; each message
+clones it and sets the keys after the bar (one `set_key_vals`), then the values. A message whose keys before the bar
+differ from the prepared ones (never seen), or whose remaining keys fail, takes the full path (template clone, every
+key, the key-by-key fallback), as does a variable whose prefix fails. The question whether `set_key_vals(A + B)` equals
+`set_key_vals(A)`, clone, `set_key_vals(B)` byte for byte (ecCodes sets keys in order, and some of the prefix keys change
+the layout: `typeOfLevel`, `stepType`, `productDefinitionTemplateNumber`, `shortName`) is settled by the byte
+comparisons: the encoder-only run of §4 (676 / 676 messages byte-identical to anemoi's, fp16 and fp32, both modes),
+every `varda-forecast` reference run of `docs/downscaler.md` §7 (24 h fp16 and fp32, 120 h, `--no-downscaler`), and
+`test_io_output` (both outputs, a lam field with NaN and +-inf, a constant field, accumulated tp: identical files in
+both modes, every message from a prepared handle). The messages also go through `check_encoding` as before.
+
+The values go straight from the state into a per-thread float64 buffer: the output's post-processor chain
+(`extract_from_state`, `extract_mask` as a slice, `assign_mask`) is applied once, at construction, to the point indices
+and kept as copy runs plus NaN fill, checked against `run_output_pps` on the indices themselves; the NaN -> -9999 and
++-inf -> +-FLT_MAX rule of `nan_to_missing` is applied on the float64 values. Before, every message copied its column
+(G floats), extracted it into a new array, scanned it and converted it into a new float64 array.
+
+What it buys, measured on an A100 node with 32 CPUs (fp16 24 h, the hourly writer's `forecast.json` parts summed over
+messages, `docs/downscaler.md` §7): keys 33 -> 19-26 s and gather 20-22 -> 14-15 s, and the 5-day forecast 59 -> 44 s
+together with the variable-major states below; the per-message cost is mostly not the key setting itself (0.4-0.5 ms single-threaded, prepared or not: a micro-benchmark on the ICON template) but contention:
+ecCodes serialises handle creation, and every part's per-thread time grows with the number of threads encoding at
+once (single-threaded a lam message costs 0.3 ms gather, 0.4 ms keys, 10.7 ms CCSDS packing; with 32 threads 2.5, 2.5
+and 19.7 ms of CPU time each, throughput levelling off at ~880 messages/s on 64 CPUs).
+
+**Variable-major states** (`write_step_vmajor`): `y` given as (V_out, G) is read in place by the messages, so a state
+is neither transposed nor copied; in concurrent mode `release` then comes once the state's messages are encoded (y
+is read until then), before they are written. `varda-forecast`'s device loop delivers its window buffers that way
+(the drain transposes while copying out of the staging ring, `docs/downscaler.md` §7; `VARDA_TD_VMAJOR=0`: (G, V)
+buffers, transposed by the writer). The files are those of `write_step` (`test_io_output`, sequential and concurrent).
+
+`Stats` also reports `transpose` (wall seconds of the writer's own (G, V) -> (V, G) transposes), `thread_cpu` (CPU
+time of the four message parts, `CLOCK_THREAD_CPUTIME_ID`: `cpu_gather + cpu_keys + cpu_pack + cpu_check` minus it is
+time the encoding threads were waiting or preempted), and `prepared_messages` / `full_path_messages`.
+
 Keys, e.g. (checked in `tests/io/test_io_output.cpp`):
 ```
 lam t_500 step 6:   edition=2,typeOfLevel=isobaricInhPa,stepType=instant,typeOfGeneratingProcess=2,shortName=T,dataType=fc,date=20261022,time=1500,step=6,level=500
@@ -181,7 +227,8 @@ accumulation/rescaling and the unpadded file names (`outputs/202610221500_6.grib
 lines on stderr when it loads the IFS templates; they come from the template files, not from the encoding.
 
 Unit tests, `tests/io/test_io_output.cpp` (ctest, `test_io_output`; the real-data parts skip without
-`$VARDA_SCRATCH`, the HF templates and `VARDA_COSMO_DEFINITIONS`): 45 checks, all ok. Python-int/float parsing,
+`$VARDA_SCRATCH`, the HF templates and `VARDA_COSMO_DEFINITIONS`): 45 checks, all ok (more since: the hourly output,
+the concurrent mode, the prepared handles and `write_step_vmajor`, 68 checks). Python-int/float parsing,
 accumulate (negative clamp, float32 sums, NaN kept), rescale, `assign_mask`, NaN -> -9999 and +-inf -> +-FLT_MAX,
 path rendering; the io config (sizes 98 / 80 / 67 / 70, orders, namer, `{step:03}` -> `{step}`); `build_keys` for
 lam pl / sfc / tp / z at step 0 and global pl / tp; the 15 patch names to shortName + paramId; ICON and IFS

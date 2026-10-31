@@ -477,6 +477,129 @@ static void test_td_concurrent(const std::string& cfgpath, const std::string& td
     fs::remove_all(root);  // created by this test
 }
 
+// Prepared mode (the default) against the full path (VARDA_GRIB_PREPARED=0): both outputs of the forecaster's
+// config (lam: ICON templates; global: IFS templates, patches, bitmap), step 0 and three steps, a lam field
+// with NaN (missingValue + bitmap on an ICON message) and +-inf next to it, a constant field, tp accumulated;
+// then the downscaler's config with write_step_vmajor against write_step, sequential and concurrent, and a
+// forecaster state at hour 6 (copy rule). Every file byte-identical.
+static void test_prepared_and_vmajor(const std::string& cfgpath, const std::string& tcfgpath, const std::string& tdir) {
+    namespace fs = std::filesystem;
+    const std::string root = env_or("TMPDIR", "/tmp") + "/varda-test-prepared-" + std::to_string(::getpid());
+    const DateTime t{2026, 10, 22, 15, 0, 0};
+    const int64_t n0 = 1147980, n1 = 540670, N320 = 542080;
+    std::vector<GridSource> src(2);
+    src[0].name = "lam_0";
+    src[0].mask.assign(size_t(n0), 1);
+    src[1].name = "global";
+    src[1].mask.assign(size_t(N320), 1);
+    for (int64_t k = 0; k < 1410; ++k) src[1].mask[size_t(62219 + 20 * k)] = 0;
+    const int64_t G = n0 + n1;
+    auto same_files = [](const std::vector<std::string>& a, const std::string& ra, const std::vector<std::string>& b,
+                         const std::string& rb) {
+        bool ok = a.size() == b.size() && !a.empty();
+        for (size_t i = 0; ok && i < a.size(); ++i) {
+            const std::string x = file_bytes(a[i]);
+            ok = a[i].substr(ra.size()) == b[i].substr(rb.size()) && !x.empty() && x == file_bytes(b[i]);
+        }
+        return ok;
+    };
+    {
+        IoConfig c = IoConfig::load(cfgpath);
+        const size_t V = c.output_variables.size();
+        size_t jtp = 0;
+        for (size_t j = 0; j < V; ++j)
+            if (c.output_variables[j] == "tp") jtp = j;
+        std::vector<std::vector<float>> init;
+        for (size_t k = 0; k < c.initial_state_fields.size(); ++k) {
+            std::vector<float> f(static_cast<size_t>(G));
+            for (int64_t g = 0; g < G; ++g) f[size_t(g)] = 100.0f + float(k) + 0.001f * float(g % 1000);
+            init.push_back(std::move(f));
+        }
+        auto run = [&](const std::string& dir, bool prepared, GribOutput::Stats* st) {
+            if (prepared) ::unsetenv("VARDA_GRIB_PREPARED");
+            else ::setenv("VARDA_GRIB_PREPARED", "0", 1);
+            GribOutput go(src, c.output_variables, c, tdir, dir, t);
+            ::unsetenv("VARDA_GRIB_PREPARED");
+            go.write_initial(c.initial_state_fields, init);
+            std::vector<float> y(size_t(G) * V);
+            for (int s = 1; s <= 3; ++s) {
+                for (int64_t g = 0; g < G; ++g)
+                    for (size_t j = 0; j < V; ++j) y[size_t(g) * V + j] = float(j) + 0.5f * float(s) + 0.013f * float((g * 7 + s) % 101);
+                y[jtp] = -1.0f;
+                y[size_t(77) * V + 0] = std::nanf("");  // lam field 0: NaN and +-inf
+                y[size_t(78) * V + 0] = std::numeric_limits<float>::infinity();
+                y[size_t(79) * V + 0] = -std::numeric_limits<float>::infinity();
+                y[size_t(n0 + 5) * V + 1] = std::nanf("");  // global field 1: one more missing point
+                for (int64_t g = 0; g < G; ++g) y[size_t(g) * V + 2] = 280.0f;  // a constant field
+                go.write_step(6 * s, y.data());
+            }
+            go.close();
+            if (st) *st = go.stats();
+            return go.files();
+        };
+        GribOutput::Stats sp, sl;
+        const auto fp = run(root + "/prep", true, &sp);
+        const auto fl = run(root + "/full", false, &sl);
+        expect(same_files(fp, root + "/prep", fl, root + "/full") && fp.size() == 8,
+               "prepared handles: forecaster files byte-identical to the full path (" + std::to_string(fp.size()) + " files)");
+        expect(sp.prepared_messages == 2 * (70 + 3 * 67) && sp.full_path_messages == 0 && sl.prepared_messages == 0,
+               "prepared handles: every message from a prepared handle (" + std::to_string(sp.prepared_messages) + ", " +
+                   std::to_string(sp.full_path_messages) + " full)");
+    }
+    {
+        IoConfig c = IoConfig::load(tcfgpath);
+        const size_t V = c.output_variables.size();
+        size_t jtp = 0;
+        for (size_t j = 0; j < V; ++j)
+            if (c.output_variables[j] == "tp") jtp = j;
+        std::vector<float> fy(size_t(G) * V);
+        for (int64_t g = 0; g < G; ++g)
+            for (size_t j = 0; j < V; ++j) fy[size_t(g) * V + j] = 5000.0f + float(j) + 0.003f * float(g % 777);
+        auto fill = [&](std::vector<float>& y, int s) {
+            y.resize(size_t(G) * V);
+            for (int64_t g = 0; g < G; ++g)
+                for (size_t j = 0; j < V; ++j) y[size_t(g) * V + j] = float(j) + 0.37f * float(s) + 0.01f * float((g + s) % 100);
+            y[jtp] = -1.0f;
+        };
+        auto vmajor = [&](const std::vector<float>& y) {
+            std::vector<float> v(y.size());
+            for (int64_t g = 0; g < G; ++g)
+                for (size_t j = 0; j < V; ++j) v[j * size_t(G) + size_t(g)] = y[size_t(g) * V + j];
+            return v;
+        };
+        const int H = 7;
+        auto run = [&](const std::string& dir, int states, bool vm, int* releases) {
+            GribOutput go(src, c.output_variables, c, tdir, dir, t);
+            if (states > 1) go.set_concurrency(states, 2);
+            std::vector<std::vector<float>> keep(H + 1);
+            std::atomic<int> rel{0};
+            for (int s = 1; s <= H; ++s) {
+                std::vector<float> y;
+                fill(y, s);
+                keep[size_t(s)] = vm ? vmajor(y) : y;
+                const float* f = s == 6 ? fy.data() : nullptr;
+                auto done = [&rel, &keep, s] {
+                    std::fill(keep[size_t(s)].begin(), keep[size_t(s)].end(), -9.0f);  // released: may be overwritten
+                    ++rel;
+                };
+                if (vm) go.write_step_vmajor(s, keep[size_t(s)].data(), f, done);
+                else go.write_step(s, keep[size_t(s)].data(), f, done);
+            }
+            go.close();
+            if (releases) *releases = rel.load();
+            return go.files();
+        };
+        int r1 = 0, r2 = 0;
+        const auto a = run(root + "/gv", 1, false, nullptr);
+        const auto b = run(root + "/vs", 1, true, &r1);
+        const auto d = run(root + "/vc", 3, true, &r2);
+        expect(same_files(a, root + "/gv", b, root + "/vs") && same_files(a, root + "/gv", d, root + "/vc") && a.size() == size_t(H),
+               "write_step_vmajor: files byte-identical to write_step (sequential and concurrent)");
+        expect(r1 == H && r2 == H, "write_step_vmajor: every y released once (" + std::to_string(r1) + ", " + std::to_string(r2) + ")");
+    }
+    fs::remove_all(root);  // created by this test
+}
+
 int main() {
     test_pure();
     test_copy_rule_pure();
@@ -505,5 +628,6 @@ int main() {
     test_td_config(tcfg);
     test_td_end_to_end(tcfg, tdir);
     test_td_concurrent(tcfg, tdir);
+    test_prepared_and_vmajor(cfg, tcfg, tdir);
     return fails ? 1 : 0;
 }

@@ -21,8 +21,9 @@
 //           (when memory allows) copied on the device to a hold buffer so the next window can start.
 // A drain thread copies each window's (T_out, G, V_out) outputs device-to-host in chunks through
 // `staging_slots` pinned slots of `staging_bytes`, then into req.out_buffer(k) with an OpenMP copy of
-// `copy_threads` threads, and calls on_output(k, t, ..) as soon as state t is complete (on the drain
-// thread, in order). Nothing is page-locked beyond the ring (the window buffers stay pageable).
+// `copy_threads` threads (a transposing copy with vmajor_output: (T_out, V_out, G) window buffers), and
+// calls on_output(k, t, ..) as soon as state t is complete (on the drain thread, in order). Nothing is
+// page-locked beyond the ring (the window buffers stay pageable).
 //
 // Forecaster states: with a producer device (>= 0), push_device(s, d_y, ready) copies step s's
 // output (on the producer's device, complete after `ready`) into a ring of `ring_states` device
@@ -49,12 +50,20 @@ namespace varda::cuda {
 
 class CudaBackend;
 
+// out (T, V, G) <- the elements [off, off + len) of a (T, G, V) array held at src[0, len) (any range, also
+// across states and rows); the drain's copy with vmajor_output. The calling thread's OpenMP team.
+void transposed_copy(float* out, const float* src, size_t off, size_t len, size_t G, size_t V);
+
 struct DeviceLoopOptions {
     int ring_states = 2;                          // forecaster states in flight on the device (>= 1)
     size_t staging_bytes = size_t(64) << 20;      // one pinned staging slot
     int staging_slots = 4;                        // pinned staging slots (>= 1)
     int copy_threads = 8;                         // OpenMP threads of the host copy out of the staging ring
     int hold_output = -1;                         // -1: when the device has room, 0: never, 1: always
+    // true: the host copy out of the staging ring transposes each state, so that the window buffers are
+    // variable-major, (T_out, V_out, G), and on_output's state is (V_out, G) (GribOutput::write_step_vmajor
+    // reads it in place); false: (T_out, G, V_out), as Downscaler::run gives them. Same values.
+    bool vmajor_output = false;
 };
 
 class DeviceDownscaler {

@@ -38,9 +38,13 @@
 // the rollout hands each step's output on the GPU to the loop (a device copy into a small ring), the
 // window inputs are assembled there, and the outputs come back through a page-locked staging ring
 // (VARDA_TD_STAGING_MB per slot, default 64; VARDA_TD_STAGING_SLOTS, default 4) and an OpenMP copy
-// (VARDA_TD_COPY_THREADS, default 8) into the window buffers. VARDA_TD_DEVICE_LOOP=0 forces the host
-// loop (inputs assembled on the host, predict_step's own copies). VARDA_TD_CHECK_INPUTS=1 compares
-// every device-assembled window input with the host assembly, bitwise (verification; slower).
+// (VARDA_TD_COPY_THREADS, default 8) into the window buffers; that copy transposes each state, so the
+// window buffers are variable-major and the hourly writer encodes from them in place
+// (GribOutput::write_step_vmajor; VARDA_TD_VMAJOR=0: (G, V) buffers transposed by the writer, same files).
+// VARDA_TD_DEVICE_LOOP=0 forces the host loop (inputs assembled on the host, predict_step's own copies).
+// VARDA_TD_CHECK_INPUTS=1 compares every device-assembled window input with the host assembly, bitwise
+// (verification; slower). Both writers encode from prepared handles (GribOutput; VARDA_GRIB_PREPARED=0:
+// the full path for every message, docs/io-output.md §2; same files).
 // --quiet leaves the input log (every file and message used) out of stdout; it stays in forecast.json.
 //
 // DIR receives the GRIB files under the configured relative paths (outputs/<dateTime>_<step>.grib); DIR/forecast.json the provenance and
@@ -178,10 +182,13 @@ public:
     // has been called (once GribOutput no longer reads y: on the writer thread, or on one of its
     // encoding workers in concurrent mode; or dropped after an error; here if the item is refused).
     // This is how the downscaler's window buffers reach the writer.
-    void push_ref(int step_hours, const float* y, const float* forecaster_y, std::function<void()> done = {}) {
+    // vmajor: y is (V_out, G) (GribOutput::write_step_vmajor), read in place until `done`.
+    void push_ref(int step_hours, const float* y, const float* forecaster_y, std::function<void()> done = {},
+                  bool vmajor = false) {
         Item it;
         it.step_hours = step_hours;
         it.yref = y;
+        it.vmajor = vmajor;
         it.forecaster_y = forecaster_y;
         it.done = std::move(done);
         enqueue(std::move(it));
@@ -206,6 +213,7 @@ private:
         const std::vector<std::vector<float>>* values = nullptr;
         std::vector<float> y;
         const float* yref = nullptr;  // push_ref: y in place of the copy
+        bool vmajor = false;          // push_ref: yref is (V_out, G)
         const float* forecaster_y = nullptr;
         std::function<void()> done;   // push_ref: called once the item is written or dropped
     };
@@ -249,7 +257,9 @@ private:
                         // the state after this call returns); a copied y lives until then.
                         std::function<void()> done;
                         done.swap(it.done);
-                        if (it.yref) {
+                        if (it.yref && it.vmajor) {
+                            out_.write_step_vmajor(it.step_hours, it.yref, it.forecaster_y, std::move(done));
+                        } else if (it.yref) {
                             out_.write_step(it.step_hours, it.yref, it.forecaster_y, std::move(done));
                         } else {
                             auto keep = std::make_shared<std::vector<float>>(std::move(it.y));
@@ -310,7 +320,8 @@ private:
     bool cancelled_ = false;
 };
 
-// The downscaler's output buffers, one window (T_out, G, V_out) each, handed to the hourly writer by
+// The downscaler's output buffers, one window (T_out, G, V_out) each ((T_out, V_out, G) from the device loop with
+// vmajor_output), handed to the hourly writer by
 // pointer: acquire() blocks while every buffer is in flight (written or waiting to be); the writer
 // releases a buffer once the window's last state is written. Page-locked (cudaHostAlloc) when the
 // downscaler runs on CUDA, so that predict_step's device-to-host copy is a direct DMA.
@@ -699,6 +710,10 @@ int main(int argc, char** argv) {
                 lo.staging_slots = std::max(1, env_int("VARDA_TD_STAGING_SLOTS", lo.staging_slots));
                 lo.copy_threads = std::max(1, env_int("VARDA_TD_COPY_THREADS", lo.copy_threads));
                 lo.hold_output = env_int("VARDA_TD_HOLD", -1);
+                // variable-major window buffers: the drain transposes each state while copying it out of the
+                // staging ring, so the hourly writer encodes from them in place (VARDA_TD_VMAJOR=0: (G, V)
+                // buffers, transposed by the writer); same files
+                lo.vmajor_output = env_int("VARDA_TD_VMAJOR", 1) != 0;
                 const int producer = td_overlap ? varda::cuda::as_cuda(*model)->device() : -1;
                 td_device = std::make_unique<varda::cuda::DeviceDownscaler>(*ds, producer, lo);
             }
@@ -818,9 +833,23 @@ int main(int argc, char** argv) {
                     win_buf[size_t(k)] = tbufs->acquire();
                     return win_buf[size_t(k)];
                 };
-                rq.on_output = [&](int k, int t, int step_h, const varda::DateTime& valid, const float* y_t) {
-                    if (dump_y)
-                        std::memcpy(&hourly[(size_t(k) * size_t(T_out) + size_t(t)) * td_out_n], y_t, td_out_n * 4);
+                // the device loop's window buffers may be variable-major, (T_out, V_out, G)
+                bool td_vmajor = false;
+#ifdef VARDA_WITH_CUDA
+                td_vmajor = td_device && td_device->options().vmajor_output;
+#endif
+                rq.on_output = [&, td_vmajor](int k, int t, int step_h, const varda::DateTime& valid, const float* y_t) {
+                    if (dump_y) {
+                        float* d = &hourly[(size_t(k) * size_t(T_out) + size_t(t)) * td_out_n];
+                        if (!td_vmajor) {
+                            std::memcpy(d, y_t, td_out_n * 4);
+                        } else {  // back to (G, V_out)
+                            const size_t G = size_t(td_model->config().n_data_nodes), V = td_out_n / G;
+#pragma omp parallel for schedule(static)
+                            for (size_t g = 0; g < G; ++g)
+                                for (size_t v = 0; v < V; ++v) d[g * V + v] = y_t[v * G + g];
+                        }
+                    }
                     // the forecaster's state of this hour, for the copy-prognostic-from-forecaster post-processor
                     // (its host copy: published by the rollout callback, which the device loop does not wait for)
                     const float* fy = nullptr;
@@ -833,7 +862,7 @@ int main(int argc, char** argv) {
                     std::function<void()> done = [pool = tbufs.get(), b = win_buf[size_t(k)], left = win_left[size_t(k)]] {
                         if (left->fetch_sub(1) == 1) pool->release(b);
                     };
-                    twriter->push_ref(step_h, y_t, fy, std::move(done));
+                    twriter->push_ref(step_h, y_t, fy, std::move(done), td_vmajor);
                     if (t + 1 == T_out) {
                         std::printf("hours %d-%d (window %d, to %s) computed\n", k * W + 1, step_h, k + 1,
                                     varda::format_iso8601_utc(valid).c_str());
@@ -976,6 +1005,7 @@ int main(int argc, char** argv) {
                           {"staging_bytes", lo.staging_bytes},
                           {"staging_slots", lo.staging_slots},
                           {"copy_threads", lo.copy_threads},
+                          {"vmajor_output", lo.vmajor_output},
                           {"output_held", td_device->output_held()},
                           {"device_bytes", td_device->device_bytes()},
                           {"pinned_bytes", td_device->pinned_bytes()},
@@ -1029,6 +1059,9 @@ int main(int argc, char** argv) {
                         {"grib", {{"post", ts.post}, {"encode", ts.encode}, {"write", ts.write},
                                   {"write_wait", ts.write_wait}, {"cpu_gather", ts.cpu_gather},
                                   {"cpu_keys", ts.cpu_keys}, {"cpu_pack", ts.cpu_pack}, {"cpu_check", ts.cpu_check},
+                                  {"thread_cpu", ts.thread_cpu}, {"transpose", ts.transpose},
+                                  {"prepared_messages", ts.prepared_messages},
+                                  {"full_path_messages", ts.full_path_messages},
                                   {"states", tout->concurrency()}, {"max_states_in_flight", ts.max_states_in_flight},
                                   {"messages", ts.messages}, {"bytes", ts.bytes}}},
                         {"total", td_end - td0}}},
@@ -1117,6 +1150,9 @@ int main(int argc, char** argv) {
                       {"write_after_rollout", write_tail_s},
                       {"step_write", writer.step_seconds()},
                       {"grib", {{"post", gs.post}, {"encode", gs.encode}, {"write", gs.write},
+                                {"cpu_gather", gs.cpu_gather}, {"cpu_keys", gs.cpu_keys}, {"cpu_pack", gs.cpu_pack},
+                                {"cpu_check", gs.cpu_check}, {"thread_cpu", gs.thread_cpu}, {"transpose", gs.transpose},
+                                {"prepared_messages", gs.prepared_messages}, {"full_path_messages", gs.full_path_messages},
                                 {"messages", gs.messages}, {"bytes", gs.bytes}}},
                       {"total", total_s}}},
                     {"step_ms", step_ms}};

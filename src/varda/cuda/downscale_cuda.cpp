@@ -37,6 +37,43 @@ void parallel_copy(float* dst, const float* src, size_t n) {
     }
 }
 
+}  // namespace
+
+// out (T, V, G) <- the elements [off, off + len) of a (T, G, V) array, held at src[0, len): element (t, g, v)
+// goes to out[t * G * V + v * G + g], i.e. out + t * G * V is state t variable-major. The calling
+// thread's OpenMP team, over blocks of rows (each block's V columns written as contiguous runs).
+void transposed_copy(float* out, const float* src, size_t off, size_t len, size_t G, size_t V) {
+    const size_t n = G * V, end = off + len;
+    size_t e = off;
+    while (e < end) {
+        const size_t t = e / n, r0 = e % n, r1 = std::min(n, r0 + (end - e));  // state t's elements [r0, r1)
+        const float* s = src + (e - off);  // s[r - r0] = element r of state t
+        float* o = out + t * n;
+        const size_t g0 = r0 / V, g1 = (r1 + V - 1) / V;  // rows touched (the first and last may be partial)
+        constexpr size_t B = 64;
+        const size_t nb = (g1 - g0 + B - 1) / B;
+#pragma omp parallel for schedule(static)
+        for (size_t b = 0; b < nb; ++b) {
+            const size_t ga = g0 + b * B, gb = std::min(g1, ga + B);
+            const bool edge = ga * V < r0 || gb * V > r1;
+            for (size_t v = 0; v < V; ++v) {
+                float* ov = o + v * G;
+                if (!edge) {
+                    for (size_t g = ga; g < gb; ++g) ov[g] = s[g * V + v - r0];
+                } else {
+                    for (size_t g = ga; g < gb; ++g) {
+                        const size_t r = g * V + v;
+                        if (r >= r0 && r < r1) ov[g] = s[r - r0];
+                    }
+                }
+            }
+        }
+        e += r1 - r0;
+    }
+}
+
+namespace {
+
 cudaEvent_t make_event(bool timing) {
     cudaEvent_t e = nullptr;
     VARDA_CUDA_CHECK(cudaEventCreateWithFlags(&e, timing ? cudaEventDefault : cudaEventDisableTiming));
@@ -274,7 +311,8 @@ void DeviceDownscaler::drain(const DownscaleRequest& req, int n) {
             VARDA_CUDA_CHECK(cudaEventSynchronize(ev_stg_[i % S]));
             const size_t off = i * chunk, len = std::min(chunk, total - off);
             t0 = now_s();
-            parallel_copy(out + off, stg_[i % S], len);
+            if (o_.vmajor_output) transposed_copy(out, stg_[i % S], off, len, size_t(G_), out_n_ / size_t(G_));
+            else parallel_copy(out + off, stg_[i % S], len);
             w.host_copy += now_s() - t0;
             if (i + S < n_chunks) enqueue(i + S);
             while (next < T_out_ && size_t(next + 1) * out_n_ <= off + len) {

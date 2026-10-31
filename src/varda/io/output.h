@@ -5,6 +5,12 @@
 // templates with NaN -> -9999 and a bitmap. Keys, key order and the Python str() spelling of each
 // value follow anemoi/inference/grib/encoding.py and outputs/grib.py exactly, so that the messages
 // are the same bytes when fed the same values.
+//
+// Per message, by default, the handle is a clone of the variable's prepared handle (the template with every key
+// before the first step- or value-dependent one already set, in anemoi's order) on which only the remaining keys are
+// set, and the values are gathered from the state straight into float64; VARDA_GRIB_PREPARED=0 takes the full path
+// (template clone, every key, the values copied through the post-processors) for every message. Same bytes
+// (docs/io-output.md §2).
 #pragma once
 
 #include <cstdint>
@@ -96,6 +102,11 @@ public:
     // worker thread once the state is gathered, before its messages are encoded, or here if the call
     // throws). Both must stay valid and unchanged until then.
     void write_step(int step_hours, const float* y, const float* forecaster_y, std::function<void()> release);
+    // The same with y variable-major: (V_out, G), y + j * G the G values of output variable j (model output
+    // order), which the messages read in place (no transpose, no copy); forecaster_y stays (G, V_out).
+    // Concurrent mode: `release` is called once the state's messages are encoded (y is read until then),
+    // before they are written. Same messages and files as write_step on the transposed state.
+    void write_step_vmajor(int step_hours, const float* y, const float* forecaster_y, std::function<void()> release);
 
     // Concurrent encoding of whole states (default: off, one state at a time). With states > 1,
     // write_initial / write_step run the top-level post-processors on the calling thread, in call order
@@ -124,13 +135,24 @@ public:
     // states overlap, so it exceeds the elapsed time), and file writes (summed likewise).
     struct Stats {
         double post = 0, encode = 0, write = 0;
-        // CPU seconds summed over threads, per part of a message's encoding
+        // seconds summed over the encoding threads (each thread's wall clock, so waits and preemption count),
+        // per part of a message's encoding: the values (gather), the handle and its keys, the packing, the checks
         double cpu_gather = 0, cpu_keys = 0, cpu_pack = 0, cpu_check = 0;
         int64_t messages = 0, bytes = 0;
         // concurrent mode: seconds the writes of a state waited for an earlier state's writes to the same
         // file (summed), and the most states encoding at once
         double write_wait = 0;
         int max_states_in_flight = 0;
+        // wall seconds of the (G, V) -> (V, G) transposes of write_step's states (summed; each runs on the
+        // encoding team)
+        double transpose = 0;
+        // prepared mode (the default, VARDA_GRIB_PREPARED != 0): messages encoded from a prepared handle,
+        // and messages that took the full path (no prepared handle, its keys differ, or a key failed)
+        int64_t prepared_messages = 0, full_path_messages = 0;
+        // CPU seconds (CLOCK_THREAD_CPUTIME_ID: user + system, not time spent waiting or preempted) of the
+        // same four parts, summed over messages: cpu_gather + cpu_keys + cpu_pack + cpu_check minus this is
+        // the time the encoding threads waited (locks, oversubscribed cores)
+        double thread_cpu = 0;
     };
     Stats stats() const;
     int64_t n_points() const { return G_; }

@@ -134,7 +134,10 @@ rollout.run(q); t.join();
   64 MB through 4 pinned slots (256 MB, allocated once; `VARDA_TD_STAGING_MB`, `VARDA_TD_STAGING_SLOTS`), each chunk then
   copied by an OpenMP team of 8 threads (`VARDA_TD_COPY_THREADS`) into the caller's pageable `out_buffer(k)`, and calls
   `on_output(k, t, ..)` as soon as state t is complete. `on_output` and `out_buffer` are called on the drain thread, in
-  order. The window buffers stay pageable (page-locking them is what costs seconds, §7).
+  order. The window buffers stay pageable (page-locking them is what costs seconds, §7). With
+  `DeviceLoopOptions::vmajor_output` (`varda-forecast`'s default, `VARDA_TD_VMAJOR=0` turns it off) the copy transposes
+  (`transposed_copy`, any chunk boundary): the window buffers are `(T_out, V_out, G)`, each state variable-major, and
+  the hourly writer reads them in place (`GribOutput::write_step_vmajor`, §7 "cheaper hourly encoding"); same values.
 - **Lifetimes and events.** Ring slot s % R: written by `push_device(s)` after the copy stream waited for
   `ev_consumed[slot]` (window s - R's gather), read by window s's gather after the downscaler stream waited for
   `ev_copied[slot]`. Backend input: slot 0 is overwritten (window k's copy) only after window k - 1's forward pass in stream
@@ -542,15 +545,55 @@ sets the total. fp32, two GPUs, 32 CPUs, on this 80 GB node: 53.3 / 51.4 s (one 
 `VARDA_TD_CHECK_INPUTS=1` with the downscaler on the second GPU (the `cudaMemcpyPeerAsync` feed): 4 of 4 windows bitwise
 equal to the host assembly, outputs byte-identical.
 
+**Cheaper hourly encoding** (prepared handles, direct gathers, variable-major window buffers; `docs/io-output.md` §2).
+Each message now clones its variable's prepared handle (the template with every key before the step keys already set)
+and sets only the step keys, `level`, the patch and bitmap keys and `generatingProcessIdentifier`; its values go from
+the state straight into a per-thread float64 buffer; and the device loop's drain transposes each state while copying
+it out of the staging ring, so the hourly writer reads the window buffers in place (no transpose, no column copy).
+Measured in two jobs on one node (4 x A100-SXM4 96 GB "PG506-232", 128 cores; `$VARDA_SCRATCH/jobs/enc/final32`
+with 32 CPUs and one GPU, `final64` with 64 CPUs and two GPUs, run after it), fp16, CUDA graph on, `--assets`, 24 h on
+2026-10-22T15 and 120 h on 2026-10-30T15, the committed binary (27a1d8d, "before") and this one ("after") alternating
+after a discarded first run. Seconds, process wall clock / `forecast.json` total; the hourly writer's parts summed over
+messages (each thread's wall clock, `downscaler.seconds.grib.cpu_*`):
+
+| CPUs | GPUs | run | before | after | loop blocked on the writer, before / after | hourly gather / keys / pack, before / after |
+|---|---|---|---|---|---|---|
+| 32 | 1 | 24 h | 16.73 / 15.85, 16.59 / 15.90 | **14.40 / 13.68, 14.34 / 13.65** | 2.33-2.60 / 0.21-0.27 | 20-22 / 33 / 65-70 // 14-15 / 19-26 / 67-68 |
+| 32 | 1 | 120 h | 59.01 / 58.21 | **44.18 / 43.48** | 31.0 / 13.9 | 126 / 354 / 403 // 74 / 195 / 344 |
+| 32 | 1 | `--no-downscaler` | 7.99 / 7.39 | 7.78 / 7.20 | | |
+| 64 | 1 | 24 h | 12.59 / 11.67, 12.17 / 11.36 | **11.18 / 10.35, 11.24 / 10.43** | 0 / 0 | 17-20 / 44-60 / 48-58 // 9-10 / 9 / 44-45 |
+| 64 | 1 | 120 h | 37.82 / 36.94, 40.58 / 39.20 | **33.20 / 32.37, 33.46 / 32.22** | 12.1-16.7 / 0 | 96-105 / 337-572 / 274-275 // 44-51 / 38-41 / 215-230 |
+| 64 | 2 | 24 h | 12.82 / 11.71 | 12.23 / 11.09 | 1.36 / 0.29 | 21 / 38 / 53 // 12 / 46 / 48 |
+| 64 | 1 | `--no-downscaler` | 7.17 / 6.45 | 7.09 / 6.39 | | |
+
+With 32 CPUs the 5-day forecast takes 44 s instead of 59 s and the 24 h one 14.4 s instead of 16.6-16.7 s; with 64 CPUs
+33.2-33.5 s instead of 37.8-40.6 s, and the writer no longer holds the loop back at all (0 s blocked, 0.5 s of writing
+after the last window): the total is then set by the GPU (rollout 26 s, the two models sharing one GPU). The writer's
+thread CPU time (`thread_cpu`, new) is 85-87 s per 24 h and 437 s per 120 h with 32 CPUs (56-58 s and 275-297 s with
+64); the CCSDS packing is most of it (61-66% of the summed parts; 78% of the CPU time in the micro-benchmark below). The gains, separated in single runs (32 CPUs, 24 h, `jobs/enc/gpu1`,
+`gpu2`): prepared handles and direct gathers (with the writer still transposing) 16.4-16.8 s -> 14.8 s, the
+variable-major window buffers 14.8 s -> 14.3-14.4 s (the writer's transposes were 4.7-5.2 s of its 24 h; the drain's
+transposing copy takes 0.85-1.7 s per window instead of 0.45-1.06 s for the plain copy, off the critical path). In a
+micro-benchmark on one ICON message (CPU node, `jobs/enc/kb2`), single-threaded, a message costs 0.3 ms gather, 0.4 ms
+keys (0.54 ms the full path), 10.7 ms packing, 0.2 ms checks; with 32 threads at once 2.5, 2.5, 19.7 and 0.7 ms of CPU
+time, levelling off at ~880 messages/s on 64 CPUs: beyond ~16 threads the per-message cost grows with the number of
+threads (the gather's memory streaming most; glibc malloc thresholds changed nothing), and handle creation is
+serialised inside ecCodes. Every run byte-identical: 24 h fp16 to `td-final/out-fp16-2` (35 files; one GPU, two GPUs),
+120 h to `td-5day-2/out-base-120h-1` (163 files), `--no-downscaler` to `td-final/out-fc-only` (10 files), fp32 24 h on
+two GPUs (44.02 / 43.04 s, 64 CPUs; no baseline run in the job) to `td-final/out-fp32` (35 files); also
+`VARDA_GRIB_PREPARED=0` and `VARDA_TD_VMAJOR=0` (fp16 24 h), and `--dump-y`'s hourly states with and without the
+variable-major buffers (`cmp` of `hourly.safetensors`). Encoder-only (`varda-grib-write`, §4 of `docs/io-output.md`):
+676 / 676 messages byte-identical to anemoi-inference's, fp16 and fp32, prepared and full path.
+
 ## 8. Open points
 
-- The fp16 critical path is now the hourly GRIB writer (§7, device-resident loop): ~140 CPU s of encoding per 24 h on
-  32 CPUs (gather 23, keys 37-47, CCSDS packing 70-76, check 3), ~0.45 s per hour with three hours at once. The loop's
-  window is 0.66 s of GPU work and its copies are off the critical path; the loop waits for the writer (2.5-2.9 s at 24 h,
-  31 s at 120 h). Ways forward, not done: (b) cheaper hourly encoding: the keys part (~40 CPU s: template clone and
-  `set_key_vals` per message) and the column gathers (~23 CPU s) are repeated identically every hour; (c) more CPUs per
-  GPU: measured, 64 CPUs instead of 32 take the 5-day forecast from 59-62 s to 37.5-40.8 s (§7, the combined state), still
-  blocked on the writer for 12-18 s, so (b) is the next lever. ((a), the device-resident loop, is done: §2, §7.)
+- The hourly GRIB writer (§7) costs ~85 CPU s per 24 h with 32 CPUs, most of it CCSDS packing (ecCodes/libaec,
+  prescribed by the templates); the keys and gathers are no longer repeated per message (§7, cheaper hourly encoding). With
+  64 CPUs it no longer limits the loop (0 s blocked at 120 h; the GPU sets the total); with 32 CPUs it still does at
+  120 h (13.9 s blocked, 44 s total). Not done: (d) overlapping a state's file writes (single-threaded, ~0.3 s per hour,
+  after its encoding) with its encoding; (e) fewer bytes through memory per message (the float64 values that ecCodes
+  packs are 9.2 MB per lam message, and the per-message cost grows with the number of threads at once). ((a) the
+  device-resident loop, (b) cheaper keys and gathers, (c) more CPUs per GPU: done or measured, §2, §7.)
 - The device loop across two GPUs (`Options::cuda_device` of the downscaler differing from the forecaster's) is verified by
   `tests/test_downscale.cpp` §6 on the synthetic model (two A100-SXM4-80GB on NVLink, peer access enabled: `feed` =
   `peer`, every variant bitwise; `$VARDA_SCRATCH/jobs/td-devloop-5`) and by `varda-forecast --downscaler-device cuda:1`

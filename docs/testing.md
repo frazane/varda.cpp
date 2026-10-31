@@ -24,7 +24,9 @@ exit 0) when their data or device is missing.
   zero in-degree and destination sub-ranges, thread-count invariance) against naive double references.
 - `test_cuda_gemm`: cuBLASLt Linear wrapper, fp32 and fp16, odd rows, padded output width, tiny and wide K, repeatability.
 - `test_cuda_kernels`: CUDA kernels (attention incl. C = 768, LayerNorm, fused residual + LayerNorm,
-  GELU, normaliser, input/output assembly, every bounding type), fp32 and fp16 storage.
+  GELU, normaliser, input/output assembly, every bounding type), fp32 and fp16 storage; the device-resident
+  downscaler loop's `gather_columns` against the host assembly (bitwise, NaN payloads, -0, denormals, inf) and the
+  drain's `transposed_copy` over chunk boundaries.
 - `test_forcings`: dynamic forcings bitwise against anemoi's `ComputedForcings` fixtures
   (`$VARDA_SCRATCH/forcings/`), date helpers, thread invariance. Data part skipped if fixtures are missing.
 - `test_downscale`: the temporal downscaler's per-channel assembly table, slot fill, rejected configurations, dates and
@@ -242,9 +244,11 @@ Parts that need data skip with a message and exit 0 when their variables are uns
   `VARDA_REGRID_MATRIX`, `VARDA_N320_TEMPLATE` (HF `templates/ifs-levtype=sfc.grib`), `VARDA_REGRID_REF_DUMPS` (a
   reference run's `dumps/`) and `VARDA_COSMO_DEFINITIONS`: MIR's own `regrid.1` input messages through our regridder
   must decode bitwise like MIR's output messages.
-- `test_io_output`: 45 checks of the output side: Python-style parsing, `tp` accumulate and rescale, `assign_mask`, NaN
-  and inf encoding, path rendering, the io config, `build_keys`, patch names, template matching, and a synthetic
-  end-to-end write on the real templates. Needs `VARDA_IO_CONFIG` (default
+- `test_io_output`: 68 checks of the output side: Python-style parsing, `tp` accumulate and rescale, `assign_mask`, NaN
+  and inf encoding, path rendering, the io config, `build_keys`, patch names, template matching, a synthetic
+  end-to-end write on the real templates, the concurrent writer (same files and bytes as one state at a time, release
+  once, errors), the prepared-handle path against the full path (542/542 messages, NaN and inf, constants, tp) and
+  `write_step_vmajor` against `write_step`. Needs `VARDA_IO_CONFIG` (default
   `$VARDA_SCRATCH/realdata/assets/varda-io.json`, produced by `python/export_io_config.py`), and for the end-to-end part
   `VARDA_TEMPLATES` (default `$VARDA_SCRATCH/hf/templates`) and `VARDA_COSMO_DEFINITIONS`.
 
@@ -308,6 +312,10 @@ binaries first (`$VARDA_SCRATCH/jobs/<name>/bin`).
 The interpolator's forward pass is covered above: synthetic models g and h (section 4, both backends), `varda-parity`
 on the real golden data (section 3, `tolerances/varda-td.json`), the CUDA output-assembly unit test for T_out = 6
 (`test_cuda_kernels`). The loop and the real-data path (`docs/downscaler.md`):
+
+- `test_downscale` section 6 (with `VARDA_TEST_TD_MODEL` and a GPU; skipped otherwise): the device-resident loop
+  against the host loop on the same CUDA model, 4 windows, host and device feed (and the peer feed with two GPUs),
+  hold buffer on and off, staging ring sizes and chunks that do not divide a state, fp32 and fp16, bitwise.
 
 - `test_io_output` (ctest) also covers the hourly output: the copy rule's glob matching (14 cases against Python's
   `fnmatchcase`), the downscaler io config (`$VARDA_TD_IO_CONFIG`, default `$VARDA_SCRATCH/realdata/assets/varda-td-io.json`:

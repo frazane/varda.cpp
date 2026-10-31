@@ -142,8 +142,12 @@ forces the host loop (inputs assembled on the host and uploaded, outputs through
 `VARDA_TD_COPY_THREADS` (OpenMP threads copying out of it, default 8), `VARDA_TD_RING` (forecaster states in flight on
 the device, default 2), `VARDA_TD_HOLD` (0 / 1: never / always copy a window's output to a hold buffer; default when
 the GPU has room), `VARDA_TD_CHECK_INPUTS=1` (compare every device-assembled window input with the host assembly,
-bitwise; prints one line per window, exit code 3 on a difference; slower), and `VARDA_FC_COPY_THREADS` (OpenMP
-threads of the rollout callback's copy of each step into host memory, default 8). None changes a result.
+bitwise; prints one line per window, exit code 3 on a difference; slower), `VARDA_TD_VMAJOR` (0: the device loop's
+window buffers stay (G, V) and the hourly writer transposes each state; default 1: the drain transposes while copying
+out of the staging ring and the writer reads the states in place, `docs/io-output.md` §2), `VARDA_GRIB_PREPARED` (0:
+both GRIB writers encode every message by the full path, template clone and every key, instead of from prepared
+handles; `docs/io-output.md` §2; for A/B checks) and `VARDA_FC_COPY_THREADS` (OpenMP threads of the rollout callback's
+copy of each step into host memory, default 8). None changes a result.
 
 One GPU job, A100-SXM4-80GB, 32 CPUs, 2026-10-23, `varda-forecast --realdata ... --precision fp16`
 (device rollout, CUDA graph on, 4 steps, write queue 4, 32 OpenMP threads), the same command run three times in the

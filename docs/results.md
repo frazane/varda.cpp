@@ -404,4 +404,34 @@ CPUs for 12-18 s. A second GPU saves the rollout 4-5 s at 120 h and 2 s at 24 h 
 in fp32 (two GPUs, 32 CPUs, this 80 GB node) the run takes 53.3 / 51.4 s where one 80 GB GPU does not hold both models.
 Every run byte-identical: 24 h to the reference runs of section 6 (35 files), 120 h to the 120 h run above (163 files);
 the peer-copy feed to the second GPU checked bitwise against the host assembly (`VARDA_TD_CHECK_INPUTS=1`, 4 of 4
-windows). Next lever: the cost of the hourly encoding itself (`docs/downscaler.md` §8).
+windows). Next lever: the cost of the hourly encoding itself, below.
+
+### Cheaper hourly encoding: prepared handles, direct gathers, variable-major drain
+
+**Setup.** `docs/io-output.md` §2 and `docs/downscaler.md` §7 "Cheaper hourly encoding": one prepared ecCodes handle per
+(output, variable) holding every step-independent key (a prefix of anemoi's key sequence, so nothing is reordered;
+per message: clone, the step and value keys, the values), the post-processor chain turned into copy runs once, and the
+device loop's drain writing the states variable-major so the writer gathers nothing. Same node type as above (4 x A100
+96 GB, 128 cores), fp16, CUDA graph on, `--assets`, one job per CPU count, the previous binary and this one alternating
+after a discarded first run. Seconds, process wall clock / `forecast.json` total:
+
+| CPUs | GPUs | lead time | before | after |
+|---|---|---|---|---|
+| 32 | 1 | 24 h | 16.7 / 15.9, 16.6 / 15.9 | **14.4 / 13.7, 14.3 / 13.7** |
+| 32 | 1 | 120 h | 59.0 / 58.2 | **44.2 / 43.5** |
+| 32 | 1 | forecaster only | 8.0 / 7.4 | 7.8 / 7.2 |
+| 64 | 1 | 24 h | 12.6 / 11.7, 12.2 / 11.4 | **11.2 / 10.4, 11.2 / 10.4** |
+| 64 | 1 | 120 h | 37.8 / 36.9, 40.6 / 39.2 | **33.2 / 32.4, 33.5 / 32.2** |
+| 64 | 2 | 24 h | 12.8 / 11.7 | 12.2 / 11.1 |
+| 64 | 2 | 24 h, fp32 | | 44.0 / 43.0 |
+| 64 | 1 | forecaster only | 7.2 / 6.5 | 7.1 / 6.4 |
+
+With 64 CPUs the loop is no longer blocked on the writer (0 s; 12-17 s before) and the 120 h total is set by the GPU
+(rollout 26 s, both models on one GPU); with 32 CPUs the writer still blocks the loop for 13.9 s (31 s before). The
+encoder's real CPU time (a new `thread_cpu` counter) is 437 s for 121 hourly files on 32 CPUs, against 624 s of summed
+per-thread wall clock: the `cpu_*` figures of the earlier sections include waiting, and the key setting itself is
+0.4 ms of an 11.6 ms message single-threaded; most of what remains is the CCSDS packing, whose per-message cost grows
+with the number of threads packing at once (10.7 ms alone, 19.7 ms with 32). Every run byte-identical: 24 h fp16 and
+fp32 to the reference runs (35 files each), 120 h to the 120 h run above (163 files), forecaster only to its reference
+(10 files), the encoder alone to anemoi's messages (676/676, fp16 and fp32, prepared and full path); no message fell
+back to the full path.

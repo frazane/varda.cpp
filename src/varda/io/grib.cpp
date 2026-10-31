@@ -211,6 +211,9 @@ void GribHandle::set_key_vals(const KeyVals& kvs) {
 void GribHandle::set_double_array(const std::string& key, const std::vector<double>& v) {
     check(codes_set_double_array(h_, key.c_str(), v.data(), v.size()), "set_double_array " + key);
 }
+void GribHandle::set_double_array(const std::string& key, const double* v, size_t n) {
+    check(codes_set_double_array(h_, key.c_str(), v, n), "set_double_array " + key);
+}
 
 std::pair<const void*, size_t> GribHandle::message() const {
     const void* p = nullptr;
