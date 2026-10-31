@@ -23,6 +23,7 @@
 #include <cuda_runtime_api.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -50,6 +51,18 @@ public:
     DeviceRollout& operator=(const DeviceRollout&) = delete;
 
     void run(const RolloutRequest& req);
+
+    // Optional consumer of the device-resident outputs (e.g. the temporal downscaler's device loop,
+    // docs/downscaler.md §2), called on run()'s thread right after step s is enqueued, with d_y = step
+    // s's output (G, V_out) on this rollout's device, complete once `ready` has completed (an event on
+    // the rollout's stream). The hook may enqueue reads of d_y on its own streams (after waiting for
+    // `ready`) and returns an event recorded after them, or nullptr: step s + 2, the next writer of
+    // d_y, waits for that event on the GPU (no host synchronisation). The hook may block the host
+    // (e.g. while its own buffers are full); it must not enqueue work on the rollout's streams. The
+    // returned event must not be re-recorded before step s + 2 has been enqueued, i.e. before the
+    // hook's call for step s + 2. Set it before run(); the numerics are unchanged.
+    using StepHook = std::function<cudaEvent_t(int step, const float* d_y, cudaEvent_t ready)>;
+    void set_step_hook(StepHook hook) { hook_ = std::move(hook); }
 
     // GPU time of each step of the last run (ms; CUDA events around each step's graph, read
     // after the run), and the host wall time of the whole loop (s, upload of x0 excluded).
@@ -87,6 +100,8 @@ private:
 
     cudaStream_t main_ = nullptr, d2h_ = nullptr, h2d_ = nullptr;
     cudaEvent_t ev_up_[2] = {nullptr, nullptr}, ev_d2h_[2] = {nullptr, nullptr};
+    StepHook hook_;
+    cudaEvent_t ev_hook_[2] = {nullptr, nullptr};  // per parity: the hook's event for the step that last wrote y_[p]
     std::vector<cudaEvent_t> ev_beg_, ev_end_;
     // graph_[p][u]: parity p (which y / f buffers), u = 1 with the state update, 0 without (last step)
     cudaGraphExec_t graph_[2][2] = {{nullptr, nullptr}, {nullptr, nullptr}};

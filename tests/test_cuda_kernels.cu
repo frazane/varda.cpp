@@ -3,7 +3,8 @@
 // sub-ranges, several channel/head layouts incl. C = 768, invariance to the warp split), LayerNorm
 // and the fused residual + LayerNorm (every C the backend accepts), GELU (erf and tanh),
 // normaliser, input assembly and output assembly (residual and every bounding type, one and several
-// output steps). fp32 and fp16 storage.
+// output steps). fp32 and fp16 storage. The downscaler's device input gather (gather_columns) against
+// DownscaleAssembly::fill_slot, bitwise.
 #include <cuda_fp16.h>
 
 #include <algorithm>
@@ -17,6 +18,7 @@
 
 #include "varda/cuda/common.h"
 #include "varda/cuda/kernels.h"
+#include "varda/downscale.h"
 #include "varda/format.h"
 #include "varda/graph.h"
 
@@ -406,6 +408,52 @@ void test_output(std::mt19937& rng, int T_out) {
     check(ok_y, "output_assemble bounding bitwise" + sfx, ok_y ? 0 : 1, 0);
 }
 
+// gather_columns with the device loop's table (src/varda/cuda/downscale_cuda.cpp) against the host
+// fill_slot: channel orders that differ between the downscaler and the forecaster, constants compacted,
+// forcing columns, special values (NaN payloads, -0, denormals, inf) copied bit for bit.
+void test_gather_columns(std::mt19937& rng) {
+    const std::vector<std::string> fin = {"a", "b", "c", "sdor", "cos_julian_day", "slor", "d", "e"};
+    const std::vector<std::string> fout = {"e", "d", "c", "b", "a"};
+    const std::vector<std::string> din = {"b", "sin_julian_day", "sdor", "a", "cos_julian_day", "d", "slor", "c", "e"};
+    const int64_t G = 1237;
+    const DownscaleAssembly a = DownscaleAssembly::make(G, din, {"cos_julian_day", "sin_julian_day"}, {4, 1},
+                                                        {"sdor", "slor"}, {2, 6}, fin, fout);
+    std::vector<int8_t> sel(size_t(a.V_in));
+    std::vector<int> col(size_t(a.V_in)), ccols;
+    for (int c = 0; c < a.V_in; ++c) {
+        if (a.kind[size_t(c)] == DownscaleAssembly::Prognostic) {
+            sel[size_t(c)] = 0;
+            col[size_t(c)] = a.from_out[size_t(c)];
+        } else if (a.kind[size_t(c)] == DownscaleAssembly::Constant) {
+            sel[size_t(c)] = 1;
+            col[size_t(c)] = int(ccols.size());
+            ccols.push_back(a.from_in[size_t(c)]);
+        } else {
+            sel[size_t(c)] = 2;
+            col[size_t(c)] = a.forcing_col[size_t(c)];
+        }
+    }
+    const int Vc = int(ccols.size());
+    auto x0 = randn(size_t(G * a.V_fin), rng), y = randn(size_t(G * a.V_fout), rng), f = randn(size_t(G * a.F), rng);
+    const uint32_t specials[] = {0x7fc00001u, 0xffc12345u, 0x80000000u, 0x00000001u, 0x7f800000u, 0xff800000u};
+    for (size_t i = 0; i < 6; ++i) std::memcpy(&y[i * 7 + 3], &specials[i], 4);
+    std::memcpy(&x0[size_t(5 * a.V_fin + 3)], &specials[0], 4);  // a constant (sdor at point 5)
+    std::vector<float> cst(size_t(G * Vc));
+    for (int64_t g = 0; g < G; ++g)
+        for (int j = 0; j < Vc; ++j) cst[size_t(g * Vc + j)] = x0[size_t(g * a.V_fin + ccols[size_t(j)])];
+    std::vector<float> ref(size_t(G * a.V_in));
+    a.fill_slot(ref.data(), y.data(), nullptr, x0.data(), f.data());
+    DeviceBuffer d_sel = raw_dev(sel), d_col = raw_dev(col), d_y = raw_dev(y), d_c = raw_dev(cst), d_f = raw_dev(f);
+    DeviceBuffer d_o(ref.size() * sizeof(float));
+    gather_columns(d_o.as<float>(), a.V_in, G, d_sel.as<int8_t>(), d_col.as<int>(), d_y.as<float>(), a.V_fout,
+                   d_c.as<float>(), Vc, d_f.as<float>(), a.F, nullptr);
+    VARDA_CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<float> out(ref.size());
+    VARDA_CUDA_CHECK(cudaMemcpy(out.data(), d_o.get(), out.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    const bool ok = std::memcmp(out.data(), ref.data(), out.size() * sizeof(float)) == 0;
+    check(ok, "gather_columns == DownscaleAssembly::fill_slot bitwise", ok ? 0 : 1, 0);
+}
+
 }  // namespace
 
 int main() {
@@ -435,6 +483,7 @@ int main() {
         test_output<float>(rng, T_out);
         test_output<__half>(rng, T_out);
     }
+    test_gather_columns(rng);
     std::printf("%s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

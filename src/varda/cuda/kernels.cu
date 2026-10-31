@@ -1,6 +1,7 @@
 // CUDA kernels of the varda backend (see kernels.h and docs/cuda.md §3).
 #include <cuda_fp16.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <stdexcept>
@@ -120,6 +121,21 @@ unsigned grid_1d(int64_t n) {
     return static_cast<unsigned>(b < 65535 * 16 ? (b > 0 ? b : 1) : 65535 * 16);
 }
 constexpr int64_t kI32 = (int64_t(1) << 31) - (int64_t(1) << 29);  // headroom > the largest grid stride (2^28)
+
+// ------------------------------------------------------------------ downscaler input
+
+template <class I>
+__global__ void gather_columns_kernel(float* __restrict__ out, I n, I n_cols, const int8_t* __restrict__ sel,
+                                      const int* __restrict__ col, const float* __restrict__ a, I lda,
+                                      const float* __restrict__ b, I ldb, const float* __restrict__ f, I ldf) {
+    for (I i = blockIdx.x * (I)blockDim.x + threadIdx.x; i < n; i += (I)gridDim.x * blockDim.x) {
+        const I g = i / n_cols;
+        const I c = i - g * n_cols;
+        const int k = __ldg(sel + c);
+        const I j = __ldg(col + c);
+        out[i] = k == 0 ? a[g * lda + j] : (k == 1 ? b[g * ldb + j] : f[g * ldf + j]);
+    }
+}
 
 // ------------------------------------------------------------------ assembly / conversions
 
@@ -460,6 +476,20 @@ void normalise(const float* x, const float* mul, const float* add, float* xn, in
 void denormalise(const float* yn, const float* add, const float* mul, float* y, int64_t n, int V, cudaStream_t s) {
     if (n < kI32) denormalise_kernel<int32_t><<<grid_1d(n), 256, 0, s>>>(yn, add, mul, y, int32_t(n), V);
     else denormalise_kernel<int64_t><<<grid_1d(n), 256, 0, s>>>(yn, add, mul, y, n, V);
+    VARDA_CUDA_LAUNCH();
+}
+
+void gather_columns(float* out, int n_cols, int64_t G, const int8_t* sel, const int* col, const float* a, int lda,
+                    const float* b, int ldb, const float* f, int ldf, cudaStream_t s) {
+    const int64_t n = G * n_cols;
+    if (n <= 0) return;
+    // 32-bit indexing when every index of the sources fits as well
+    const int64_t widest = std::max<int64_t>({int64_t(n_cols), int64_t(lda), int64_t(ldb), int64_t(ldf)});
+    if (G * widest < kI32)
+        gather_columns_kernel<int32_t><<<grid_1d(n), 256, 0, s>>>(out, int32_t(n), n_cols, sel, col, a, lda, b, ldb,
+                                                                  f, ldf);
+    else
+        gather_columns_kernel<int64_t><<<grid_1d(n), 256, 0, s>>>(out, n, n_cols, sel, col, a, lda, b, ldb, f, ldf);
     VARDA_CUDA_LAUNCH();
 }
 

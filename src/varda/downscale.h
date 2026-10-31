@@ -149,13 +149,22 @@ public:
     void run_window(int k, const DateTime& date0, const float* x, const OutputCallback& on_output, float* y_out);
 
     const Config& config() const { return m_.config(); }
+    Model& model() { return m_; }
     const DownscaleTimes& times() const { return times_; }
     bool has_assembly() const { return has_asm_; }
     const DownscaleAssembly& assembly() const { return asm_; }
     const std::vector<float>& input() const { return x_; }  // last assembled input
     // Seconds per window: assembly (state copy), forcings, predict_step; waiting in y_at for the
-    // window's end state (wait_input) and in out_buffer (wait_output).
-    struct WindowTimes { double assemble = 0, forcings = 0, predict = 0, wait_input = 0, wait_output = 0; };
+    // window's end state (wait_input) and in out_buffer (wait_output). The device loop
+    // (cuda/downscale_cuda.h) reports the same fields with: assemble = GPU time of the slot copy and
+    // the scatter, predict = GPU time of the forward pass (no copies), wait_input = waiting for the
+    // forecaster's state, plus d2h (device-to-host copy of the window's outputs through the staging
+    // ring, from the first chunk to the last), host_copy (summed copies out of the staging ring into
+    // the output buffer) and window (wall time from the window's first enqueue to its last on_output).
+    struct WindowTimes {
+        double assemble = 0, forcings = 0, predict = 0, wait_input = 0, wait_output = 0;
+        double d2h = 0, host_copy = 0, window = 0;
+    };
     const std::vector<WindowTimes>& window_times() const { return wt_; }
 
 private:

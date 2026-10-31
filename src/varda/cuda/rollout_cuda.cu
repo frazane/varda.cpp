@@ -170,6 +170,7 @@ void DeviceRollout::run(const RolloutRequest& req) {
         ev_end_.push_back(e);
     }
     if (req.on_window && !hwin_) hwin_ = halloc(in_n_);
+    ev_hook_[0] = ev_hook_[1] = nullptr;
     forcing_s_.assign(n, 0.0);
 
     // Forcing of step s (written after step s) into pinned buffer hf_[s & 1], then uploaded on h2d_.
@@ -207,6 +208,7 @@ void DeviceRollout::run(const RolloutRequest& req) {
         }
         if (update) VARDA_CUDA_CHECK(cudaStreamWaitEvent(main_, ev_up_[p], 0));    // forcing s is on the device
         if (s >= 2) VARDA_CUDA_CHECK(cudaStreamWaitEvent(main_, ev_d2h_[p], 0));  // y_[p] copied out (step s-2)
+        if (s >= 2 && ev_hook_[p]) VARDA_CUDA_CHECK(cudaStreamWaitEvent(main_, ev_hook_[p], 0));  // and read by the hook
         VARDA_CUDA_CHECK(cudaEventRecord(ev_beg_[s], main_));
         if (use_graph_) VARDA_CUDA_CHECK(cudaGraphLaunch(graph_[p][update ? 1 : 0], main_));
         else enqueue_step(p, update);
@@ -214,6 +216,7 @@ void DeviceRollout::run(const RolloutRequest& req) {
         VARDA_CUDA_CHECK(cudaStreamWaitEvent(d2h_, ev_end_[s], 0));
         VARDA_CUDA_CHECK(cudaMemcpyAsync(hy_[p], y_[p], out_n_ * sizeof(float), cudaMemcpyDeviceToHost, d2h_));
         VARDA_CUDA_CHECK(cudaEventRecord(ev_d2h_[p], d2h_));
+        if (hook_) ev_hook_[p] = hook_(s, y_[p], ev_end_[s]);
         if (s + 1 < n - 1) {
             // pinned hf_[1-p] was last uploaded for step s-1; that copy finished before step s-1 ran.
             if (s >= 1) VARDA_CUDA_CHECK(cudaEventSynchronize(ev_up_[1 - p]));

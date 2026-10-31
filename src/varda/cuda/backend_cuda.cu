@@ -94,6 +94,10 @@ public:
         VARDA_CUDA_CHECK(cudaStreamDestroy(stream_));
         stream_ = s;  // the graph (if captured) is launched on whichever stream predict_step uses
     }
+    float* device_input() override { return x_dev_; }
+    const float* device_output() const override { return y_dev_; }
+    cudaStream_t stream() const override { return stream_; }
+    void enqueue_predict() override;
     int device() const override { return dev_; }
     size_t weight_bytes() const override { return weight_bytes_; }
     size_t activation_bytes() const override { return act_bytes_; }
@@ -724,6 +728,16 @@ void Engine<T>::predict_step(const float* x, float* y, const ActivationHook* hoo
         ran_eager_ = true;
         return;
     }
+    enqueue_predict();
+    VARDA_CUDA_CHECK(cudaMemcpyAsync(y, y_dev_, out_n * sizeof(float), cudaMemcpyDeviceToHost, s));
+    VARDA_CUDA_CHECK(cudaStreamSynchronize(s));
+}
+
+// x_dev_ -> y_dev_ on stream_: eagerly on the first run (cuBLASLt plans), then through the graph.
+template <class T>
+void Engine<T>::enqueue_predict() {
+    VARDA_CUDA_CHECK(cudaSetDevice(dev_));
+    cudaStream_t s = stream_;
     if (!opts_.cuda_graph || !ran_eager_) {
         predict_step_device(x_dev_, y_dev_, s);
         ran_eager_ = true;
@@ -732,8 +746,6 @@ void Engine<T>::predict_step(const float* x, float* y, const ActivationHook* hoo
         if (graph_exec_) VARDA_CUDA_CHECK(cudaGraphLaunch(graph_exec_, s));
         else predict_step_device(x_dev_, y_dev_, s);  // capture failed: eager from now on
     }
-    VARDA_CUDA_CHECK(cudaMemcpyAsync(y, y_dev_, out_n * sizeof(float), cudaMemcpyDeviceToHost, s));
-    VARDA_CUDA_CHECK(cudaStreamSynchronize(s));
 }
 
 template class Engine<float>;

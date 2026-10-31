@@ -30,9 +30,17 @@
 // VARDA_TD_WRITER_STATES hours at once (default 3, VARDA_TD_WRITER_THREADS OpenMP threads each; the tp
 // accumulation stays in hour order), byte-identical to one hour at a time (docs/downscaler.md §7).
 // --downscaler-device cuda:N (or N) runs the downscaler on CUDA device N, e.g. a second GPU (default: the
-// forecaster's device, 0): the two models then neither time-slice one GPU nor share its memory. The rollout's
-// steps still reach the downscaler through host memory (StepFeed), unchanged; the start-up sequencing
-// (downscaler loaded after the forecaster's set-up) is kept. forecast.json records the device.
+// forecaster's device, 0): the two models then neither time-slice one GPU nor share its memory. The device
+// loop below then copies the rollout's steps across devices (cudaMemcpyPeerAsync); the host loop takes them
+// through host memory (StepFeed) as before. The start-up sequencing (downscaler loaded after the
+// forecaster's set-up) is kept. forecast.json records the device.
+// On CUDA with the device rollout the downscaler's loop is device-resident (docs/downscaler.md §2):
+// the rollout hands each step's output on the GPU to the loop (a device copy into a small ring), the
+// window inputs are assembled there, and the outputs come back through a page-locked staging ring
+// (VARDA_TD_STAGING_MB per slot, default 64; VARDA_TD_STAGING_SLOTS, default 4) and an OpenMP copy
+// (VARDA_TD_COPY_THREADS, default 8) into the window buffers. VARDA_TD_DEVICE_LOOP=0 forces the host
+// loop (inputs assembled on the host, predict_step's own copies). VARDA_TD_CHECK_INPUTS=1 compares
+// every device-assembled window input with the host assembly, bitwise (verification; slower).
 // --quiet leaves the input log (every file and message used) out of stdout; it stays in forecast.json.
 //
 // DIR receives the GRIB files under the configured relative paths (outputs/<dateTime>_<step>.grib); DIR/forecast.json the provenance and
@@ -74,6 +82,7 @@
 #include "varda/varda.h"
 #ifdef VARDA_WITH_CUDA
 #include "varda/cuda/cuda_backend.h"
+#include "varda/cuda/downscale_cuda.h"
 #include "varda/cuda/rollout_cuda.h"
 #endif
 
@@ -104,6 +113,21 @@ void mkdirs(const std::string& p) {
         if ((i == p.size() || p[i] == '/') && !cur.empty()) ::mkdir(cur.c_str(), 0755);
         if (i < p.size()) cur += p[i];
     }
+}
+
+// dst[0, n) = src[0, n) with `threads` OpenMP threads (contiguous pieces).
+void parallel_copy(float* dst, const float* src, size_t n, int threads) {
+#pragma omp parallel num_threads(threads)
+    {
+        const size_t t = size_t(omp_get_thread_num()), nt = size_t(omp_get_num_threads());
+        const size_t lo = n * t / nt, hi = n * (t + 1) / nt;
+        if (hi > lo) std::memcpy(dst + lo, src + lo, (hi - lo) * sizeof(float));
+    }
+}
+
+int env_int(const char* name, int dflt) {
+    const char* e = std::getenv(name);
+    return e && *e ? std::atoi(e) : dflt;
 }
 
 // Encodes the initial state and the steps in order on its own thread, so GRIB encoding overlaps the
@@ -512,6 +536,7 @@ int main(int argc, char** argv) {
     }
     const bool with_td = !td_path.empty();
     if (threads > 0) omp_set_num_threads(threads);
+    int exit_code = 0;  // 3: VARDA_TD_CHECK_INPUTS found a difference
     try {
         const double t_start = app::now_s();
         if (!realdata.empty()) files_from_realdata(realdata, files);
@@ -591,6 +616,9 @@ int main(int argc, char** argv) {
         std::unique_ptr<varda::Model> td_model;  // loaded after the rollout set-up (below)
         std::unique_ptr<IoConfig> tcfg;          // its io config, checked right after the load
         std::unique_ptr<varda::Downscaler> ds;
+#ifdef VARDA_WITH_CUDA
+        std::unique_ptr<varda::cuda::DeviceDownscaler> td_device;  // the device-resident loop, if used
+#endif
         int W = 0, T_out = 0;                     // window hours, outputs per window
         size_t td_out_n = 0;                      // G * V_out of one hourly state
         double td_load_s = 0;
@@ -661,6 +689,21 @@ int main(int argc, char** argv) {
                     throw std::runtime_error("downscaler initial-state field " + f + " is not a forecaster input");
             td_out_n = size_t(tc.n_data_nodes) * size_t(tc.n_output_vars);
 #ifdef VARDA_WITH_CUDA
+            // The device-resident loop (docs/downscaler.md §2): a CUDA downscaler fed by the device rollout
+            // (during it; from the host copies when VARDA_TD_OVERLAP=0). Its device buffers and the pinned
+            // staging ring are allocated here, before another thread uses the GPU.
+            if (engine == "device" && varda::cuda::as_cuda(*td_model) && env_int("VARDA_TD_DEVICE_LOOP", 1) != 0) {
+                varda::cuda::DeviceLoopOptions lo;
+                lo.ring_states = std::max(1, env_int("VARDA_TD_RING", lo.ring_states));
+                lo.staging_bytes = size_t(std::max(1, env_int("VARDA_TD_STAGING_MB", 64))) << 20;
+                lo.staging_slots = std::max(1, env_int("VARDA_TD_STAGING_SLOTS", lo.staging_slots));
+                lo.copy_threads = std::max(1, env_int("VARDA_TD_COPY_THREADS", lo.copy_threads));
+                lo.hold_output = env_int("VARDA_TD_HOLD", -1);
+                const int producer = td_overlap ? varda::cuda::as_cuda(*model)->device() : -1;
+                td_device = std::make_unique<varda::cuda::DeviceDownscaler>(*ds, producer, lo);
+            }
+#endif
+#ifdef VARDA_WITH_CUDA
             // During the rollout the downscaler's kernels go first: the hourly writer, the critical
             // path, waits for its windows; the 6-hourly files have time to spare.
             const char* pr = std::getenv("VARDA_TD_PRIORITY");
@@ -719,6 +762,8 @@ int main(int argc, char** argv) {
         std::unique_ptr<StepWriter> twriter;
         double td0 = 0, td_setup_s = 0, td_loop_t0 = 0, td_loop_s = 0;
         std::exception_ptr td_err;
+        const bool check_inputs = env_int("VARDA_TD_CHECK_INPUTS", 0) != 0;
+        int check_windows = 0, check_mismatch = 0;
         auto td_setup = [&] {
             td0 = app::now_s();
             std::printf("downscaler %s (uuid %s) on %s, loaded in %.2f s; %d windows of %d h, %d outputs each%s\n",
@@ -777,7 +822,12 @@ int main(int argc, char** argv) {
                     if (dump_y)
                         std::memcpy(&hourly[(size_t(k) * size_t(T_out) + size_t(t)) * td_out_n], y_t, td_out_n * 4);
                     // the forecaster's state of this hour, for the copy-prognostic-from-forecaster post-processor
-                    const float* fy = (step_h % W == 0) ? &ys[size_t(step_h / W - 1) * out_n] : nullptr;
+                    // (its host copy: published by the rollout callback, which the device loop does not wait for)
+                    const float* fy = nullptr;
+                    if (step_h % W == 0) {
+                        if (!feed.wait(step_h / W - 1)) throw std::runtime_error("forecaster step not delivered");
+                        fy = &ys[size_t(step_h / W - 1) * out_n];
+                    }
                     // every state of the window released (no longer read): its buffer is free again
                     if (t == 0) win_left[size_t(k)] = std::make_shared<std::atomic<int>>(T_out);
                     std::function<void()> done = [pool = tbufs.get(), b = win_buf[size_t(k)], left = win_left[size_t(k)]] {
@@ -790,7 +840,39 @@ int main(int argc, char** argv) {
                         std::fflush(stdout);
                     }
                 };
-                ds->run(rq);
+#ifdef VARDA_WITH_CUDA
+                if (td_device) {
+                    if (check_inputs) {
+                        // the device-assembled input against the host assembly from the same states, bitwise
+                        rq.on_input = [&](int k, const float* x) {
+                            const varda::DownscaleAssembly& a = ds->assembly();
+                            const size_t G = size_t(a.G), slot = G * size_t(a.V_in);
+                            const float* x0n = in.x0.data() + size_t(in.T - 1) * G * size_t(a.V_fin);
+                            std::vector<float> fs(G * size_t(a.F)), fe(G * size_t(a.F)), xh(2 * slot);
+                            const auto& lat = td_model->latitudes();
+                            const auto& lon = td_model->longitudes();
+                            if (a.F > 0) {
+                                varda::compute_forcings(ds->times().window_start(in.date0, k), a.forcing_names, lat.data(),
+                                                 lon.data(), G, fs.data());
+                                varda::compute_forcings(ds->times().window_end(in.date0, k), a.forcing_names, lat.data(),
+                                                 lon.data(), G, fe.data());
+                            }
+                            if (!feed.wait(k)) throw std::runtime_error("forecaster step not delivered");
+                            if (k == 0) a.fill_slot(xh.data(), nullptr, x0n, x0n, a.F ? fs.data() : nullptr);
+                            else a.fill_slot(xh.data(), &ys[size_t(k - 1) * out_n], nullptr, x0n, a.F ? fs.data() : nullptr);
+                            a.fill_slot(xh.data() + slot, &ys[size_t(k) * out_n], nullptr, x0n, a.F ? fe.data() : nullptr);
+                            const bool same0 = std::memcmp(xh.data(), x, slot * 4) == 0;
+                            const bool same1 = std::memcmp(xh.data() + slot, x + slot, slot * 4) == 0;
+                            ++check_windows;
+                            if (!same0 || !same1) ++check_mismatch;
+                            std::printf("input check window %d: slot 0 %s, slot 1 %s\n", k, same0 ? "bitwise equal" : "DIFFERS",
+                                        same1 ? "bitwise equal" : "DIFFERS");
+                        };
+                    }
+                    td_device->run(rq);
+                } else
+#endif
+                    ds->run(rq);
                 td_loop_s = app::now_s() - td_loop_t0;
             } catch (...) {
                 td_err = std::current_exception();
@@ -798,19 +880,33 @@ int main(int argc, char** argv) {
         };
         if (td_overlap) td_setup();
         std::thread td_thread;
+        std::function<void()> td_cancel_device = [] {};
+#ifdef VARDA_WITH_CUDA
+        if (td_device) td_cancel_device = [&] { td_device->cancel(); };
+        // The rollout hands each step's device output to the device loop: a copy into the loop's ring,
+        // which step s + 2 (the next writer of that output buffer) waits for on the GPU.
+        if (td_device && td_overlap && device_rollout)
+            device_rollout->set_step_hook([&](int s, const float* d_y, cudaEvent_t ready) {
+                return td_device->push_device(s, d_y, ready);
+            });
+#endif
         struct TdGuard {  // on an exception: unblock the downscaler thread and wait for it
             std::thread& t;
             StepFeed& f;
             std::unique_ptr<WindowBuffers>& b;
+            std::function<void()>& c;
             ~TdGuard() {
                 if (!t.joinable()) return;
                 f.cancel();
                 if (b) b->cancel();
+                c();
                 t.join();
             }
-        } td_guard{td_thread, feed, tbufs};
+        } td_guard{td_thread, feed, tbufs, td_cancel_device};
 
         double ys_copy_s = 0;  // the rollout callback's copy of y into ys
+        // that copy (452 MB a step) with a few OpenMP threads (VARDA_FC_COPY_THREADS, default 8)
+        const int ys_copy_threads = std::max(1, env_int("VARDA_FC_COPY_THREADS", 8));
         varda::RolloutRequest q;
         q.x0 = in.x0.data();
         q.date0 = in.date0;
@@ -819,7 +915,7 @@ int main(int argc, char** argv) {
             if (!ys.empty()) {
                 float* ys_s = &ys[size_t(s) * out_n];
                 const double tc0 = app::now_s();
-                std::memcpy(ys_s, y, out_n * 4);
+                parallel_copy(ys_s, y, out_n, ys_copy_threads);
                 ys_copy_s += app::now_s() - tc0;
                 feed.publish(s);
                 writer.push_ref((s + 1) * mc.timestep_hours, ys_s, nullptr);  // ys outlives the writer
@@ -866,14 +962,37 @@ int main(int argc, char** argv) {
             const double td_tail_s = td_end - td_loop_end;
             const varda::Config& tc = td_model->config();
             const GribOutput::Stats ts = tout->stats();
-            std::vector<double> predict_ms, assemble_ms, forcing_ms, wait_in_ms, wait_out_ms;
+            std::vector<double> predict_ms, assemble_ms, forcing_ms, wait_in_ms, wait_out_ms, d2h_ms, host_copy_ms, window_ms;
             double wait_in = 0, wait_out = 0;
-            for (const auto& w : ds->window_times()) {
+            const std::vector<varda::Downscaler::WindowTimes>* wts = &ds->window_times();
+            json dl_rep = nullptr;
+#ifdef VARDA_WITH_CUDA
+            if (td_device) {
+                wts = &td_device->window_times();
+                const auto& lo = td_device->options();
+                dl_rep = {{"device", td_device->device()},
+                          {"feed", td_device->feed_path()},
+                          {"ring_states", lo.ring_states},
+                          {"staging_bytes", lo.staging_bytes},
+                          {"staging_slots", lo.staging_slots},
+                          {"copy_threads", lo.copy_threads},
+                          {"output_held", td_device->output_held()},
+                          {"device_bytes", td_device->device_bytes()},
+                          {"pinned_bytes", td_device->pinned_bytes()},
+                          {"free_bytes_at_setup", td_device->free_bytes_at_setup()},
+                          {"setup_seconds", td_device->setup_seconds()}};
+                if (check_inputs) dl_rep["input_check"] = {{"windows", check_windows}, {"mismatched", check_mismatch}};
+            }
+#endif
+            for (const auto& w : *wts) {
                 predict_ms.push_back(1e3 * w.predict);
                 assemble_ms.push_back(1e3 * w.assemble);
                 forcing_ms.push_back(1e3 * w.forcings);
                 wait_in_ms.push_back(1e3 * w.wait_input);
                 wait_out_ms.push_back(1e3 * w.wait_output);
+                d2h_ms.push_back(1e3 * w.d2h);
+                host_copy_ms.push_back(1e3 * w.host_copy);
+                window_ms.push_back(1e3 * w.window);
                 wait_in += w.wait_input;
                 wait_out += w.wait_output;
             }
@@ -886,6 +1005,8 @@ int main(int argc, char** argv) {
                       {"window_hours", W},
                       {"outputs_per_window", T_out},
                       {"during_rollout", td_overlap},
+                      {"loop", dl_rep.is_null() ? "host" : "device"},
+                      {"device_loop", dl_rep},
                       {"window_buffers", tbufs->count()},
                       {"window_buffers_pinned", tbufs->pinned()},
                       {"writer_states", tout->concurrency()},
@@ -915,7 +1036,15 @@ int main(int argc, char** argv) {
                       {"window_assemble_ms", assemble_ms},
                       {"window_forcings_ms", forcing_ms},
                       {"window_wait_forecaster_ms", wait_in_ms},
-                      {"window_wait_buffer_ms", wait_out_ms}};
+                      {"window_wait_buffer_ms", wait_out_ms},
+                      {"window_d2h_ms", d2h_ms},
+                      {"window_host_copy_ms", host_copy_ms},
+                      {"window_ms", window_ms}};
+            if (check_inputs) {
+                std::printf("input check: %d of %d device-assembled window inputs differ from the host assembly\n",
+                            check_mismatch, check_windows);
+                if (check_mismatch > 0) exit_code = 3;
+            }
             std::printf("downscaler done in %.2f s (%.2f .. %.2f s): loop %.2f (%.2f s waiting for the forecaster, %.2f s "
                         "blocked on the writer), +%.2f s writing after the last window; GRIB encode %.2f s, write %.2f s; "
                         "%zu hourly files\n",
@@ -1002,5 +1131,5 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "varda-forecast: %s\n", e.what());
         return 1;
     }
-    return 0;
+    return exit_code;
 }
