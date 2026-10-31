@@ -91,7 +91,31 @@ global z_500:       ...,shortName=z,...,step=6,level=500,param=129        (short
 ```
 Not implemented (the exporter refuses them): hindcast modifier, ensembles, GRIB1, back-references in patches,
 negative accumulation start steps (anemoi shifts the base time and then refuses to write; the C++ throws),
-`stream` mars keys, `variables`/`output_frequency` filters.
+`stream` mars keys, `variables` filters.
+
+### The temporal downscaler's hourly output (`varda-td-io.json`)
+
+`python/export_io_config.py --model temporal_downscaler` reads the downscaler's HF config and metadata the same way and
+writes the same schema with these differences (loader: the optional keys below; everything else unchanged):
+
+| key | content |
+|---|---|
+| `runner` | `"temporal_downscaler"` (absent or `"forecaster"` in `varda-io.json`) |
+| `timestep_hours` | 1 (the checkpoint's data frequency = `output_frequency`); `lead_time_hours` 24 |
+| `initial_state_fields` | the 66 prognostics in the downscaler's input order (the runner's step 0: the input slot's variables that are also outputs; no constants, no tp) |
+| `step_field_order` | the message order of the hourly files: `initial_state_fields`, then `tp` (anemoi's runner shares one `fields` dict between a window's initial state and its hourly states, so the step files hold the initial-state fields first and tp last; `GribOutput::write_step` follows it; absent = model output order) |
+| `variables` | the downscaler's patched metadata: `tp` has `period: [1h]`, which anemoi reads as no period (`period_hours` null); the accumulate post-processor gives the start step (0) |
+| `post_processors` | as the forecaster: `accumulate_from_start_of_forecast [tp]` (now hourly, across windows), `rescale ×1000 TOT_PREC` |
+| `outputs` | one `lam` output: `outputs/varda-single_{dateTime}_{step:03}.grib` (effective `{step}`, unpadded), ICON templates, `negative_step_mode: skip` (recorded; no negative step is ever written), post-processors `extract_from_state lam_0` then `copy_prognostic_from_forecaster {common_leadtime_hours: 6, params_to_keep: [tp]}` |
+
+`copy_prognostic_from_forecaster` (anemoi-plugins-meteoswiss `copy-prognostic-from-forecaster`): at an output step that is
+a positive multiple of `common_leadtime_hours`, every field not matched by `params_to_keep` (or matched by
+`params_to_copy`; glob patterns, `*`/`?`) takes the forecaster's value of the same step. anemoi reads it back from
+the forecaster's GRIB files; `GribOutput::write_step(step, y, forecaster_y)` takes the forecaster's state in memory
+(`varda-forecast` passes the rollout's `y` of that step), replacing the merged-grid column before the extraction, which
+is the same as replacing the extracted field. `tp` is never copied: the hourly files' tp is the downscaler's hourly
+precipitation accumulated from the start of the forecast, and differs from the forecaster's 6-hourly accumulation.
+The whole chain is verified in `docs/downscaler.md` §7 (hourly files against anemoi-inference's).
 
 ## 3. Tools
 

@@ -11,9 +11,9 @@ only, and the file's sha256 is recorded. Every config value comes from the check
 tensors. Every tensor reachable in the checkpoint (deduplicated by identity) is converted, exported into
 `config.json`, or listed in `config.json["unused"]` with a reason; anything else makes the conversion fail.
 
-Supported limits (one dataset named "data", one output step, the model / component / block / residual /
-bounding classes in the tables below) are checked up front by `check_supported`, which fails with a pointer
-to docs/tools.md ("What is checked").
+Supported limits (one dataset named "data"; one output step for the forecaster, several for the interpolator
+(temporal downscaler); the model / component / block / residual / bounding classes in the tables below) are
+checked up front by `check_supported`, which fails with a pointer to docs/tools.md ("What is checked").
 """
 
 import datetime
@@ -44,9 +44,15 @@ SUPPORTED_DOC = "docs/tools.md (\"What is checked\": what is supported)"
 TENSORS = {
     "norm.mul": "pre_processors.data.processors.normalizer._norm_mul",
     "norm.add": "pre_processors.data.processors.normalizer._norm_add",
-    "nodes.data.attr": "model.node_attributes.latlons_data",
-    "nodes.hidden.attr": "model.node_attributes.latlons_hidden",
+    "nodes.data.attr": "{nodes}.latlons_data",
+    "nodes.hidden.attr": "{nodes}.latlons_hidden",
 }
+# Two pickle layouts of anemoi-models (both seen in Varda-single-1.0), resolved by layout_paths():
+#   forecaster (anemoi-core 3c5fc21): model.node_attributes is one NamedNodesAttributes, model._graph_data a HeteroData;
+#   downscaler (anemoi-core d9cf401): model.node_attributes is a ModuleDict {dataset: NamedNodesAttributes} and
+#   model._graph_data a dict {dataset: HeteroData}.
+NODE_ATTRIBUTES = "model.node_attributes"
+GRAPH_DATA = "model._graph_data"
 
 # Linear / LayerNorm modules outside the blocks: contract name -> (module path, kind) (.weight, .bias).
 MODULES = {
@@ -66,7 +72,7 @@ GRAPHS = {
 GRAPH_EDGE_INDEX = "edge_index_base"  # provider buffer (int32) -> graph.X.edge_index (int64)
 GRAPH_EDGE_ATTR = "edge_attr"
 GRAPH_EDGE_INC = "edge_inc"
-HETERO = "model._graph_data._edge_store_dict.{key}._mapping"  # .edge_index, .edge_length, .edge_dirs
+HETERO = "{graph}._edge_store_dict.{key}._mapping"  # .edge_index, .edge_length, .edge_dirs
 
 # Transformer blocks: contract prefix -> checkpoint module path ({i} = layer index).
 BLOCKS = {
@@ -78,7 +84,13 @@ PROCESSOR = "model.processor"  # holds num_layers; its `proc` ModuleList holds t
 
 # Architecture (config.json "architecture", format v3): checkpoint class -> component kind. The engine dispatches
 # on the kinds; a class missing here is rejected by check_supported() before anything is converted.
-MODEL_KINDS = {"anemoi.models.models.encoder_processor_decoder.AnemoiModelEncProcDec": "enc_proc_dec"}
+MODEL_KINDS = {
+    "anemoi.models.models.encoder_processor_decoder.AnemoiModelEncProcDec": "enc_proc_dec",
+    # temporal downscaler: inputs at explicit times (e.g. [0, 6]), n_step_output outputs per call (e.g. [1..6]),
+    # decoder width n_step_output * n_output_vars, layout "(time vars)" (interpolator.py _assemble_output)
+    "anemoi.models.models.interpolator.AnemoiModelEncProcDecMultiOutInterpolator": "enc_proc_dec_interpolator",
+}
+MULTI_OUTPUT_KINDS = {"enc_proc_dec_interpolator"}  # the only kinds allowed n_step_output > 1
 COMPONENTS = {  # part -> (module path, {class: kind})
     "encoder": ("model.encoder.data",
                 {"anemoi.models.layers.mapper.GraphTransformerForwardMapper": "graph_transformer_forward_mapper"}),
@@ -141,7 +153,7 @@ RESIDUAL_TYPES = {"anemoi.models.layers.residual.SkipConnection": "skip"}
 MAPPERS = {"enc": "model.encoder.data", "dec": "model.decoder.data"}
 NORMALIZER = "pre_processors.data.processors.normalizer"
 FORMAT_VERSION = 3  # v2 = v1 + "mappers"; v3 = v2 + "architecture", "blocks", "absent", source.sha256,
-#                      dims.n_output_steps (docs/format.md §1.2)
+#                      dims.n_output_steps (docs/format.md §1.2); "times" only for the interpolator kind
 
 # The raw `statistics` are not necessarily the ones folded into the normaliser buffers (Varda: the
 # buffers were kept from the forked run, `update_ds_stats_on_ckpt_load.states: false`). check_statistics()
@@ -160,7 +172,7 @@ UNUSED_RULES = [
     (r"(^|\.)data_indices\.",
      "index list of the IndexCollection; the engine's lists are exported in config.json indices"),
     (r"\._decoding_forcing_input_idx", "only read by the autoencoder model, unused by EncProcDec"),
-    (r"\._graph_data\._node_store_dict\.",
+    (r"\._graph_data\.(\w+\.)?_node_store_dict\.",
      "training-graph node store (raw coordinates / area weights); forward uses model.node_attributes"),
 ]
 
@@ -215,6 +227,23 @@ def get(obj, path):
 
 def plain(obj):
     return ck.to_plain(obj)
+
+
+def layout_paths(root):
+    """{"nodes": NamedNodesAttributes path, "graph": HeteroData path} for either pickle layout (see NODE_ATTRIBUTES)."""
+    na = get(root, NODE_ATTRIBUTES)
+    if ck.is_module(na) and "latlons_data" in na.__dict__["_buffers"]:
+        nodes = NODE_ATTRIBUTES
+    else:
+        check(ck.is_module(na) and DATASET in na.__dict__["_modules"]
+              and "latlons_data" in get(na, DATASET).__dict__["_buffers"],
+              f"{NODE_ATTRIBUTES}: neither a NamedNodesAttributes nor a ModuleDict with a {DATASET!r} one")
+        nodes = f"{NODE_ATTRIBUTES}.{DATASET}"
+    gd = get(root, GRAPH_DATA)
+    graph = f"{GRAPH_DATA}.{DATASET}" if isinstance(gd, dict) else GRAPH_DATA
+    check(isinstance(get(root, graph), ck.Stub) and get(root, graph)._qualname.endswith("HeteroData"),
+          f"{graph} is not a HeteroData")
+    return {"nodes": nodes, "graph": graph}
 
 
 class Accounting:
@@ -317,7 +346,9 @@ def block_paths(root):
 
 def convert_tensors(root, acc):
     weights, absent = {}, []
+    lay = layout_paths(root)
     for name, path in TENSORS.items():
+        path = path.format(**lay)
         t = get(root, path)
         acc.convert(name, t, path)
         weights[name] = contiguous_copy(t)
@@ -340,7 +371,7 @@ def convert_tensors(root, acc):
         weights[f"graph.{g}.edge_attr"] = contiguous_copy(ea)
         graph_nodes[g] = tuple(inc)
         # The HeteroData copy must equal the provider buffers.
-        hpath = HETERO.format(key=hetero_key)
+        hpath = HETERO.format(graph=lay["graph"], key=hetero_key)
         h_ei = get(root, hpath + ".edge_index")
         h_len = get(root, hpath + ".edge_length")
         h_dirs = get(root, hpath + ".edge_dirs")
@@ -373,7 +404,9 @@ def block_dims(root, blocks):
         vals = {
             "num_heads": int(blk.num_heads),
             "head_dim": int(blk.out_channels_conv),
-            "attn_channels": int(blk.attn_channels),
+            # older anemoi (downscaler) has no attn_channels attribute: the query projection's width is the same number
+            "attn_channels": int(blk.attn_channels) if "attn_channels" in blk.__dict__
+            else int(get(blk, BLOCK_MODULES["q"][0]).out_features),
             "qk_norm": bool(blk.qk_norm),
             "update_src_nodes": bool(blk.update_src_nodes),
             "mlp_hidden": int(get(blk, BLOCK_MODULES["mlp1"][0]).out_features),
@@ -437,10 +470,15 @@ def check_supported(root):
     check(datasets == [DATASET],
           f"datasets {datasets}: the contract supports exactly one dataset, named {DATASET!r} (multi-dataset models "
           f"are not supported yet); see {SUPPORTED_DOC}")
+    kind = MODEL_KINDS[model._qualname]
     n_out_steps = int(getattr(model, "n_step_output", 1))  # older anemoi: no attribute, one output step
-    check(n_out_steps == 1,
-          f"n_step_output = {n_out_steps}: the contract supports one output step only; see {SUPPORTED_DOC}")
-    arch = {"model": {"class": model._qualname, "kind": MODEL_KINDS[model._qualname]}}
+    if kind in MULTI_OUTPUT_KINDS:
+        check(n_out_steps >= 1, f"n_step_output = {n_out_steps}")
+    else:
+        check(n_out_steps == 1,
+              f"n_step_output = {n_out_steps}: a {kind} model must have one output step (several are supported only "
+              f"for {sorted(MULTI_OUTPUT_KINDS)}); see {SUPPORTED_DOC}")
+    arch = {"model": {"class": model._qualname, "kind": kind}}
     for part, (path, kinds) in COMPONENTS.items():
         cls = get(root, path)._qualname
         check(cls in kinds, f"{part} ({path}) is {cls}; supported: {sorted(kinds)}; see {SUPPORTED_DOC}")
@@ -466,6 +504,34 @@ def model_name_to_index(di, side):
     return plain(model.__dict__[attr])
 
 
+def interpolator_times(model, meta, n_input_steps, n_out_steps):
+    """Config "times" of an interpolator: {"input": [...], "target": [...], "frequency_hours": int}.
+
+    The model's own `input_times` / `output_times` (interpolator.py: training.explicit_times, which size the encoder
+    input and the decoder output), cross-checked against the checkpoint metadata: config.training.explicit_times,
+    metadata_inference.data.timesteps.{input,output}_relative_date_indices (what anemoi-inference reads) and the
+    data frequency (config.data.frequency == metadata_inference timestep, whole hours).
+    """
+    t_in = [int(v) for v in plain(model.input_times)]
+    t_out = [int(v) for v in plain(model.output_times)]
+    check(len(t_in) == n_input_steps, f"input_times {t_in}: length != n_step_input {n_input_steps}")
+    check(len(t_out) == n_out_steps, f"output_times {t_out}: length != n_step_output {n_out_steps}")
+    for name, t in (("input", t_in), ("target", t_out)):
+        check(all(b > a for a, b in zip(t, t[1:])), f"times.{name} {t} not strictly increasing")
+    et = meta["config"]["training"]["explicit_times"]
+    check([int(v) for v in et["input"]] == t_in and [int(v) for v in et["target"]] == t_out,
+          f"config.training.explicit_times {et} != model input/output times {t_in} / {t_out}")
+    ts = meta["metadata_inference"][DATASET]["timesteps"]
+    check([int(v) for v in ts["input_relative_date_indices"]] == t_in
+          and [int(v) for v in ts["output_relative_date_indices"]] == t_out,
+          f"metadata_inference timesteps {ts} != model input/output times")
+    freq = str(meta["config"]["data"]["frequency"])
+    check(freq == str(ts["timestep"]), f"config.data.frequency {freq!r} != metadata_inference timestep {ts['timestep']!r}")
+    m = re.fullmatch(r"(\d+)h", freq)
+    check(m is not None and int(m.group(1)) > 0, f"frequency {freq!r}: only whole hours ('<N>h') are supported")
+    return {"input": t_in, "target": t_out, "frequency_hours": int(m.group(1))}
+
+
 def build_config(root, acc, weights, absent, blocks, n_layers, graph_nodes, ckpt_path, arch):
     model = get(root, "model")
     dims = block_dims(root, blocks)
@@ -474,10 +540,13 @@ def build_config(root, acc, weights, absent, blocks, n_layers, graph_nodes, ckpt
 
     n_input_steps = int(model.n_step_input)
     check(int(root.n_step_input) == n_input_steps, "root.n_step_input != model.n_step_input")
+    n_out_steps = int(getattr(model, "n_step_output", 1))  # checked by check_supported
+    interpolator = arch["model"]["kind"] in MULTI_OUTPUT_KINDS
     n_in = int(model.num_input_channels[DATASET])
     n_out = int(model.num_output_channels[DATASET])
-    n_nodes = {k: int(v) for k, v in get(model, "node_attributes").num_nodes.items()}
-    attr_ndims = {k: int(v) for k, v in get(model, "node_attributes").attr_ndims.items()}
+    node_attributes = get(root, layout_paths(root)["nodes"])
+    n_nodes = {k: int(v) for k, v in node_attributes.num_nodes.items()}
+    attr_ndims = {k: int(v) for k, v in node_attributes.attr_ndims.items()}
     check(attr_ndims["data"] == attr_ndims["hidden"], "node attribute dims differ")
     node_attr_dim = attr_ndims["data"]
 
@@ -492,7 +561,9 @@ def build_config(root, acc, weights, absent, blocks, n_layers, graph_nodes, ckpt
         "dec.emb_dst in": (weights["dec.emb_dst.weight"].shape[1], n_input_steps * n_in + node_attr_dim),
         "enc.emb_dst in": (weights["enc.emb_dst.weight"].shape[1], node_attr_dim),
         "emb_src out": (weights["enc.emb_src.weight"].shape[0], C),
-        "out_proj": (tuple(weights["dec.out_proj.weight"].shape), (n_out, C)),
+        "out_proj": (tuple(weights["dec.out_proj.weight"].shape), (n_out_steps * n_out, C)),
+        "out_proj bias": (tuple(weights["dec.out_proj.bias"].shape) if "dec.out_proj.bias" in weights
+                          else (n_out_steps * n_out,), (n_out_steps * n_out,)),
         "data nodes": (weights["nodes.data.attr"].shape[0], n_nodes["data"]),
         "hidden nodes": (weights["nodes.hidden.attr"].shape[0], n_nodes["hidden"]),
         "nodes attr dim": (weights["nodes.data.attr"].shape[1], node_attr_dim),
@@ -559,6 +630,7 @@ def build_config(root, acc, weights, absent, blocks, n_layers, graph_nodes, ckpt
 
     # Provenance and identity (uuid, run_id, size, sha256: docs/format.md §1.2 "source")
     meta = ck.anemoi_metadata(ckpt_path)
+    times = interpolator_times(model, meta, n_input_steps, n_out_steps) if interpolator else None
     ident = ck.checkpoint_identity(ckpt_path)
     commit = meta["provenance_training"]["git_versions"]["anemoi.models"]["git"]["sha1"]
     st = Path(ckpt_path).stat()
@@ -583,7 +655,7 @@ def build_config(root, acc, weights, absent, blocks, n_layers, graph_nodes, ckpt
             "mlp_hidden": dims["mlp_hidden"],
             "num_processor_layers": n_layers,
             "n_input_steps": n_input_steps,
-            "n_output_steps": 1,  # checked by check_supported
+            "n_output_steps": n_out_steps,  # 1 unless the kind is in MULTI_OUTPUT_KINDS (check_supported)
             "n_data_vars": len(data_names),
             "n_input_vars": n_in,
             "n_output_vars": n_out,
@@ -603,6 +675,7 @@ def build_config(root, acc, weights, absent, blocks, n_layers, graph_nodes, ckpt
         "blocks": {prefix: {"kind": kind, "class": get(root, path)._qualname, "path": path}
                    for prefix, path, kind, _ in blocks},
         "absent": absent,
+        **({"times": times} if interpolator else {}),  # absent for the forecaster (its config is unchanged)
     }
 
 
@@ -696,7 +769,7 @@ def read_cutout_masks(ckpt_path, entries, lat, lon):
     return out
 
 
-def build_forcings(meta, in_names, residual_input_names):
+def build_forcings(meta, in_names, residual_input_names, n_input_steps, n_output_steps):
     """Config section "forcings": which model inputs the rollout refreshes, from the checkpoint's metadata.
 
     Mirrors anemoi-inference 9505dd0 (docs/forcings.md section 1):
@@ -705,15 +778,19 @@ def build_forcings(meta, in_names, residual_input_names):
       constant = constant_in_time                           (runner.py:463-466 `reset`; the roll carries them);
       prognostic = the rest, taken from the model output (already `indices.residual_*`).
     Input indices come from metadata_inference.<dataset>.data_indices.input (metadata.py:1583-1584). The timestep is
-    metadata_inference.<dataset>.timesteps.timestep (metadata.py:1509-1511).
+    metadata_inference.<dataset>.timesteps.timestep (metadata.py:1509-1511): the forecaster's step, or the data
+    frequency of an interpolator (the unit of its `times`). The temporal-downscaler runner of anemoi-inference
+    (runners/temporal_downscaler.py) uses the same constant / dynamic forcing inputs as the forecaster's runner.
     """
     vm = meta["dataset"][DATASET]["variables_metadata"]
     inf = meta["metadata_inference"][DATASET]
     vtypes = inf["variable_types"]
     idx = {k: int(v) for k, v in inf["data_indices"]["input"].items()}
     check(idx == {n: i for i, n in enumerate(in_names)}, "metadata_inference data_indices.input != converted input names")
-    check(len(inf["timesteps"]["output_relative_date_indices"]) == 1, "multi-step output is not supported")
-    check(len(inf["timesteps"]["input_relative_date_indices"]) == 2, "unexpected number of input steps")
+    n_rel_out = len(inf["timesteps"]["output_relative_date_indices"])
+    n_rel_in = len(inf["timesteps"]["input_relative_date_indices"])
+    check(n_rel_out == n_output_steps, f"metadata output_relative_date_indices: {n_rel_out} != {n_output_steps} steps")
+    check(n_rel_in == n_input_steps, f"metadata input_relative_date_indices: {n_rel_in} != {n_input_steps} steps")
     ts = str(inf["timesteps"]["timestep"])
     m = re.fullmatch(r"(\d+)h", ts)
     check(m is not None and int(m.group(1)) > 0, f"timestep {ts!r}: only whole hours ('<N>h') are supported")
@@ -758,7 +835,8 @@ def convert(ckpt_path, out_path):
     config = build_config(root, acc, weights, absent, blocks, n_layers, graph_nodes, ckpt_path, arch)
     config["forcings"] = build_forcings(
         ck.anemoi_metadata(ckpt_path), config["variables"]["input"],
-        [config["variables"]["input"][i] for i in config["indices"]["residual_input"]])
+        [config["variables"]["input"][i] for i in config["indices"]["residual_input"]],
+        config["dims"]["n_input_steps"], config["dims"]["n_output_steps"])
     stats_err = check_statistics(root, config["variables"]["data"])
     rules = UNUSED_RULES if stats_err <= 1e-6 else [
         (pat, STATS_STALE_REASON.format(err=stats_err) if r == STATS_FOLDED_REASON else r) for pat, r in UNUSED_RULES]

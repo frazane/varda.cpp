@@ -93,16 +93,20 @@ struct BoundingDev {
     float lo = 0, hi = 0;
 };
 
+// T_out output steps (1 for the forecaster, n_output_steps for the interpolator): the decoder
+// output row g holds step t in columns [t V_out, (t + 1) V_out) (anemoi's "(time vars)"); y and
+// pre_bound are [T_out, G, V_out]. Every step takes the residual from the same input step and its
+// boundings (fraction totals included) from its own values.
 struct OutputArgs {
-    const void* dec = nullptr; int64_t ld_dec = 0;  // [G, V_out] decoder output (T)
+    const void* dec = nullptr; int64_t ld_dec = 0;  // [G, T_out V_out] decoder output (T)
     const float* xn_step = nullptr;  // xn[residual_step] = [G, V_in]
-    int V_in = 0, V_out = 0;
+    int V_in = 0, V_out = 0, T_out = 1;
     int64_t G = 0;
     const int* res_src = nullptr;  // [V_out]: model-input index added to output v, or -1
     const BoundingDev* bounds = nullptr; int n_bounds = 0;
     const int* bidx = nullptr;     // index lists of the boundings
-    float* pre_bound = nullptr;    // optional [G, V_out]
-    float* y = nullptr;            // [G, V_out] normalised, after bounding
+    float* pre_bound = nullptr;    // optional [T_out, G, V_out]
+    float* y = nullptr;            // [T_out, G, V_out] normalised, after bounding
 };
 template <class T>
 void output_assemble(const OutputArgs& a, cudaStream_t s);

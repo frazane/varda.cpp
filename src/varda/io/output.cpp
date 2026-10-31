@@ -328,6 +328,8 @@ struct GribOutput::Impl {
     std::vector<OutStream> streams;
     std::map<std::string, std::vector<float>> acc;  // accumulators by variable name
     std::vector<float> transposed;                  // write_step's (V, G) copy of y
+    std::vector<std::string> step_order;            // cfg.step_field_order (empty: out_names)
+    std::vector<size_t> step_col;                   // y column of each message of write_step
 
     const GridSource& source(const std::string& name, size_t* idx = nullptr) const {
         for (size_t i = 0; i < sources.size(); ++i)
@@ -396,6 +398,8 @@ struct GribOutput::Impl {
                 case PostProcessorDef::AssignMask:
                     a = assign_mask(a, mask_named(pp.mask));
                     break;
+                case PostProcessorDef::CopyFromForecaster:
+                    break;  // applied on the merged-grid column before the extraction (write_state)
                 default:
                     throw std::runtime_error("GribOutput: output post-processor type not supported");
             }
@@ -505,14 +509,27 @@ struct GribOutput::Impl {
 
     GribOutput::Stats stats;
 
-    template <class Col>
-    void write_state(const std::vector<std::string>& names, Col&& column, int step_hours) {
+    // The CopyFromForecaster post-processor of an output that applies at this step, else nullptr
+    // (copy_prognostic_from_forecaster.py: lead > 0 and lead % common_leadtime == 0).
+    static const PostProcessorDef* copy_rule(const OutputDef& d, int step_hours) {
+        for (const auto& pp : d.post_processors)
+            if (pp.type == PostProcessorDef::CopyFromForecaster && step_hours > 0 &&
+                step_hours % pp.common_leadtime_hours == 0)
+                return &pp;
+        return nullptr;
+    }
+
+    // `fcol(i)`: the forecaster's merged-grid column of field i (CopyFromForecaster), or an empty
+    // vector when no forecaster state was given.
+    template <class Col, class FCol>
+    void write_state(const std::vector<std::string>& names, Col&& column, int step_hours, FCol&& fcol) {
         using clock = std::chrono::steady_clock;
         auto secs = [](clock::time_point a) { return std::chrono::duration<double>(clock::now() - a).count(); };
         auto t0 = clock::now();
         Top top = run_top(names, column);
         stats.post += secs(t0);
         for (auto& s : streams) {
+            const PostProcessorDef* copy = copy_rule(*s.def, step_hours);
             // write_initial_state first checks that every field has a template
             std::vector<size_t> fields;
             for (size_t i = 0; i < names.size(); ++i) {
@@ -531,7 +548,18 @@ struct GribOutput::Impl {
                     const auto tg = clock::now();
                     const IoVariable& v = cfg.variable(names[i]);
                     auto it = top.changed.find(names[i]);
-                    std::vector<float> a = it != top.changed.end() ? it->second : column(i);
+                    std::vector<float> a;
+                    if (copy && copy->copies(names[i])) {
+                        // the forecaster's value of this step replaces the field (the filter runs after the
+                        // top-level post-processors, which only touch the kept tp)
+                        a = fcol(i);
+                        if (a.empty())
+                            throw std::runtime_error("GribOutput: output " + s.def->name + " copies " + names[i] +
+                                                     " from the forecaster at step " + std::to_string(step_hours) +
+                                                     " h, but no forecaster state was given");
+                    } else {
+                        a = it != top.changed.end() ? it->second : column(i);
+                    }
                     a = run_output_pps(*s.def, std::move(a));
                     cpu[0] += secs(tg);
                     enc[f] = encode_field(s, v, std::move(a), step_hours, top, cpu);
@@ -563,11 +591,13 @@ struct GribOutput::Impl {
                 stats.write += secs(tw);
             });
         }
-        wait_pending();
+        // The last output's file writes are left pending: they overlap the next state's encoding (the
+        // next write_state waits for them before launching its own, so every file is written in order);
+        // close(), stats() and files() wait for them.
     }
 
-    std::future<void> pending;  // the previous output's file writes
-    void wait_pending() {
+    mutable std::future<void> pending;  // the previous output's file writes
+    void wait_pending() const {
         if (pending.valid()) pending.get();  // rethrows a write error
     }
 
@@ -613,19 +643,49 @@ GribOutput::GribOutput(std::vector<GridSource> sources, std::vector<std::string>
                                  std::to_string(cfg.number_of_grid_points));
     p_->streams.resize(p_->cfg.outputs.size());
     for (size_t i = 0; i < p_->streams.size(); ++i) p_->streams[i].def = &p_->cfg.outputs[i];
+    // A CopyFromForecaster rule takes the forecaster's raw state, so it must not select a variable the top-level
+    // post-processors change (anemoi's plugin would copy the forecaster's processed GRIB field instead).
+    for (const auto& d : cfg.outputs)
+        for (const auto& pp : d.post_processors) {
+            if (pp.type != PostProcessorDef::CopyFromForecaster) continue;
+            for (const auto& name : p_->out_names) {
+                if (!pp.copies(name)) continue;
+                for (const auto& top : cfg.post_processors) {
+                    const bool acc = top.type == PostProcessorDef::Accumulate &&
+                                     std::find(top.accumulations.begin(), top.accumulations.end(), name) != top.accumulations.end();
+                    const IoVariable* v = cfg.find_variable(name);
+                    const bool resc = top.type == PostProcessorDef::Rescale && v && v->param() == top.param;
+                    if (acc || resc)
+                        throw std::runtime_error("GribOutput: output " + d.name + " copies " + name +
+                                                 " from the forecaster, but a top-level post-processor changes it; not implemented");
+                }
+            }
+        }
+    p_->step_order = cfg.step_field_order;
+    const std::vector<std::string>& order = p_->step_order.empty() ? p_->out_names : p_->step_order;
+    for (const auto& n : order) {
+        auto it = std::find(p_->out_names.begin(), p_->out_names.end(), n);
+        if (it == p_->out_names.end()) throw std::runtime_error("GribOutput: step_field_order names unknown output " + n);
+        p_->step_col.push_back(size_t(it - p_->out_names.begin()));
+    }
 }
 
-GribOutput::~GribOutput() = default;
+GribOutput::~GribOutput() {
+    try {
+        p_->wait_pending();
+    } catch (...) {
+    }
+}
 
 void GribOutput::write_initial(const std::vector<std::string>& names, const std::vector<std::vector<float>>& values) {
     if (!p_->cfg.write_initial_state) return;
     if (names.size() != values.size()) throw std::runtime_error("write_initial: names and values differ in length");
     for (const auto& v : values)
         if (int64_t(v.size()) != p_->G) throw std::runtime_error("write_initial: a field does not have G values");
-    p_->write_state(names, [&](size_t i) { return values[i]; }, 0);
+    p_->write_state(names, [&](size_t i) { return values[i]; }, 0, [](size_t) { return std::vector<float>(); });
 }
 
-void GribOutput::write_step(int step_hours, const float* y) {
+void GribOutput::write_step(int step_hours, const float* y, const float* forecaster_y) {
     const size_t V = p_->out_names.size();
     const size_t G = size_t(p_->G);
     // y is (G, V): transpose it once, in cache-sized blocks, so that every message reads its variable
@@ -639,19 +699,40 @@ void GribOutput::write_step(int step_hours, const float* y) {
         for (size_t j = 0; j < V; ++j)
             for (size_t g = g0; g < g1; ++g) yt[j * G + g] = y[g * V + j];
     }
+    // Message order: the output order, or the io config's step_field_order (same set); `col[i]` is the y
+    // column of the i-th message.
+    const std::vector<std::string>& names = p_->step_order.empty() ? p_->out_names : p_->step_order;
+    const std::vector<size_t>& col = p_->step_col;
     p_->write_state(
-        p_->out_names, [&](size_t j) { return std::vector<float>(yt.begin() + j * G, yt.begin() + (j + 1) * G); },
-        step_hours);
+        names,
+        [&](size_t i) {
+            const size_t j = col[i];
+            return std::vector<float>(yt.begin() + j * G, yt.begin() + (j + 1) * G);
+        },
+        step_hours,
+        [&](size_t i) {
+            std::vector<float> c;
+            if (!forecaster_y) return c;
+            const size_t j = col[i];
+            c.resize(G);
+            for (size_t g = 0; g < G; ++g) c[g] = forecaster_y[g * V + j];
+            return c;
+        });
 }
 
 void GribOutput::close() {
+    p_->wait_pending();
     for (auto& s : p_->streams)
         for (auto& [path, w] : s.writers) w->close();
 }
 
-GribOutput::Stats GribOutput::stats() const { return p_->stats; }
+GribOutput::Stats GribOutput::stats() const {
+    p_->wait_pending();
+    return p_->stats;
+}
 
 std::vector<std::string> GribOutput::files() const {
+    p_->wait_pending();
     std::vector<std::string> out;
     for (const auto& s : p_->streams) out.insert(out.end(), s.created.begin(), s.created.end());
     return out;

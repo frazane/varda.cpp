@@ -53,6 +53,12 @@ cmake -S . -B build-out && cmake --build build-out -j 32
 build-out/varda-forecast --assets $VARDA_SCRATCH/assets/varda-single-1.0 \
     --realdata $VARDA_SCRATCH/realdata/20261022T15 --out OUT \
     --device cuda --precision fp16 [--lead-time-hours H] [--write-queue N] [--allow-nans] [--dump-y] [--quiet]
+# with the 1-hourly temporal downscaler after the rollout (docs/downscaler.md): a bundle with downscaler.safetensors +
+# varda-td-io.json (tools/make_assets.py) runs it, --no-downscaler skips it; or explicitly (both options together):
+#    --downscaler $VARDA_SCRATCH/converted/varda-td/model.safetensors --downscaler-io-config $VARDA_SCRATCH/realdata/assets/varda-td-io.json
+# Then OUT/outputs/varda-single_<dateTime>_{0..24}.grib (lam, ICON templates; 66 messages at hour 0, 67 per hour: 35 files,
+# 2350 messages for 24 h) are written too, forecast.json gains a "downscaler" entry, and --dump-y also writes
+# OUT/hourly.safetensors (y.<hour>) and puts x0 and the input names into y.safetensors.
 # any date:  --date 2026-10-22T15:00:00 --kenda DIR --ifs-prev F --ifs F --ifs-constants F
 # without the bundle: --model M --io-config J --regrid-matrix R --templates DIR [--definitions D] (table above)
 ```
@@ -121,7 +127,12 @@ The tables below, the "10.4 s warm" and the 14 s cold load are historical (commi
 Environment: `VARDA_PREFETCH_THREADS` (weights prefetch threads, default 32, 0 disables; the cold mapping on Lustre was
 faulted in as one serial stream at ~100 MB/s), `VARDA_INPUT_IO_THREADS` (input GRIB reader threads, default 16),
 `VARDA_INPUT_IFS_THREADS` (OpenMP team of the IFS branch, default a quarter of the threads clamped to 4..16),
-`VARDA_INPUT_TRACE` (per-file and per-branch timelines in the input log). None changes a result.
+`VARDA_INPUT_TRACE` (per-file and per-branch timelines in the input log). With the temporal downscaler
+(`docs/downscaler.md` §7): `VARDA_TD_OVERLAP` (0: run the downscaler after the rollout instead of alongside it; device
+rollout only), `VARDA_TD_BUFFERS` (window output buffers handed to the hourly writer, default 2), `VARDA_TD_PINNED`
+(1: page-locked window buffers; slower start, kept as an experiment), `VARDA_TD_PRIORITY` (0: default-priority CUDA
+stream for the downscaler), `VARDA_FC_WRITER_THREADS` (OpenMP threads of the 6-hourly writer while overlapping, default
+8). None changes a result.
 
 One GPU job, A100-SXM4-80GB, 32 CPUs, 2026-10-23, `varda-forecast --realdata ... --precision fp16`
 (device rollout, CUDA graph on, 4 steps, write queue 4, 32 OpenMP threads), the same command run three times in the
@@ -185,3 +196,8 @@ run); fp32 163 s against 41 s (4.0x), the only fp32 comparison. Details and conf
   those of the checkpoint's `source0` coordinates (`docs/realdata-reference.md` section 1).
 - **Step files are not byte-identical to the reference's.** They differ from anemoi-inference's by the model error only;
   step 0 is identical (`docs/results.md` section 5).
+- **Downscaler inputs come from memory, not from the GRIB files.** anemoi-inference's downscaler reads the forecaster's
+  GRIB files back (24-bit packing); `varda-forecast` hands the rollout's float32 outputs to the downscaler directly, and
+  copies them, not their packed values, into the 6-hourly fields of the hourly files. The difference is below 1.2e-7
+  relative on the inputs and not measurable on the outputs (`docs/downscaler.md` §5-6). The hourly files' message
+  order follows the reference's (`tp` last; `docs/io-output.md`).

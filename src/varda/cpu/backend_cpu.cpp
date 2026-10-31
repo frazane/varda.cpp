@@ -5,9 +5,14 @@
 //   x_src  = [xn[t0] | xn[t1] | ... | data attr]             (G, T*V_in + A)
 //   z      = encoder(x_src, hidden attr)                     (H, C)
 //   z      = proc_{n-1}(...proc_0(z)) (+ z if latent_skip)   (H, C)
-//   d      = decoder(z, x_src)                               (G, V_out): block + LN + Linear
-//   y      = d, + xn[residual_step] on the prognostic outputs; bounding (config order)
-//   Y      = (y - add[norm_output]) / mul[norm_output]
+//   d      = decoder(z, x_src)                               (G, T_out*V_out): block + LN + Linear
+//   y_t    = d[:, t*V_out : (t+1)*V_out]                     t = 0..T_out-1 ("(time vars)")
+//   y_t    = y_t, + xn[residual_step] on the prognostic outputs (same input step for every t);
+//            bounding (config order, per step)
+//   Y_t    = (y_t - add[norm_output]) / mul[norm_output]     y: (1, T_out, 1, G, V_out)
+//
+// T_out = n_output_steps: 1 for the forecaster (anemoi AnemoiModelEncProcDec), > 1 for the
+// temporal downscaler (AnemoiModelEncProcDecMultiOutInterpolator); the rest is the same maths.
 //
 // Every block (encoder, processor, decoder) runs as a source side (k|v for all source
 // rows) and a destination side processed in chunks of complete destination rows (each
@@ -103,15 +108,15 @@ private:
     double t0_;
 };
 
-// One output bounding (anemoi layers/bounding.py), in place on (G, Vo) normalised outputs.
-void apply_bounding(const Bounding& b, float* y, int64_t G, int64_t Vo) {
+// One output bounding (anemoi layers/bounding.py), in place on (rows, Vo) normalised outputs.
+void apply_bounding(const Bounding& b, float* y, int64_t rows, int64_t Vo) {
     const size_t n = b.index.size();
     const bool relu = b.type == "relu", fraction = b.type == "fraction";
 #pragma omp parallel
     {
         std::vector<float> prod(n);
 #pragma omp for schedule(static)
-        for (int64_t g = 0; g < G; ++g) {
+        for (int64_t g = 0; g < rows; ++g) {
             float* yr = y + g * Vo;
             if (relu) {
                 // NaN propagates (as torch relu); every other value as before, -0 -> +0.
@@ -248,7 +253,7 @@ CpuBackend::CpuBackend(const Config& cfg, SafeTensorsFile& f, const Options& opt
     enc_emb_dst_ = linear(f, "enc.emb_dst", C_, A);
     dec_emb_dst_ = linear(f, "dec.emb_dst", C_, F_src_);
     dec_out_norm_ = layer_norm(f, "dec.out_norm", C_);
-    dec_out_proj_ = linear(f, "dec.out_proj", static_cast<int64_t>(cfg.n_output_steps) * cfg.n_output_vars, C_);
+    dec_out_proj_ = linear(f, "dec.out_proj", cfg.dec_out_features(), C_);  // T_out*V_out, time major
 
     proc_.reserve(cfg.num_processor_layers);  // Block::edge points into its own edge_wt
     for (const BlockInfo& bi : cfg.blocks) {
@@ -458,6 +463,7 @@ void CpuBackend::predict_step(const float* x, float* y, const ActivationHook* ho
     prof_.t.clear();
     const double t_start = omp_get_wtime();
     const int64_t T = cfg_.n_input_steps, Vi = cfg_.n_input_vars, Vo = cfg_.n_output_vars;
+    const int64_t To = cfg_.n_output_steps, Fo = cfg_.dec_out_features();  // Fo = To * Vo
     const int64_t G = G_, H = H_, C = C_, F = F_src_, A = cfg_.node_attr_dim;
     report(hook, "in.x", x, {1, T, G, Vi});
 
@@ -484,7 +490,7 @@ void CpuBackend::predict_step(const float* x, float* y, const ActivationHook* ho
 
     float* z = arena_.get("z", H * C);
     float* latent = arena_.get("latent", H * C);
-    float* dec = arena_.get("dec_out", G * Vo);
+    float* dec = arena_.get("dec_out", G * Fo);
     double t0 = omp_get_wtime();
     encoder(x_src, z, hook);
     prof_.add("= encoder", omp_get_wtime() - t0);
@@ -495,29 +501,34 @@ void CpuBackend::predict_step(const float* x, float* y, const ActivationHook* ho
     decoder(latent, x_src, dec, hook);
     prof_.add("= decoder", omp_get_wtime() - t0);
 
-    // Skip residual on the prognostic outputs (normalised input step residual_step), in y.
+    // Output step t of data node g is decoder channels [t*Vo, (t+1)*Vo) of row g (anemoi's
+    // "(time vars)"); y holds step t at y + t*G*Vo. Skip residual on the prognostic outputs
+    // (normalised input step residual_step, the same for every output step).
     const float* x_skip = xn + cfg_.residual_step * G * Vi;
 #pragma omp parallel for schedule(static)
-    for (int64_t g = 0; g < G; ++g) {
-        float* yr = y + g * Vo;
-        std::memcpy(yr, dec + g * Vo, sizeof(float) * Vo);
-        for (size_t k = 0; k < cfg_.residual_output.size(); ++k)
-            yr[cfg_.residual_output[k]] = yr[cfg_.residual_output[k]] + x_skip[g * Vi + cfg_.residual_input[k]];
-    }
-    report(hook, "out.pre_bound", y, {1, 1, 1, G, Vo});
+    for (int64_t g = 0; g < G; ++g)
+        for (int64_t t = 0; t < To; ++t) {
+            float* yr = y + (t * G + g) * Vo;
+            std::memcpy(yr, dec + g * Fo + t * Vo, sizeof(float) * Vo);
+            for (size_t k = 0; k < cfg_.residual_output.size(); ++k)
+                yr[cfg_.residual_output[k]] = yr[cfg_.residual_output[k]] + x_skip[g * Vi + cfg_.residual_input[k]];
+        }
+    report(hook, "out.pre_bound", y, {1, To, 1, G, Vo});
 
-    // Bounding, in config order, in normalised space.
-    for (const Bounding& b : cfg_.bounding) apply_bounding(b, y, G, Vo);
-    report(hook, "out.norm", y, {1, 1, 1, G, Vo});
+    // Bounding, in config order, in normalised space. Every bounding acts within one row of Vo
+    // outputs (a fraction's total is in the same row, i.e. the same step), so the To*G rows
+    // of all steps are bounded as one (To*G, Vo) array.
+    for (const Bounding& b : cfg_.bounding) apply_bounding(b, y, To * G, Vo);
+    report(hook, "out.norm", y, {1, To, 1, G, Vo});
 
     // Inverse normalisation: (y - add) / mul.
 #pragma omp parallel for schedule(static)
-    for (int64_t g = 0; g < G; ++g)
+    for (int64_t r = 0; r < To * G; ++r)
         for (int64_t v = 0; v < Vo; ++v) {
-            const float d = y[g * Vo + v] - add_out_[v];
-            y[g * Vo + v] = d / mul_out_[v];
+            const float d = y[r * Vo + v] - add_out_[v];
+            y[r * Vo + v] = d / mul_out_[v];
         }
-    report(hook, "out.y", y, {1, 1, 1, G, Vo});
+    report(hook, "out.y", y, {1, To, 1, G, Vo});
 
     if (prof_.on) {
         std::fprintf(stderr, "[varda cpu] predict_step %.3f s (%d threads)\n", omp_get_wtime() - t_start, threads_);

@@ -2,8 +2,8 @@
 // graph attention (zero in-degree destinations, degrees up to 64, odd sizes, destination
 // sub-ranges, several channel/head layouts incl. C = 768, invariance to the warp split), LayerNorm
 // and the fused residual + LayerNorm (every C the backend accepts), GELU (erf and tanh),
-// normaliser, input assembly and output assembly (residual and every bounding type). fp32 and
-// fp16 storage.
+// normaliser, input assembly and output assembly (residual and every bounding type, one and several
+// output steps). fp32 and fp16 storage.
 #include <cuda_fp16.h>
 
 #include <algorithm>
@@ -353,9 +353,9 @@ void test_assemble(std::mt19937& rng) {
 }
 
 template <class T>
-void test_output(std::mt19937& rng) {
+void test_output(std::mt19937& rng, int T_out) {
     const bool f32 = std::is_same<T, float>::value;
-    const int V_in = 10, V_out = 9, ld = 16;
+    const int V_in = 10, V_out = 9, ld = (T_out * V_out + 7) / 8 * 8 + 8;  // step t at columns t V_out
     const int64_t G = 45;
     auto dec = rounded<T>(randn(G * ld, rng)), xs = randn(G * V_in, rng, 0.5f);
     std::vector<int> res = {3, 0, -1, 1, 2, 9, 4, 5, -1};  // output v gets xs[res[v]]
@@ -375,18 +375,22 @@ void test_output(std::mt19937& rng) {
     add_b(2, {4, 5}, {3}, 0.0f, 1.0f);     // fraction, one total
     add_b(2, {6, 7}, {0, 1}, -0.5f, 0.5f); // fraction, paired totals
     DeviceBuffer d_dec = to_dev<T>(dec), d_xs = raw_dev(xs), d_res = raw_dev(res), d_bd = raw_dev(bd),
-                 d_idx = raw_dev(idx), d_pre(G * V_out * 4), d_y(G * V_out * 4);
+                 d_idx = raw_dev(idx), d_pre(T_out * G * V_out * 4), d_y(T_out * G * V_out * 4);
     OutputArgs a;
     a.dec = d_dec.get(); a.ld_dec = ld; a.xn_step = d_xs.as<float>(); a.V_in = V_in; a.V_out = V_out; a.G = G;
+    a.T_out = T_out;
     a.res_src = d_res.as<int>(); a.bounds = d_bd.as<BoundingDev>(); a.n_bounds = static_cast<int>(bd.size());
     a.bidx = d_idx.as<int>(); a.pre_bound = d_pre.as<float>(); a.y = d_y.as<float>();
     output_assemble<T>(a, nullptr);
-    auto pre = from_dev<float>(d_pre, G * V_out), y = from_dev<float>(d_y, G * V_out);
+    auto pre = from_dev<float>(d_pre, T_out * G * V_out), y = from_dev<float>(d_y, T_out * G * V_out);
     bool ok_pre = true, ok_y = true;
+    for (int t = 0; t < T_out; ++t)
     for (int64_t g = 0; g < G; ++g) {
         std::vector<float> r(V_out);
-        for (int v = 0; v < V_out; ++v) r[v] = res[v] >= 0 ? dec[g * ld + v] + xs[g * V_in + res[v]] : dec[g * ld + v];
-        for (int v = 0; v < V_out; ++v) ok_pre &= pre[g * V_out + v] == r[v];
+        const float* dg = dec.data() + g * ld + t * V_out;
+        const int64_t row = (t * G + g) * V_out;
+        for (int v = 0; v < V_out; ++v) r[v] = res[v] >= 0 ? dg[v] + xs[g * V_in + res[v]] : dg[v];
+        for (int v = 0; v < V_out; ++v) ok_pre &= pre[row + v] == r[v];
         auto clamp = [](float x, float lo, float hi) { return std::min(std::max(x, lo), hi); };
         r[2] = std::max(r[2], 0.0f);
         r[3] = clamp(r[3], 0, 1);
@@ -395,10 +399,11 @@ void test_output(std::mt19937& rng) {
         r[6] = clamp(r[6], -0.5f, 0.5f); r[7] = clamp(r[7], -0.5f, 0.5f);
         const float t0 = r[0], t1 = r[1];
         r[6] *= t0; r[7] *= t1;
-        for (int v = 0; v < V_out; ++v) ok_y &= y[g * V_out + v] == r[v];
+        for (int v = 0; v < V_out; ++v) ok_y &= y[row + v] == r[v];
     }
-    check(ok_pre, std::string("output_assemble residual bitwise ") + tname(f32), ok_pre ? 0 : 1, 0);
-    check(ok_y, std::string("output_assemble bounding bitwise ") + tname(f32), ok_y ? 0 : 1, 0);
+    const std::string sfx = " T_out=" + std::to_string(T_out) + " " + tname(f32);
+    check(ok_pre, "output_assemble residual bitwise" + sfx, ok_pre ? 0 : 1, 0);
+    check(ok_y, "output_assemble bounding bitwise" + sfx, ok_y ? 0 : 1, 0);
 }
 
 }  // namespace
@@ -426,8 +431,10 @@ int main() {
     test_normaliser(rng);
     test_assemble<float>(rng);
     test_assemble<__half>(rng);
-    test_output<float>(rng);
-    test_output<__half>(rng);
+    for (int T_out : {1, 6}) {
+        test_output<float>(rng, T_out);
+        test_output<__half>(rng, T_out);
+    }
     std::printf("%s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

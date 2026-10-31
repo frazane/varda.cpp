@@ -38,11 +38,13 @@ namespace {
     throw std::runtime_error("io config: " + where + ": " + what);
 }
 
-void only_keys(const ojson& j, std::initializer_list<const char*> allowed, const std::string& where) {
+// Every key of `allowed` must be present and nothing else may be, except the keys of `optional`.
+void only_keys(const ojson& j, std::initializer_list<const char*> allowed, const std::string& where,
+               std::initializer_list<const char*> optional = {}) {
     if (!j.is_object()) bad(where, "expected an object");
-    std::set<std::string> ok(allowed.begin(), allowed.end());
+    std::set<std::string> ok(allowed.begin(), allowed.end()), opt(optional.begin(), optional.end());
     for (auto it = j.begin(); it != j.end(); ++it)
-        if (!ok.count(it.key())) bad(where, "unknown key '" + it.key() + "'");
+        if (!ok.count(it.key()) && !opt.count(it.key())) bad(where, "unknown key '" + it.key() + "'");
     for (const auto& k : ok)
         if (!j.contains(k)) bad(where, "missing key '" + k + "'");
 }
@@ -125,10 +127,40 @@ PostProcessorDef parse_pp(const ojson& j, const std::string& where) {
         p.type = PostProcessorDef::AssignMask;
         p.mask = get_str(j, "mask", where);
         if (get_str(j, "fill_value", where) != "nan") bad(where, "only fill_value 'nan' is supported");
+    } else if (t == "copy_prognostic_from_forecaster") {
+        only_keys(j, {"type", "common_leadtime_hours"}, where, {"params_to_copy", "params_to_keep"});
+        p.type = PostProcessorDef::CopyFromForecaster;
+        p.common_leadtime_hours = int(get_int(j, "common_leadtime_hours", where));
+        if (p.common_leadtime_hours <= 0) bad(where, "common_leadtime_hours must be positive");
+        if (j.contains("params_to_copy")) p.params_to_copy = str_list(j.at("params_to_copy"), where + ".params_to_copy");
+        if (j.contains("params_to_keep")) p.params_to_keep = str_list(j.at("params_to_keep"), where + ".params_to_keep");
+        if (p.params_to_copy.empty() == p.params_to_keep.empty())
+            bad(where, "exactly one of params_to_copy / params_to_keep must be given (and non-empty)");
+        for (const auto& l : {p.params_to_copy, p.params_to_keep})
+            for (const auto& g : l)
+                if (g.find('[') != std::string::npos) bad(where, "glob character classes are not supported: '" + g + "'");
     } else {
         bad(where, "unknown post-processor type '" + t + "'");
     }
     return p;
+}
+
+// fnmatch.fnmatchcase with `*` and `?` only (character classes are rejected by the loader).
+bool glob_match(const char* pat, const char* str) {
+    while (*pat) {
+        if (*pat == '*') {
+            while (*pat == '*') ++pat;
+            if (!*pat) return true;
+            for (const char* s = str; ; ++s) {
+                if (glob_match(pat, s)) return true;
+                if (!*s) return false;
+            }
+        }
+        if (!*str || (*pat != '?' && *pat != *str)) return false;
+        ++pat;
+        ++str;
+    }
+    return !*str;
 }
 
 }  // namespace
@@ -152,10 +184,13 @@ IoConfig IoConfig::parse(const std::string& text) {
               {"schema", "source", "grid", "area", "number_of_grid_points", "timestep_hours", "lead_time_hours",
                "write_initial_state", "allow_nans", "cutout_sources", "variables", "model_variables",
                "output_variables", "initial_state_fields", "kenda_namer_rules", "post_processors", "outputs"},
-              "top level");
+              "top level", {"runner", "step_field_order"});
     IoConfig c;
     c.schema = get_str(j, "schema", "top level");
     if (c.schema != "varda-io/1") bad("schema", "unsupported '" + c.schema + "' (expected varda-io/1)");
+    if (j.contains("runner")) c.runner = get_str(j, "runner", "top level");
+    if (c.runner != "forecaster" && c.runner != "temporal_downscaler")
+        bad("runner", "unsupported '" + c.runner + "' (forecaster | temporal_downscaler)");
     c.grid = get_str(j, "grid", "top level");
     for (const auto& a : j.at("area")) {
         if (!a.is_number()) bad("area", "expected numbers");
@@ -170,6 +205,14 @@ IoConfig IoConfig::parse(const std::string& text) {
     c.model_variables = str_list(j.at("model_variables"), "model_variables");
     c.output_variables = str_list(j.at("output_variables"), "output_variables");
     c.initial_state_fields = str_list(j.at("initial_state_fields"), "initial_state_fields");
+    if (j.contains("step_field_order")) {
+        c.step_field_order = str_list(j.at("step_field_order"), "step_field_order");
+        std::vector<std::string> a = c.step_field_order, b = c.output_variables;
+        std::sort(a.begin(), a.end());
+        std::sort(b.begin(), b.end());
+        if (a != b || std::adjacent_find(a.begin(), a.end()) != a.end())
+            bad("step_field_order", "must be a permutation of output_variables");
+    }
 
     for (const auto& v : j.at("variables")) {
         const std::string w = "variables[" + std::to_string(c.variables.size()) + "]";
@@ -204,9 +247,14 @@ IoConfig IoConfig::parse(const std::string& text) {
     for (const auto& o : j.at("outputs")) {
         const std::string w = "outputs[" + std::to_string(c.outputs.size()) + "]";
         only_keys(o, {"name", "kind", "path", "path_effective", "encoding", "template_index", "post_processors",
-                      "modifiers", "check_encoding", "missing_value"}, w);
+                      "modifiers", "check_encoding", "missing_value"}, w, {"negative_step_mode"});
         OutputDef d;
         d.name = get_str(o, "name", w);
+        if (o.contains("negative_step_mode")) {
+            d.negative_step_mode = get_str(o, "negative_step_mode", w);
+            if (d.negative_step_mode != "error" && d.negative_step_mode != "skip")
+                bad(w, "negative_step_mode must be error or skip (no negative step is ever written here; 'write' is not implemented)");
+        }
         if (get_str(o, "kind", w) != "grib") bad(w, "only grib outputs are supported");
         d.path = get_str(o, "path", w);
         d.path_effective = get_str(o, "path_effective", w);
@@ -263,6 +311,16 @@ const IoVariable& IoConfig::variable(const std::string& name) const {
     const IoVariable* v = find_variable(name);
     if (!v) throw std::runtime_error("io config: unknown variable '" + name + "'");
     return *v;
+}
+
+bool PostProcessorDef::copies(const std::string& name) const {
+    auto any = [&](const std::vector<std::string>& pats) {
+        for (const auto& g : pats)
+            if (glob_match(g.c_str(), name.c_str())) return true;
+        return false;
+    };
+    if (!params_to_copy.empty()) return any(params_to_copy);
+    return !any(params_to_keep);
 }
 
 const OutputDef& IoConfig::output(const std::string& name) const {

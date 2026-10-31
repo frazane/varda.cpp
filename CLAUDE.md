@@ -12,6 +12,9 @@
   tolerances. `docs/tools.md`: converter. `docs/testing.md`: every test suite and how to run it.
 - `docs/metal.md`: the optional Apple Silicon Metal/MPS backend (fp32 and mixed fp16) and its
   qualification limits. `docs/apple-silicon.md`: building and verifying on macOS arm64.
+- `docs/downscaler.md`: the temporal downscaler (`varda-td`, hourly output): loop semantics, `varda-downscale`,
+  the hourly GRIB output of `varda-forecast`, results. `docs/downscaler-reference.md`: anemoi-inference's
+  `temporal_downscaler` runner on real data, its dumps and spreads.
 - `docs/forecast.md`: running a forecast from real data (GRIB in, GRIB out), overlap, timings, limits.
   `docs/spec-io.md`: the I/O spec. `docs/realdata-reference.md`: the anemoi-inference reference run and dumps.
   `docs/io-input.md`: GRIB -> x0. `docs/io-output.md`: y -> GRIB, io config.
@@ -87,3 +90,11 @@ backend only. GPU target: sm_80 (A100).
 | sizes | G 1 688 650, H 189 809, E enc/proc/dec 2.85M / 1.52M / 5.07M, 79 in / 67 out | G 40 320, H 10 242, 84 in / 72 out |
 
 Iterate on the dev model (seconds per forward), then confirm on Varda.
+
+The temporal downscaler (`varda-td`, the second HF model, `varda-temporal-downscaler-det-sgm/model.ckpt` under
+`$VARDA_SCRATCH/hf/`; same graph and width as Varda, 77 in / 6 x 67 out): converted `$VARDA_SCRATCH/converted/varda-td/`,
+golden made here with anemoi `$VARDA_SCRATCH/golden-ref/varda-td/<tag>/` (exported `golden/varda-td/<tag>.safetensors`),
+`tolerances/varda-td.json`, the anemoi-inference reference run `$VARDA_SCRATCH/downscale/ref/20261022T15/<tag>/`.
+Its reference venvs differ from the forecaster's (another anemoi-core revision): `$VARDA_SCRATCH/venv-ref-varda-td`
+(golden, lock `python/reference/requirements-ref-varda-td.lock.txt`) and `$VARDA_SCRATCH/ref-oper-td/.venv` (real data).
+There is no small interpolator checkpoint: iterate on the synthetic models g and h (`tests/run_synthetic.sh`).

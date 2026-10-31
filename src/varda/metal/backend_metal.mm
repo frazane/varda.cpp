@@ -231,6 +231,11 @@ MetalBackend::MetalBackend(const Config& cfg, SafeTensorsFile& f, const Options&
     : cfg_(cfg), fp16_(opts.precision == Precision::FP16), C_(cfg.num_channels), G_(cfg.n_data_nodes),
       H_(cfg.n_hidden_nodes), F_(cfg.src_features()),
       chunk_(8192) {
+    // The Metal backend is not yet generalised to several output steps (the temporal downscaler,
+    // docs/downscaler.md): refuse rather than mis-assemble the output.
+    if (cfg.n_output_steps != 1)
+        throw std::runtime_error("Metal backend: models with n_output_steps != 1 (the temporal downscaler) are not "
+                                 "supported yet; use --device cpu or cuda");
     @autoreleasepool {
         device_ = MTLCreateSystemDefaultDevice();
         if (!device_ || !device_.hasUnifiedMemory)

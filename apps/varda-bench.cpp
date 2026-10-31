@@ -126,7 +126,7 @@ int main(int argc, char** argv) {
         const varda::Config cfg = model->config();  // a copy: --determinism reloads the model
         if (golden.uuid != cfg.uuid) throw std::runtime_error("golden checkpoint uuid does not match the model");
         const int64_t in_n = int64_t(cfg.n_input_steps) * cfg.n_data_nodes * cfg.n_input_vars;
-        const int64_t out_n = cfg.n_data_nodes * cfg.n_output_vars;
+        const int64_t out_n = int64_t(cfg.n_output_steps) * cfg.n_data_nodes * cfg.n_output_vars;
         if (xv.numel() != in_n) throw std::runtime_error("in.x has the wrong size");
         auto* be = varda::cuda::as_cuda(*model);
         const char* graph_s = opts.cuda_graph ? "on" : "off";

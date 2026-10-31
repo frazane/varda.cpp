@@ -36,6 +36,9 @@ Names, shapes and dtypes (format v3): fp32 weights as stored,
 `proc.{i}`, `dec.block`) `q k v self edge proj mlp1 mlp2` (Linear: `.weight` [out, in],
 `.bias` [out]) and `ln_dst ln_mlp` (+ `ln_src` in mapper blocks) (LayerNorm `.weight`,
 `.bias`), plus `enc.emb_src enc.emb_dst dec.emb_dst dec.out_norm dec.out_proj`.
+`enc.emb_src.weight` and `dec.emb_dst.weight` are [C, T·V_in + A]; `dec.out_proj.weight` is
+[T_out·V_out, C] (T_out = `dims.n_output_steps`: 1 for the forecaster, 6 for the Varda temporal
+downscaler, whose decoder emits every output step at once, row t·V_out + v).
 
 In addition (not in `weights.pt`; optional, older files lack them):
 `grid.latitudes`, `grid.longitudes` F64 [n_data_nodes], degrees: the checkpoint's supporting
@@ -72,6 +75,24 @@ roll), and the step length. Prognostic inputs are `indices.residual_input`. Ever
 from the checkpoint by the converter, never hard-coded; the engine reads sizes, epsilons,
 activation variants, index lists and bounding from it and asserts nothing model-specific.
 
+Two model kinds (`architecture.model.kind`; `class` is the anemoi class):
+
+| kind | anemoi class | `dims.n_output_steps` | `times` |
+|---|---|---|---|
+| `enc_proc_dec` (forecaster) | `...encoder_processor_decoder.AnemoiModelEncProcDec` | 1 | absent |
+| `enc_proc_dec_interpolator` (temporal downscaler) | `...interpolator.AnemoiModelEncProcDecMultiOutInterpolator` | ≥ 1 (Varda: 6) | present |
+
+`times` (interpolator only) = `{"input": [...], "target": [...], "frequency_hours": int}`: the
+relative time indices of the `n_input_steps` input slots and of the `n_output_steps` output
+steps, in units of `frequency_hours` (Varda downscaler: `[0, 6]`, `[1, 2, 3, 4, 5, 6]`, 1). They
+are the model's `input_times` / `output_times` (anemoi's `training.explicit_times`), checked by
+the converter against `config.training.explicit_times`,
+`metadata_inference.data.timesteps.{input,output}_relative_date_indices` and the data
+frequency. For the interpolator, `forcings.timestep_hours` is that frequency (the unit of
+`times`), and `residual.step` (0 for Varda) selects the input slot added to every output step.
+The forecaster's config has no `times` key and is byte-for-byte what it was before the kind
+existed.
+
 The engine rejects unknown `architecture.*.kind`, block `kind`, `residual.type`,
 `bounding[].type` or `dims.gelu_approximate` values at load time with a clear error.
 
@@ -87,11 +108,14 @@ Keys and shapes (B = 1; T input steps, A = 4 node attributes, C channels):
 | `enc.x_dst` | (H, A) | hidden-node input features |
 | `enc.emb_src`, `enc.emb_dst` | (G, C), (H, C) | node embeddings (`enc.emb_src` on all rows) |
 | `enc.out`, `proc.{i}.out` (i = 0..n_proc−1) | (H, C) | encoder and processor block outputs |
-| `latent` | (H, C) | decoder source input = processor out + `enc.out` |
+| `latent` | (H, C) | decoder source input = processor out (+ `enc.out` if `dims.latent_skip`) |
 | `dec.emb_dst`, `dec.block_out` | (G, C) | decoder embedding and block output |
-| `dec.out` | (G, V_out) | after the output LayerNorm + Linear |
-| `out.pre_bound`, `out.norm` | (1, 1, 1, G, V_out) | normalised, after the residual; after bounding |
-| `out.y` | (1, 1, 1, G, V_out) | `predict_step` output, physical units |
+| `dec.out` | (G, T_out·V_out) | after the output LayerNorm + Linear; column t·V_out + v is step t, variable v |
+| `out.pre_bound`, `out.norm` | (1, T_out, 1, G, V_out) | normalised, after the residual (on every step); after bounding |
+| `out.y` | (1, T_out, 1, G, V_out) | `predict_step` output, physical units |
+
+T_out = `dims.n_output_steps` (1 for the forecaster, 6 for the Varda temporal downscaler); the residual
+adds `in.x_norm[:, residual.step]` to the prognostic outputs of every step.
 
 Required in every golden dump: `in.x`, `in.x_norm`, `enc.x_src`, `enc.out`, `proc.{i}.out`, `latent`, `dec.out`,
 `out.*`; the others are best effort.
@@ -108,7 +132,9 @@ Metric: per key, in float64,
 ## 3. Golden files (`python/export_golden.py`)
 
 The reference golden directories (anemoi runs, read-only: `$REF_GOLDEN/<tag>/activations.pt` +
-`manifest.json`, `$REF_GOLDEN_DEV/<tag>/` for the dev model) are exported once to
+`manifest.json`, `$REF_GOLDEN_DEV/<tag>/` for the dev model; for the Varda temporal downscaler
+`varda-td`, `$VARDA_SCRATCH/golden-ref/varda-td/<tag>/`, made by
+`python/reference/run_reference.py --golden`) are exported once to
 `$VARDA_SCRATCH/golden/<model>/<tag>.safetensors`:
 every key of `activations.pt` as F32 with its shape, and `__metadata__` =
 `{"varda_golden": "1", "tag": <tag>, "manifest": <manifest.json as a string>,
@@ -116,11 +142,23 @@ every key of `activations.pt` as F32 with its shape, and `__metadata__` =
 `checkpoint_uuid` pairs the golden data with a model (`source.uuid` in its config): it is
 `manifest.checkpoint_identity.uuid` if present, else the uuid in the embedded
 `anemoi-metadata/anemoi.json` of the checkpoint the manifest names (old manifests). Consumers refuse to compare unpaired files.
+`python/reference/compare_golden.py --contract MODEL GOLDEN...` checks golden sets (directory or exported file)
+against a converted model: exact key set, the §2 shapes from its `dims`, F32, finite values, paired uuid.
+
+Tags (all with the synthetic input of `run_reference.make_input`, seed 0, two states; the same input for every tag of a
+model; TF32 off; `ANEMOI_INFERENCE_NUM_CHUNKS*` unset; for `varda` and `varda-td` two capture runs, bitwise equal): `cpu-fp32-pyg` (CPU, fp32,
+pyg attention: the ground truth), `cuda-fp32-triton` (A100, fp32, triton attention), `cuda-fp16-triton` (A100,
+`torch.autocast(float16)`, triton). Models: `varda` (forecaster, uuid `e8c577ed-...`), `dev`, `varda-td` (temporal
+downscaler, uuid `00e40f03-2f7e-4c1c-8e6d-91ed9062249f`).
 
 ## 4. Tolerances (`tolerances/*.json`)
 
 Calibrated on the reference runs' own spreads (rule in each file's `method`), keyed by checkpoint
-uuid (`checkpoint.uuid`). Tables: `cuda-fp32` (engine fp32 vs `cpu-fp32-pyg`), `cuda-fp16`
+uuid (`checkpoint.uuid`): `tolerances/varda.json`, `dev.json`, `varda-td.json`. Generator:
+`python/reference/calibrate_tolerances.py` (reproduces `varda.json` and `dev.json` exactly from the reference
+compare files; `--check` verifies that). The temporal downscaler's loop has its own per-window, per-hour file,
+`tolerances/downscale/varda-td.json` (tables `fast-fp32-vs-ref`, `fast-fp16-vs-ref`, `fast-fp16-vs-ref-fp16`; generator
+`python/reference/calibrate_downscale_tolerances.py`; `docs/downscaler.md` §3). One-step tables: `cuda-fp32` (engine fp32 vs `cpu-fp32-pyg`), `cuda-fp16`
 (engine fp16 vs `cpu-fp32-pyg`), `cuda-fp16-vs-ref-fp16` (engine fp16 vs
 `cuda-fp16-triton`). The C++ CPU fp32 path is held to the `cuda-fp32` table (it is the
 reference's own cross-device fp32 spread × 3, floored at 1e-5): a from-scratch fp32

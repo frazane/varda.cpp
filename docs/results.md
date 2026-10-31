@@ -226,3 +226,81 @@ assets (fadvise cannot drop pages another process maps).
 - No anemoi-inference run in this job; the current-binary ratios against it are from the cost benchmark (previous
   subsection).
 - Three cold runs per binary, one node. These cold runs were not the first process in the job (see the headline).
+
+## 6. Temporal downscaler (`varda-td`, 2026-10-30)
+
+The second model of Varda-single-1.0 (`varda-temporal-downscaler-det-sgm/model.ckpt`, sha256 `452fda53…a21d0e`, uuid
+`00e40f03-2f7e-4c1c-8e6d-91ed9062249f`; `docs/downscaler.md`): the same engine with 6 output steps per call. No
+reference data existed for it; everything below was produced here with the original model (anemoi-core at the revision
+the checkpoint pins, `python/reference/requirements-ref-varda-td.lock.txt`; the forecaster's reference venv cannot run
+this pickle, and a later anemoi-models would decode the encoder output instead of the processor's, `docs/cpu.md`).
+
+**Converter.** `$VARDA_SCRATCH/converted/varda-td/model.safetensors`, 1 300 003 628 bytes, sha256 `9b6c6e77…73e9`;
+429 checkpoint tensors, 384 converted, 45 exported or unused (strict accounting); `dec.out_proj` (402, 1024); config
+kind `enc_proc_dec_interpolator`, `times {input [0, 6], target [1..6], 1 h}`, residual step 0, no latent skip, ReLU on
+tp; forcings 5 dynamic + 6 constant. The forecaster and the dev model reconvert whole-file identical (`docs/tools.md`).
+
+**Golden data and tolerances** (`$VARDA_SCRATCH/golden/varda-td/<tag>.safetensors`, input (1, 2, G, 77) with the
+forecaster's recipe, 2 capture runs per tag, all 30 activations bitwise deterministic; `tolerances/varda-td.json` by the
+forecaster's rule, `python/reference/calibrate_tolerances.py`, which reproduces `varda.json` and `dev.json` exactly):
+
+| reference spread | worst key | rel_absmax | forecaster's |
+|---|---|---|---|
+| cuda-fp32-triton vs cpu-fp32-pyg | dec.out / out.pre_bound / out.norm | 5.4e-5 | 3.6e-6 |
+| cuda-fp16-triton vs cpu-fp32-pyg | proc.13.out | 3.6e-2 | 3.5e-3 |
+| out.y, fp32 / fp16 | | 3.8e-7 / 3.1e-4 | |
+
+The downscaler's own reference spreads are about ten times the forecaster's in the late processor layers (activations
+up to 1768 in absmax); the tables follow from them by the same rule, nothing loosened.
+
+**One call, 30 activations** (CPU: EPYC 7713, one job; CUDA: A100-SXM4-80GB, one job; hook inert and the returned `y`
+bitwise equal to `out.y` everywhere; CPU bitwise at 8 and 64 threads; graph on = graph off):
+
+| device / precision | vs | table | worst ratio (key) | out.y rel_absmax |
+|---|---|---|---|---|
+| CPU fp32, 64 threads | cpu-fp32-pyg | cuda-fp32 | 0.367 (proc.10.out) | 3.0e-7 |
+| CUDA fp32 | cpu-fp32-pyg | cuda-fp32 | 0.519 (proc.14.out) | 4.6e-7 |
+| CUDA fp16 | cpu-fp32-pyg | cuda-fp16 | 0.637 (proc.7.out) | 3.3e-4 |
+| CUDA fp16 | cuda-fp16-triton | cuda-fp16-vs-ref-fp16 | 0.758 (proc.10.out) | 3.8e-4 |
+
+Synthetic interpolators g (6 output steps, residual step 0) and h (3 steps, residual −1, latent skip, all boundings):
+CPU ≤ 7.0e-7 (fp32), CUDA ≤ 3.2e-7 (fp32) and ≤ 1.3e-3 (fp16), all within the 1e-5 / 3e-3 rules (`docs/testing.md` §4).
+Forecaster regression: dev and Varda outputs bitwise identical to the previous binary on both backends, timings unchanged.
+
+**Speed, one call** (A100-SXM4-80GB, warm, hook-free, graph on, same job as the forecaster; `docs/cuda.md` §11):
+varda-td fp16 **732 ms** (forecaster 720 ms; +11 ms: output Linear 408 instead of 72 columns, output assembly, denormalise),
+fp32 7524 ms (forecaster 7451 ms). First call 1.25 s. Device memory 25.6 GB fp16, 43.8 GB fp32. The original under
+anemoi-inference on the same model and data: 1.7 s per window warm (fp16 autocast, A100; `docs/downscaler-reference.md`),
+so about 2.3x, measured in different jobs (the bench harness runs one model at a time; a same-job number is not taken).
+
+**The loop against anemoi-inference's `temporal_downscaler` runner** (real forecaster run of 2026-10-22T15, 4 windows
+x 6 hours; references `$VARDA_SCRATCH/downscale/ref/20261022T15/{cpu-fp32,fp32,fp16}`; metric per variable, float64;
+`docs/downscaler.md` §6):
+
+| what | engine | worst variable rel_absmax (max over 24 states) |
+|---|---|---|
+| model on the reference's exact inputs, vs the original CPU fp32 | CPU fp32 / CUDA fp32 / CUDA fp16 | 3.4e-6 / 6.1e-6 / 7.7e-3 |
+| same, vs the original CUDA fp32 | CPU fp32 / CUDA fp32 / CUDA fp16 | 4.8e-6 / 4.3e-6 / 7.7e-3 |
+| same, vs the original CUDA fp16 | CUDA fp16 / CUDA fp32 | 4.6e-3 / 8.2e-3 |
+| full loop, inputs assembled in memory from the forecaster's states | CPU fp32 / CUDA fp32 / CUDA fp16 (vs fp16) | 4.9e-6 / 3.8e-6 / 5.2e-3 |
+| assembled inputs vs the reference's (GRIB-decoded) | | prognostics ≤ 1.2e-7 (1.1e-7 in the fp32 chain; 24-bit packing), forcings and lsm/lat/lon bitwise, z 3.4e-8 |
+
+For scale, the original's own spreads on the same states: CPU fp32 vs CUDA fp32 5.2e-6, fp16 vs fp32 (downscaler only)
+7.3e-3, fp16 vs fp32 (whole chain) 1.04e-2 (`docs/downscaler-reference.md`). The error is flat over the six hours and
+the four windows. Judged with `tolerances/downscale/varda-td.json` (per window and hour, from those spreads by the
+one-step rules): CPU fp32 0.34, CUDA fp32 0.33 (vs cuda fp32) / 0.47 (vs cpu fp32), CUDA fp16 0.85 vs the original's
+fp16 on the same inputs, all 24/24 within; CUDA fp16 vs the original's fp32: 1.02 on one entry (`tp`, window 1 hour 6),
+23/24 within, reported (one fp16 trajectory is not a noise floor, `docs/rollout.md`).
+
+**Real-data forecast with the downscaler** (`varda-forecast --downscaler`, 2026-10-22T15, 24 h, A100-SXM4-80GB,
+32 threads, fp16 graph on; `docs/downscaler.md` §7): the 25 hourly GRIB files against anemoi-inference's: worst message
+`rel_absmax` 1.5e-2 fp16 (the original's own whole-chain fp16-vs-fp32 difference is 1.04e-2), 1.4e-5 fp32; hour 0:
+62 of 66 messages byte-identical (the other 4 differ at re-quantisation level, as the original's own re-encode does);
+two runs byte-identical (2350 messages). Process wall clock
+**17.3 s warm, 18.8 s for the first run in the allocation** with the final binary (the downscaler overlapping the
+rollout, outputs handed to the hourly writer by pointer, file writes overlapping the encoding; `docs/downscaler.md` §7),
+and 63.9 s fp32; 23.3-24.3 s / 73-94 s before those changes. Same job, same
+GPU, the original (the notebook's two anemoi-inference commands): fp16 215-247 s + 192-194 s against 23.7 s for the
+binary of that job, about 17x (about 23x with the final binary's 17.3 s, measured in a later job); fp32 250 s + 217 s
+against 75.3 s, 6.2x (7.3x with the final 63.9 s). The node was shared with another job of ours; the forecaster-only
+136 s vs 8.2 s of section 5 was on an idle node.

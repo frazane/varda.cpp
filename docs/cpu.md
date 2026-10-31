@@ -2,7 +2,10 @@
 
 `varda::make_cpu_backend` (`src/varda/cpu/`): a readable fp32 implementation of
 `predict_step` on OpenMP + OpenBLAS. It mirrors the op sequence of anemoi's GraphTransformer
-with the pyg backend on CPU, and is held to the `cuda-fp32` tolerance table.
+with the pyg backend on CPU, and is held to the `cuda-fp32` tolerance table. It runs both
+models of Varda-single-1.0: the forecaster (`enc_proc_dec`, one output step) and the 1-hourly
+temporal downscaler `varda-td` (`enc_proc_dec_interpolator`, six output steps per call; §1,
+"Temporal downscaler").
 
 | file | contents |
 |---|---|
@@ -23,10 +26,14 @@ x_src  = [xn[t0] | xn[t1] | data attr]                             (G, T*V_in + 
 z      = encoder: src  kv = [k|v](LN_src(emb_src(x_src)))         all G data rows
                   dst  mapper block on emb_dst(hidden attr)        (H, C)
 z      = proc_{n-1}(... proc_0(z)) (+ z if latent_skip)            (H, C)
-dec    = decoder: src  kv = [k|v](LN_src(z));  dst: emb_dst(x_src), block, LN + Linear   (G, V_out)
-y      = dec, + xn[residual_step] on the prognostic outputs; bounding in config order
-Y      = (y - add[norm_output]) / mul[norm_output]                 division, as the reference
+dec    = decoder: src  kv = [k|v](LN_src(z));  dst: emb_dst(x_src), block, LN + Linear   (G, T_out*V_out)
+y_t    = dec[:, t*V_out:(t+1)*V_out], t = 0..T_out-1               time major, "(time vars)"
+y_t    = y_t, + xn[residual_step] on the prognostic outputs; bounding in config order
+Y_t    = (y_t - add[norm_output]) / mul[norm_output]               division, as the reference
 ```
+
+`T_out` = `n_output_steps`: 1 for the forecaster (then this is exactly the single-step pass).
+`predict_step` returns `y` as (1, T_out, 1, G, V_out), step t at `y + t*G*V_out`.
 
 Each block (encoder, every processor block, decoder) is a *source side* (`LN_src`, then `k`
 and `v` into one `[k | v]` row of 2C per source node, so one gather fetches both) and a
@@ -43,6 +50,34 @@ In a processor block `LN_src` is `ln_dst` (one LayerNorm; it is evaluated on the
 side and again on the destination side, with identical results). Everything is read from
 `Config`: sizes, index lists, LayerNorm eps, GELU variant, latent skip, residual step,
 bounding list, and which LayerNorm/Linear biases are `absent`.
+
+### Temporal downscaler (interpolator)
+
+anemoi's `AnemoiModelEncProcDecMultiOutInterpolator` is the forecaster's forward pass with
+these differences, all read from `Config` (`model_kind`, `n_output_steps`, `times`):
+
+- The input slots are the config's `times.input` (Varda downscaler: [0, 6] in hours,
+  `frequency_hours` = 1); `x_src` is `[xn[slot 0] | xn[slot 1] | attr]` exactly as for the
+  forecaster.
+- The decoder's output Linear has `T_out*V_out` rows; `dec.out` is (G, T_out*V_out) with
+  channel `t*V_out + v` (einops `"(time vars)"`).
+- The skip residual is the same normalised input slot `xn[residual_step]` for every output
+  step (anemoi expands it over time; the downscaler's `residual.step` is 0, the first input).
+- Each bounding acts within one output row of `V_out` values, so the `T_out*G` rows of all
+  steps are bounded as one array; a fraction bounding's total is the same step's.
+  De-normalisation uses the output statistics for every step.
+- Contract keys (`docs/format.md` §2): `dec.out` (G, T_out*V_out); `out.pre_bound`, `out.norm`,
+  `out.y` (1, T_out, 1, G, V_out); every other key unchanged.
+- `latent` is the processor output, plus `enc.out` only if `latent_skip` (false for the Varda
+  downscaler). This is the semantics of anemoi-models 0.12.1.post30 (which trained the
+  downscaler, per the checkpoint's provenance) and of the anemoi-core revision of its reference
+  venv. anemoi-models 0.13.1 (post4/post6, the forecaster's reference venvs) instead decodes the
+  *encoder* output when `latent_skip` is false (the processor result is computed and dropped);
+  the forecasters have `latent_skip` true, where both versions agree.
+
+The extra cost is the output layer: `dec.out_proj` has 6 x 67 = 402 rows instead of 67 on
+`varda-td`, 335 C more multiply-adds per data node (about 3% of the decoder's ~11 C² per data
+row), and the decoder output and `y` are 2.7 GB each (G x 402 fp32) instead of 0.45 GB.
 
 ### Attention kernel
 
@@ -108,7 +143,7 @@ kept across calls (buffers with disjoint lifetimes share a name). Varda, C = 102
 | `x_norm`, `x_src` | T·G x V_in, G x 162 | 1.1 + 1.1 |
 | `z`, `latent`, two processor ping-pong buffers, encoder `emb_dst` | 5 x H x C | 3.9 |
 | encoder `emb_src` chunk, decoder `emb_dst` / block-out chunks | 65 536 x C each | 0.8 |
-| decoder output | G x V_out | 0.45 |
+| decoder output | G x T_out·V_out | 0.45 (forecaster), 2.7 (`varda-td`, T_out = 6) |
 
 No per-edge tensor exists (the largest would be E_dec x C = 21 GB); `e_ij` lives in a
 `deg x C` per-thread scratch (at most 64 x 4 KB). The destination side never holds more
@@ -138,8 +173,27 @@ outputs are bitwise equal. One job per model (runs A and C of the speed table).
 |---|---|---|---|
 | dev model | 0.101 (`proc.1.out`, 1.01e-6) | 1.01e-6 | `dec.block_out` 3.36e-6 |
 | Varda | 0.181 (`dec.block_out`, 1.81e-6) | 1.81e-6 | `dec.out` 3.46e-6 |
+| `varda-td` (T_out = 6) | 0.367 (`proc.10.out`, 3.67e-6) | 3.67e-6 at the worst-ratio key (largest absolute value 4.27e-5, `dec.out`, `out.pre_bound`, `out.norm`; tol 1.62e-4, ratio 0.26) | not run |
 
-`in.*`, `enc.x_*` and `enc.emb_dst` (a 4-wide GEMM) are bitwise. The error grows from
+`varda-td` (2026-10-30, CPU node, 64 threads on `-c 64`, `tolerances/varda-td.json` sha256 `39314aea…`): all 30
+contract keys within the `cuda-fp32` table, hooked and hook-free outputs bitwise equal, returned `y` bitwise equal to
+the hooked `out.y` and within its tolerance against the golden (rel_absmax 3.04e-7, max_abs 0.0625 on absmax 2.06e5).
+Per key (rel_absmax / max_abs): `enc.emb_src` 6.50e-7 / 5.72e-6, `enc.out` 8.57e-7 / 4.77e-5, `proc.0..9.out`
+9.9e-7..1.58e-6, `proc.10.out` 3.67e-6 / 5.04e-4 (tol 1e-5, the worst ratio), `proc.11.out` 3.55e-6, `proc.12..15.out`
+3.2e-6..8.2e-6 (tol 2.35e-5..6.38e-5), `latent` = `proc.15.out` 5.39e-6 / 9.52e-3 (`latent_skip` false),
+`dec.emb_dst` 5.69e-7, `dec.block_out` 9.92e-6 / 5.88e-3, `dec.out` 4.27e-5 / 6.90e-3, `out.y` 3.04e-7 / 6.25e-2;
+`in.*`, `enc.x_*`, `enc.emb_dst` bitwise. The reference's own GPU-vs-CPU spread jumps at the same layers
+(`proc.13.out` 2.1e-5, `dec.out` 5.4e-5): this model's late processor layers amplify perturbations more than the
+forecaster's. Hook-free `predict_step` 91.5 s (92.9 s in `varda-run`), peak RSS 30.9 GB (`varda-run`; `varda-parity`
+85 GB with the 49.5 GB golden file mapped). A second job at 8 threads (405 s hook-free) gave the same `max_abs` and
+`rel_absmax` for every key, and its `out.y` (`varda-run --out`) is bitwise equal to the 64-thread one.
+
+Regression of the forecaster path (2026-10-30, same change): on the dev model, `varda-parity` with the new binary at
+64 and 8 threads reproduces every key's `max_abs` and `rel_absmax` of the run behind `docs/results.md` section 2
+exactly, as does the previous binary in the same job; `out.y` from `varda-run` is bitwise equal at 1, 8 and 64 threads
+and to the previous binary's.
+
+For the two forecaster-sized rows above: `in.*`, `enc.x_*` and `enc.emb_dst` (a 4-wide GEMM) are bitwise. The error grows from
 ~2-6e-7 at the embeddings to ~7e-7 through the processor, and peaks in the decoder; it is
 about half the GPU reference's own spread against the CPU reference (`cuda-fp32-triton`
 vs `cpu-fp32-pyg`: 3.6e-6 on both models). Full per-key tables: `varda-parity --report`

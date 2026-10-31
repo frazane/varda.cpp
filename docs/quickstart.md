@@ -19,6 +19,7 @@ The result is a directory of GRIB files, `./varda-out/<YYYYmmddTHH>/outputs/`, p
 | `--lead-time H` | 24 (the HF config's) | hours, a multiple of 6; `48h` and `5d` also work |
 | `--precision fp16\|fp32` | fp16 | fp16 is the checkpoint's precision (`16-mixed`, what anemoi-inference runs) |
 | `--device cuda\|cpu` | cuda | CPU: about 60 s per step (fp32) |
+| `--no-downscaler` | | forecaster only: skip the temporal downscaler even if the bundle holds it (section 1) |
 | `--out DIR` | `./varda-out/<YYYYmmddTHH>` | |
 | `-- ...` | | any further `varda-forecast` option (`docs/forecast.md` section 2), e.g. `-- --allow-nans` |
 
@@ -45,14 +46,20 @@ before it leaves the open-data servers).
    an allocation (`salloc`, `sbatch`). It runs `varda-forecast --assets BUNDLE --realdata INPUTDIR --out DIR`.
 4. Prints the summary from `forecast.json`: files, sizes, the IFS runs used, timings.
 
+When the bundle holds the temporal downscaler (`downscaler.safetensors` + `varda-td-io.json`; `./varda setup` links them from
+the converted files under `$VARDA_SCRATCH` when they exist, and `make_assets.py build` makes them when the download has
+`varda-temporal-downscaler-det-sgm/`; an existing bundle without them is not extended: move it away and run setup again), the run continues with the 1-hourly temporal downscaler as
+the HF notebook's second command does, and writes the hourly LAM files `outputs/varda-single_<dateTime>_<h>.grib`
+(h = 0 .. lead time) next to the 6-hourly ones (`docs/downscaler.md`). `--no-downscaler` runs the forecaster only.
+
 ## 2. Where things go
 
 | what | where | size |
 |---|---|---|
 | build | `build/` (`VARDA_BUILD`) | |
-| assets bundle | `$VARDA_SCRATCH/assets/varda-single-1.0/` (`VARDA_ASSETS`) | 1.35 GB |
+| assets bundle | `$VARDA_SCRATCH/assets/varda-single-1.0/` (`VARDA_ASSETS`) | 1.35 GB (2.65 GB with the downscaler) |
 | input cache, one directory per date | `$VARDA_SCRATCH/inputs/<YYYYmmddTHH>/` (`VARDA_INPUTS`) | about 2.5 GB per date |
-| forecast | `./varda-out/<YYYYmmddTHH>/` (`--out`) | 1.28 GB for 24 h (10 files); about 0.25 GB per further 6 h step |
+| forecast | `./varda-out/<YYYYmmddTHH>/` (`--out`) | 1.28 GB for 24 h (10 files); about 0.25 GB per further 6 h step; with the downscaler, 25 more hourly files of about 170 MB each (4.3 GB for 24 h) |
 
 Nothing is deleted automatically: remove old input dates and outputs yourself.
 
@@ -64,12 +71,15 @@ varda-io.json                       variables, GRIB output keys, template index 
 regrid-ifs0p25-n320.safetensors     MIR's IFS 0.25 deg -> N320 linear matrix (python/export_regrid_matrix.py)
 templates/                          templates/ of the HF repo (ICON and IFS GRIB samples)
 definitions/                        ecCodes definitions of eccodes-cosmo-resources 2.44.0.1 (KENDA short names)
+downscaler.safetensors              optional: the converted temporal downscaler (python/convert.py)
+varda-td-io.json                    optional: its hourly GRIB output (python/export_io_config.py --model temporal_downscaler)
 manifest.json                       sha256 and size of every file, the sources, checkpoint sha256, tool versions
 ```
 
-`varda-forecast --assets DIR` takes the five files from it (an explicit `--model`, `--io-config`,
-`--regrid-matrix`, `--templates` or `--definitions` overrides its entry). `tools/make_assets.py check` verifies a
-bundle.
+`varda-forecast --assets DIR` takes the files from it (an explicit `--model`, `--io-config`,
+`--regrid-matrix`, `--templates`, `--definitions`, `--downscaler` or `--downscaler-io-config` overrides its entry).
+The two downscaler files are present together or not at all (`make_assets.py link --no-downscaler` leaves them out).
+`tools/make_assets.py check` verifies a bundle.
 
 **Input directory** (`python/fetch_inputs.py`; the layout `varda-forecast --realdata` reads, the same as the frozen
 reference cache of `docs/realdata-reference.md`):

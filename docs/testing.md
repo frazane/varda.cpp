@@ -7,7 +7,7 @@ need a compute node (CLAUDE.md, "Compute"); a job copies the binaries it runs to
 
 | suite | what it checks | needs | run |
 |---|---|---|---|
-| ctest (`tests/*.cpp\|cu`) | kernels, GEMM wrapper, forcings, rollout state | CPU; GPU for the `.cu` tests; data for part of `test_forcings` | `cd build-<you> && ctest` |
+| ctest (`tests/*.cpp\|cu`) | kernels, GEMM wrapper, forcings, rollout state, downscaler assembly | CPU; GPU for the `.cu` tests; data for part of `test_forcings` | `cd build-<you> && ctest` |
 | Python tests (`python/tests/test_convert.py`) | converted-file contract, restricted unpickler | `.venv`; converted files (env vars) | see below |
 | `varda-parity` on real golden data | engine vs the anemoi golden data, all contract keys | converted model + golden + `tolerances/<model>.json` | see below |
 | ctest, GRIB layer (`tests/io/*.cpp`) | numpy log, vertical interpolation, input and output building blocks, ecCodes link | ecCodes (`VARDA_GRIB=ON`); data for the real-data parts | `cd build-<you> && ctest` |
@@ -27,12 +27,14 @@ exit 0) when their data or device is missing.
   GELU, normaliser, input/output assembly, every bounding type), fp32 and fp16 storage.
 - `test_forcings`: dynamic forcings bitwise against anemoi's `ComputedForcings` fixtures
   (`$VARDA_SCRATCH/forcings/`), date helpers, thread invariance. Data part skipped if fixtures are missing.
+- `test_downscale`: the temporal downscaler's per-channel assembly table, slot fill, rejected configurations, dates and
+  step hours (no model file; `docs/downscaler.md` §4, section 6 here).
 - `test_rollout`, `test_rollout_cuda`: rollout state update (roll, feedback, forcings, constants) on synthetic
   windows, host and device bitwise equal; dates; config validation. The device test skips without a GPU.
 
 The GRIB layer's tests (`tests/io/*.cpp`, built only when ecCodes is found) are listed in section 5.1.
 
-Measured (build-synth, node with one A100, 2026-10-23): 6/6 passed, 18.5 s total
+Measured (build-synth, node with one A100, 2026-10-23, before `test_downscale` existed): 6/6 passed, 18.5 s total
 (`test_forcings` 12.7 s, others at most 2.7 s).
 
 ## 2. Python tests
@@ -57,6 +59,22 @@ TABLE of `tolerances/<model>.json` (looked up by the model's `source.uuid`, or `
 `--report-only GOLDEN` compares for information. A second, hook-free `predict_step` must reproduce the hooked
 output bitwise. Exit 0 only if all keys are present, finite and within tolerance. Tables: `cuda-fp32` (CPU and CUDA
 fp32 vs `cpu-fp32-pyg`), `cuda-fp16`, `cuda-fp16-vs-ref-fp16`. Recorded results: `docs/results.md` section 2.
+
+The output `y` returned by `predict_step` is checked as well: against the golden `out.y` under the `out.y` tolerance
+(line `(returned y)`, report field `checks[].returned_y`), so the layout of the returned output (step t at
+`y + t*G*V_out`) is verified and not only the hooked tensor. The report also records whether it is bitwise equal to
+the hooked `out.y` (`returned_y_bitwise_out_y`; always on CPU).
+
+The temporal downscaler (`varda-td`, T_out = 6) runs the same way; `dec.out` is (G, 6*V_out) and the `out.*` keys
+are (1, 6, 1, G, V_out). CPU fp32 (a CPU node, `srun $VARDA_SLURM_CPU` or `sbatch`; about 25 GB plus the pages of the
+golden file):
+```
+build-<you>/varda-parity --model $VARDA_SCRATCH/converted/varda-td/model.safetensors \
+    --check $VARDA_SCRATCH/golden/varda-td/cpu-fp32-pyg.safetensors=cuda-fp32 \
+    --device cpu --precision fp32 --threads 64 --report td-64.json
+```
+and again with `--threads 8`: both reports must give the same `max_abs` for every key (the CPU path is bitwise
+independent of the thread count).
 
 ## 4. Synthetic generality suite
 
@@ -108,9 +126,22 @@ and edge counts per destination from 1 to 9 (encoder), 6 (processor), 4 (decoder
 | d | 2048 | 8 x 256 | 512 | 2 | 2 | 4 | 3 | tanh | yes | -1 | as a | same as a |
 | e | 1024 | 16 x 64 | 4096 | 4 | 2 | 4 | 3 | erf | yes | -1 | none | 84/72 with the real index spaces: tp (relu, out 22), tcc (hardtanh 0..1, out 23), fraction on out 4,5,6 with total [23] |
 | f | 256 | 4 x 64 | 640 | 2 | 2 | 2 | 1 | tanh | yes | -1 | none | 5/3: one output each: relu, hardtanh(-0.4, 0.6), fraction(0.05, 0.9; total = the hardtanh output) |
+| g | 512 | 8 x 64 | 1280 | 2 | 2 | 4 | 3 | erf | no | 0 | none | interpolator, T_out = 6: 18/8 with real names (7 prognostic, tp relu-bounded, 5 dynamic + 6 constant forcings, `forcings` section, `grid.latitudes/longitudes`) |
+| h | 256 | 16 x 16 | 760 | 3 | 2 | 3 | 2 | tanh | yes | -1 | as a | interpolator, T_out = 3: same as a; mapper chunks 2 / 3 |
 
-a-d are the reviewer's, e and f were added. Residual index lists are permuted in a-d (input index != output index), `mappers`
-is present in the config of every model.
+a-d are the reviewer's, e and f were added, then g and h for the temporal downscaler. Residual index lists are permuted
+in a-d (input index != output index), `mappers` is present in the config of every model.
+
+g and h are interpolators (`architecture.model.kind` = `enc_proc_dec_interpolator`, `dims.n_output_steps` = T_out,
+config `times`: g `{"input": [0, 6], "target": [1..6], "frequency_hours": 1}`, h `{"input": [0, 3], "target": [1, 2, 3],
+"frequency_hours": 2}`). g mimics the Varda downscaler (residual from input step 0, no latent skip, relu on tp only)
+and carries a `forcings` section (`docs/format.md` section 1.2: dynamic `cos_julian_day`, `cos_local_time`,
+`insolation`, `sin_julian_day`, `sin_local_time`; constant `cos_latitude`, `cos_longitude`, `lsm`, `sin_latitude`,
+`sin_longitude`, `z`; `timestep_hours` 1) and grid coordinates (F64 degrees; node attributes are their sin/cos), so a
+downscaling loop can run on it. h has all three boundings on every step (a fraction's total is the same step's), the
+residual from the last input step and the latent skip. Both use C, head counts and widths inside the CUDA backend's
+limits (C a multiple of 256, head_dim 8·2^k) so they test the multi-step output, not those limits. Adding them left
+the files of a-f byte-identical (checked with `cmp` against the previous generator's output).
 
 ### What the reference does (independent of the engine; follows anemoi's GraphTransformer)
 
@@ -127,6 +158,14 @@ total broadcast, or one per index), then `(y - add) / mul`. Changes made to the 
 normalisation above, the missing keys `in.x`, `in.x_norm` (shape `[1,T,1,G,V]`), `enc.x_dst`, output keys with shape
 `[1,1,1,G,V]`, config `mappers`, uuid, layouts e/f, and I64 tensors written first (the engine's reader requires aligned
 tensors, the safetensors format itself does not).
+
+Interpolator (g, h; anemoi `AnemoiModelEncProcDecMultiOutInterpolator`): the decoder's Linear has T_out·V_out outputs,
+reshaped `"(time vars)"` (channel `t*V_out + v`) to (T_out, G, V_out); the same `x_norm[step]` residual is added to every
+step (anemoi expands the skip over time); boundings act per step with that step's total; `out.*` are
+`[1,T_out,1,G,V]`, `dec.out` is `[G, T_out*V]`. The decoder source is `proc(z) (+ z if latent_skip)`, as in
+anemoi-models 0.12.1, the version that trained the Varda downscaler (`docs/cpu.md` section 1, "Temporal downscaler").
+Negative controls: a golden file with the decoder channels in var-major order fails `dec.out` (rel_absmax 1.5), one with
+output steps 0 and 1 swapped fails `out.*` and the returned-`y` check (0.7-1.0).
 
 ### Tolerances
 
@@ -157,6 +196,13 @@ CPU on its host CPU (EPYC 7713), CUDA on its A100; build-synth, with the CUDA fi
 | d | 5.89e-07 | 5.89e-07 | 7.44e-07 | 7.91e-07 | 7.44e-07 | 1.13e-03 |
 | e | 7.22e-07 | 7.22e-07 | 6.88e-07 | 6.95e-07 | 6.95e-07 | 1.35e-03 |
 | f | 6.43e-07 | 6.43e-07 | 6.43e-07 | 2.99e-07 | 2.99e-07 | 1.23e-03 |
+| g | 5.29e-07 | 5.29e-07 | 5.43e-07 | – | – | – |
+| h | 7.02e-07 | 7.02e-07 | 6.61e-07 | – | – | – |
+
+g and h (CPU only so far): build-td-cpu (CPU-only build), 2026-10-30, `BIN=build-td-cpu tests/run_synthetic.sh cpu` on
+all eight models; worst keys g `out.y` (0.053 of the tolerance; chunk 37: `proc.1.out`), h `dec.out` (0.070; chunk 37:
+`proc.2.out`). The same run reproduced the a-f CPU columns above to the printed digits. Every run passed, hook-free
+output bitwise equal to the hooked output, returned `y` bitwise equal to the hooked `out.y`.
 
 CPU output is bitwise independent of the thread count (the 1 and 8 thread columns agree to the printed digits).
 Note that C = 768 (c) passes on CUDA in this build; on an earlier build it failed.
@@ -256,6 +302,33 @@ reports failures at tolerance 0 (by construction; with `--rel-tol` set to the sc
 verdict). The verdict on the model output is 5.4; `OUT/y.safetensors` (`--dump-y`) must equal the `y` of
 `varda-rollout --out` bitwise (`docs/results.md` section 5). Rerun with the same arguments: the bytes must equal. Jobs copy the
 binaries first (`$VARDA_SCRATCH/jobs/<name>/bin`).
+
+## 6. Temporal downscaler (`varda-td`)
+
+The interpolator's forward pass is covered above: synthetic models g and h (section 4, both backends), `varda-parity`
+on the real golden data (section 3, `tolerances/varda-td.json`), the CUDA output-assembly unit test for T_out = 6
+(`test_cuda_kernels`). The loop and the real-data path (`docs/downscaler.md`):
+
+- `test_io_output` (ctest) also covers the hourly output: the copy rule's glob matching (14 cases against Python's
+  `fnmatchcase`), the downscaler io config (`$VARDA_TD_IO_CONFIG`, default `$VARDA_SCRATCH/realdata/assets/varda-td-io.json`:
+  runner, step order with tp last, the two post-processors, tp's null period) and an end-to-end run on the real templates
+  (66/67 messages, order, tp clamped and accumulated x1000 over the hours, the forecaster's fields at hour 6, an hour
+  without a forecaster state refused).
+- `test_downscale` (ctest, no model file): the per-channel assembly table on tiny name lists (coverage, name mapping,
+  constants from `x0`, forcing columns, window 0 vs window k slots), rejected configurations, dates and step hours.
+- `varda-downscale --smoke --model varda-td.safetensors [--forecaster-model varda.safetensors] [--device cuda --precision fp16]`:
+  a synthetic forecaster drives the loop; the assembled inputs are checked against an independent by-name implementation
+  (bitwise), `run_window` against `run` (bitwise), outputs finite, dates. Runs on the synthetic model g in seconds; on
+  Varda-td on a compute node.
+- `varda-downscale --ref $VARDA_SCRATCH/downscale/ref/20261022T15/<tag>/model_io.safetensors --tolerances
+  tolerances/downscale/varda-td.json [--table T]`: the model on the reference's exact inputs, per window and output step,
+  judged against the per-window, per-hour tolerances (`docs/downscaler.md` §3, §6 (a)); `--forecast y.safetensors --ref ..`
+  (the file `varda-forecast --dump-y` writes, with `x0`): the full loop, inputs assembled in memory, against the
+  reference (§6 (b)).
+- End to end: `varda-forecast --downscaler .. --downscaler-io-config ..` (section 5.5 with the two options) writes the
+  hourly files; `varda-grib-compare OUT/outputs $VARDA_SCRATCH/downscale/ref/20261022T15/<tag>/outputs --rel-tol X`
+  compares them (and the 6-hourly ones, which both directories hold) with anemoi-inference's; a second run with
+  `--require-bytes` against the first checks determinism. Results: `docs/downscaler.md` §6 (loop) and §7 (hourly files), `docs/results.md` section 6.
 
 ## Entrypoint check
 

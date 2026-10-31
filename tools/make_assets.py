@@ -6,7 +6,12 @@
     DIR/regrid-ifs0p25-n320.safetensors   python/export_regrid_matrix.py (MIR's IFS 0.25 deg -> N320 linear matrix)
     DIR/templates/                        templates/ of the HF repo (ICON and IFS GRIB samples)
     DIR/definitions/                      ecCodes definitions of eccodes-cosmo-resources (KENDA-CH1 short names)
+    DIR/downscaler.safetensors            optional: python/convert.py of the temporal downscaler checkpoint
+    DIR/varda-td-io.json                  optional: export_io_config.py --model temporal_downscaler (hourly output)
     DIR/manifest.json                     sha256 and size of every file, sources, checkpoint sha256, tool versions
+
+The two downscaler files are present together or not at all; varda-forecast runs the 1-hourly temporal
+downscaler after the rollout when the bundle has them (docs/downscaler.md).
 
 Subcommands:
     make_assets.py check [--dest DIR]           verify DIR against its manifest (exit 1 with what is missing)
@@ -38,6 +43,15 @@ REPO = Path(__file__).resolve().parent.parent
 NAME = "varda-single-1.0"
 SCHEMA = "varda-assets/1"
 FILES = ("model.safetensors", "varda-io.json", "regrid-ifs0p25-n320.safetensors")
+FILES_TD = ("downscaler.safetensors", "varda-td-io.json")  # optional, both or neither
+
+
+def td_files(d: Path) -> tuple:
+    """The optional downscaler files present in `d` (both), or () ; one without the other is an error."""
+    have = tuple(f for f in FILES_TD if (d / f).exists())
+    if len(have) == 1:
+        fail(f"{d}: {have[0]} without {[f for f in FILES_TD if f not in have][0]} (both or neither)")
+    return have
 TREES = ("templates", "definitions")
 SCRATCH = os.environ.get("VARDA_SCRATCH", "")
 
@@ -136,6 +150,27 @@ def describe(d: Path) -> dict:
     for name, want in io["source"].get("template_sha256", {}).items():
         if sha256(d / "templates" / name) != want:
             fail(f"templates/{name}: sha256 differs from varda-io.json's")
+    if td_files(d):
+        tmeta = safetensors_meta(d / "downscaler.safetensors")
+        tcfg = json.loads(tmeta["config"])
+        if tcfg.get("architecture", {}).get("model", {}).get("kind") != "enc_proc_dec_interpolator":
+            fail(f"{d / 'downscaler.safetensors'} is not a temporal downscaler (interpolator)")
+        if "cutout" not in tmeta:
+            fail(f"{d / 'downscaler.safetensors'} has no cutout masks: convert with the current python/convert.py")
+        tsrc = tcfg.get("source", {})
+        tio = json.loads((d / "varda-td-io.json").read_text())
+        if tio.get("schema") != "varda-io/1" or tio.get("runner") != "temporal_downscaler":
+            fail(f"{d / 'varda-td-io.json'}: not a temporal_downscaler io config")
+        if tio["source"].get("checkpoint_uuid") != tsrc.get("uuid"):
+            fail(f"varda-td-io.json is for checkpoint {tio['source'].get('checkpoint_uuid')}, downscaler is "
+                 f"{tsrc.get('uuid')}")
+        if tcfg.get("variables", {}).get("output") != cfg.get("variables", {}).get("output"):
+            fail("the downscaler's output variables differ from the forecaster's")
+        if tio["source"].get("templates_revision") != io["source"].get("templates_revision"):
+            fail("varda-td-io.json and varda-io.json name different template revisions")
+        out["downscaler"] = {k: tsrc.get(k) for k in ("sha256", "uuid", "size_bytes", "run_id", "checkpoint")}
+        out["downscaler"]["hf_repo"] = "MeteoSwiss/Varda-single-1.0"
+        out["downscaler"]["output_steps"] = tcfg.get("dims", {}).get("n_output_steps")
     out["tools"] = {
         "convert": f"python/convert.py (varda_format {meta.get('varda_format')}, config format "
                    f"{cfg.get('format_version')})",
@@ -149,7 +184,7 @@ def describe(d: Path) -> dict:
 
 def write_manifest(d: Path, sources: dict, how: str, extra: dict | None = None) -> dict:
     files = {}
-    for f in FILES:
+    for f in FILES + td_files(d):
         files[f] = {"sha256": sha256(d / f), "bytes": (d / f).stat().st_size, "source": sources.get(f)}
     for rel in tree_files(d / "templates"):
         files[f"templates/{rel}"] = {"sha256": sha256(d / "templates" / rel), "bytes": (d / "templates" / rel).stat()
@@ -192,9 +227,14 @@ def check(d: Path, quiet: bool = False) -> list[str]:
             bad.append(f"{p}/: missing")
         elif tree_digest(p)["sha256"] != e["sha256"]:
             bad.append(f"{p}/: differs from the manifest")
+    # varda-forecast uses the downscaler files by their presence: they must be in the manifest (verified), not dropped in
+    for f in FILES_TD:
+        if (d / f).exists() and f not in m["files"]:
+            bad.append(f"{d / f}: present but not in the manifest (unverified); rebuild the bundle with make_assets.py link")
     if not bad and not quiet:
+        td = f", downscaler {m['downscaler']['sha256'][:12]}..." if m.get("downscaler") else ", no downscaler"
         print(f"{d}: complete ({len(m['files'])} files + definitions/ ({m['trees']['definitions']['files']} files), "
-              f"checkpoint sha256 {m['checkpoint']['sha256'][:12]}..., created {m['created_utc']})")
+              f"checkpoint sha256 {m['checkpoint']['sha256'][:12]}...{td}, created {m['created_utc']})")
     return bad
 
 
@@ -229,16 +269,29 @@ def cmd_link(a) -> None:
     for k, p in srcs.items():
         if not p.exists():
             fail(f"source for {k} not found: {p} (pass it explicitly, or build from scratch: make_assets.py build)")
+    files = FILES
+    if not a.no_downscaler:
+        td = {"downscaler.safetensors": Path(a.downscaler), "varda-td-io.json": Path(a.downscaler_io_config)}
+        have = [k for k, p in td.items() if p.exists()]
+        if len(have) == 1:
+            fail(f"only {have[0]} found ({td[have[0]]}); the downscaler needs both files (or --no-downscaler)")
+        if have:
+            srcs.update(td)
+            files = FILES + FILES_TD
+        else:
+            print(f"note: no temporal downscaler ({td['downscaler.safetensors']}): bundle without it "
+                  "(python/convert.py of varda-temporal-downscaler-det-sgm/model.ckpt and export_io_config.py "
+                  "--model temporal_downscaler add it)")
     work = dest.with_name(f"{dest.name}.partial-{os.getpid()}")
     work.mkdir(parents=True)
     how = set()
-    for f in FILES:
+    for f in files:
         how.add(place(srcs[f], work / f, a.copy))
     for t in TREES:
         for rel in tree_files(srcs[t]):
             how.add(place(srcs[t] / rel, work / t / rel, a.copy))
     # verify: every placed file equals its source, byte for byte (sha256)
-    for f in FILES:
+    for f in files:
         if sha256(work / f) != sha256(srcs[f]):
             fail(f"{work / f}: sha256 differs from {srcs[f]}")
     for t in TREES:
@@ -308,6 +361,16 @@ def cmd_build(a) -> None:
     run([a.py, "-I", REPO / "python/convert.py", ckpt, work / "model.safetensors"])
     # 2. I/O configuration (reference env: anemoi-inference reads the checkpoint metadata from the zip)
     run([a.ref_py, "-I", REPO / "python/export_io_config.py", "--hf", hf, "--out", work / "varda-io.json"])
+    # 1b/2b. the temporal downscaler, when the download has it (and --no-downscaler is not given)
+    td_ckpt = hf / "varda-temporal-downscaler-det-sgm" / "model.ckpt"
+    td_sources = {}
+    if td_ckpt.exists() and not a.no_downscaler:
+        run([a.py, "-I", REPO / "python/convert.py", td_ckpt, work / "downscaler.safetensors"])
+        run([a.ref_py, "-I", REPO / "python/export_io_config.py", "--hf", hf, "--model", "temporal_downscaler",
+             "--out", work / "varda-td-io.json"])
+        td_sources = {"downscaler.safetensors": str(td_ckpt), "varda-td-io.json": str(hf)}
+    elif not a.no_downscaler:
+        print(f"note: {td_ckpt} not found: bundle without the temporal downscaler")
     # 3. MIR's interpolation matrix: one MIR call on a real open-data message fills a private MIR cache with
     #    the .mat (the layout export_regrid_matrix.py reads from a run directory), then export it
     mirrun = work / "tmp" / "mir-run"
@@ -330,7 +393,7 @@ def cmd_build(a) -> None:
     shutil.rmtree(work / "tmp")  # created above by this run
     write_manifest(work, {"model.safetensors": str(ckpt), "varda-io.json": str(hf),
                           "regrid-ifs0p25-n320.safetensors": f"MIR on {grib}", "templates": str(hf / "templates"),
-                          "definitions": defs}, "build",
+                          "definitions": defs, **td_sources}, "build",
                    {"definitions_package": ver})
     finish(work, dest)
 
@@ -350,9 +413,14 @@ def main() -> None:
     ln.add_argument("--templates", default=f"{s}hf/templates")
     ln.add_argument("--definitions", default=os.environ.get("VARDA_COSMO_DEFINITIONS")
                     or f"{s}deps/eccodes-cosmo-resources-2.44.0.1/definitions")
+    ln.add_argument("--downscaler", default=f"{s}converted/varda-td/model.safetensors")
+    ln.add_argument("--downscaler-io-config", default=f"{s}realdata/assets/varda-td-io.json")
+    ln.add_argument("--no-downscaler", action="store_true", help="bundle without the temporal downscaler")
     ln.add_argument("--copy", action="store_true", help="copy instead of hard-linking")
     b = sub.add_parser("build")
-    b.add_argument("--hf", required=True, help="HF download of Varda-single-1.0 (varda-forecaster-det-sgm/, templates/)")
+    b.add_argument("--no-downscaler", action="store_true", help="skip the temporal downscaler even if downloaded")
+    b.add_argument("--hf", required=True, help="HF download of Varda-single-1.0 (varda-forecaster-det-sgm/, templates/, "
+                                               "optionally varda-temporal-downscaler-det-sgm/)")
     b.add_argument("--dest", default=default_dest())
     b.add_argument("--grib", help="an IFS 0.25 deg open-data GRIB2 file (geometry of the regrid source)")
     b.add_argument("--py", default=str(REPO / ".venv/bin/python"), help="python with torch + numpy (converter)")

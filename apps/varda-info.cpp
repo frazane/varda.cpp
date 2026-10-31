@@ -19,13 +19,28 @@ int main(int argc, char** argv) {
         varda::Config c = varda::parse_config(f.metadata("config"));
         std::printf("checkpoint  %s\nuuid        %s\nrun_id      %s\nsha256      %s\n",
                     c.checkpoint.c_str(), c.uuid.c_str(), c.run_id.c_str(), c.sha256.c_str());
-        std::printf("dims        C=%d heads=%d x %d mlp=%d proc_layers=%d T_in=%d\n", c.num_channels,
-                    c.num_heads, c.head_dim, c.mlp_hidden, c.num_processor_layers, c.n_input_steps);
+        std::printf("kind        %s\n", c.model_kind.c_str());
+        std::printf("dims        C=%d heads=%d x %d mlp=%d proc_layers=%d T_in=%d T_out=%d latent_skip=%s\n",
+                    c.num_channels, c.num_heads, c.head_dim, c.mlp_hidden, c.num_processor_layers, c.n_input_steps,
+                    c.n_output_steps, c.latent_skip ? "yes" : "no");
+        if (c.is_interpolator()) {
+            auto list = [](const std::vector<int>& v) {
+                std::string s;
+                for (size_t i = 0; i < v.size(); ++i) s += (i ? "," : "") + std::to_string(v[i]);
+                return s;
+            };
+            std::printf("times       input [%s] target [%s] (x %d h)\n", list(c.input_times).c_str(),
+                        list(c.output_times).c_str(), c.frequency_hours);
+        }
+        std::printf("residual    skip from input step %d\n", c.residual_step);
         std::printf("vars        data=%d input=%d output=%d prognostic=%zu\n", c.n_data_vars,
                     c.n_input_vars, c.n_output_vars, c.residual_input.size());
         std::printf("nodes       data=%lld hidden=%lld\n", (long long)c.n_data_nodes,
                     (long long)c.n_hidden_nodes);
         for (const auto& b : c.bounding) std::printf("bounding    %s (%zu vars)\n", b.type.c_str(), b.index.size());
+        if (c.has_forcings)
+            std::printf("forcings    dynamic=%zu constant=%zu timestep=%d h\n", c.forcing_dynamic.size(),
+                        c.forcing_constant.size(), c.timestep_hours);
         std::printf("mappers     enc chunks=%d dec chunks=%d\n", c.enc_chunks, c.dec_chunks);
         const char* gname[] = {"enc", "proc", "dec"};
         const int64_t nsrc[] = {c.n_data_nodes, c.n_hidden_nodes, c.n_hidden_nodes};

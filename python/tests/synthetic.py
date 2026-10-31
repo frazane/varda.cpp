@@ -33,6 +33,13 @@ softmax in float64):
   * residual: y[out_idx] += x_norm[step][in_idx] (fp32 normalised input); then bounding in
     config order (a fraction bounding uses the already bounded total); then
     out.y = (y - add) / mul in the output gather.
+  * interpolator (anemoi AnemoiModelEncProcDecMultiOutInterpolator, configs g and h; model kind
+    "enc_proc_dec_interpolator", T_out = dims.n_output_steps): the decoder's Linear has T_out*V_out
+    outputs, channel t*V_out + v ("(time vars)", time major); every output step t gets the same
+    residual x_norm[step] (anemoi expands the skip over time), then the boundings per step (a
+    fraction's total is the same step's), then the de-normalisation. dec.out is (G, T_out*V_out),
+    out.* are (1, T_out, 1, G, V_out). The decoder source is processor(z) (+ z if latent_skip), as
+    in anemoi-models 0.12 which trained the Varda downscaler.
 """
 import argparse
 import hashlib
@@ -133,11 +140,35 @@ def layout_mini(_):
         ])
 
 
-LAYOUTS = {"small": layout_small, "real": layout_real, "mini": layout_mini}
+def layout_td(_):
+    """Downscaler-like: 7 prognostic variables, the diagnostic tp (output only, relu), and the forcing inputs
+    of the Varda downscaler (5 dynamic computed forcings, 6 constant: computed ones plus lsm and z), with real
+    names (so a downscaling loop can compute the forcings) in sorted order. V_data 19, V_in 18, V_out 8."""
+    prog = ["10u", "10v", "2t", "msl", "q_850", "sp", "t_850"]
+    dyn = ["cos_julian_day", "cos_local_time", "insolation", "sin_julian_day", "sin_local_time"]
+    const = ["cos_latitude", "cos_longitude", "lsm", "sin_latitude", "sin_longitude", "z"]
+    names = sorted(prog + dyn + const + ["tp"])
+    norm_input = [i for i, n in enumerate(names) if n != "tp"]
+    norm_output = [i for i, n in enumerate(names) if n in prog or n == "tp"]
+    inp, out = [names[i] for i in norm_input], [names[i] for i in norm_output]
+    return dict(
+        Vd=len(names), Vi=len(inp), Vo=len(out), names=names, norm_input=norm_input, norm_output=norm_output,
+        res_in=[inp.index(n) for n in prog], res_out=[out.index(n) for n in prog],
+        bounding=[{"type": "relu", "index": [out.index("tp")]}],
+        forcings={"dynamic": dyn, "dynamic_input_index": [inp.index(n) for n in dyn],
+                  "constant": const, "constant_input_index": [inp.index(n) for n in const],
+                  "timestep_hours": 1, "source": "python/tests/synthetic.py layout_td"})
+
+
+LAYOUTS = {"small": layout_small, "real": layout_real, "mini": layout_mini, "td": layout_td}
 
 # C, heads, mlp, n_proc, T (n_input_steps), A (node_attr_dim), Ae (edge_attr_dim), G data nodes,
 # H hidden nodes. a-d are the reviewer's configurations; e mimics the real envelope at tiny node
-# counts; f has T=2 and one output variable per bounding type.
+# counts; f has T=2 and one output variable per bounding type. g and h are interpolators (temporal
+# downscalers): T_out output steps per call, config `times`; g mimics the Varda downscaler (residual
+# from input step 0, no latent skip, relu on tp, a forcings section and grid coordinates), h has all
+# three boundings, residual from the last input step, latent skip and other mapper chunk counts.
+# Optional keys (absent from a-f, whose files must stay byte-identical): T_out, times, chunks, latlon.
 CONFIGS = {
     "a": dict(seed=1, C=256, heads=32, mlp=520, n_proc=1, T=3, A=3, Ae=2, gelu="tanh", latent_skip=True,
               res_step=-2, absent_kind=True, layout="small", G=300, H=70),
@@ -151,6 +182,12 @@ CONFIGS = {
               res_step=-1, absent_kind=False, layout="real", G=301, H=67),
     "f": dict(seed=6, C=256, heads=4, mlp=640, n_proc=2, T=2, A=2, Ae=1, gelu="tanh", latent_skip=True,
               res_step=-1, absent_kind=False, layout="mini", G=173, H=41),
+    "g": dict(seed=7, C=512, heads=8, mlp=1280, n_proc=2, T=2, A=4, Ae=3, gelu="none", latent_skip=False,
+              res_step=0, absent_kind=False, layout="td", G=257, H=53, T_out=6,
+              times={"input": [0, 6], "target": [1, 2, 3, 4, 5, 6], "frequency_hours": 1}, latlon=True),
+    "h": dict(seed=8, C=256, heads=16, mlp=760, n_proc=3, T=2, A=3, Ae=2, gelu="tanh", latent_skip=True,
+              res_step=-1, absent_kind=True, layout="small", G=211, H=47, T_out=3,
+              times={"input": [0, 3], "target": [1, 2, 3], "frequency_hours": 2}, chunks=(2, 3)),
 }
 
 
@@ -192,12 +229,14 @@ def tolerance_file(name):
 
 
 # ---------------------------------------------------------------- model generation
-def make(seed, C, heads, mlp, n_proc, T, A, Ae, gelu, latent_skip, res_step, absent_kind, layout, G, H):
+def make(seed, C, heads, mlp, n_proc, T, A, Ae, gelu, latent_skip, res_step, absent_kind, layout, G, H,
+         T_out=1, times=None, chunks=(4, 4), latlon=False):
     rng = np.random.default_rng(seed)
     hd = C // heads
     L = LAYOUTS[layout](None)
     Vd, Vi, Vo = L["Vd"], L["Vi"], L["Vo"]
-    var_data = [f"v{i}" for i in range(Vd)]
+    assert times is not None or T_out == 1, "T_out > 1 needs the interpolator kind (times)"
+    var_data = L.get("names") or [f"v{i}" for i in range(Vd)]
     norm_input, norm_output = L["norm_input"], L["norm_output"]
     t = {}
     t["norm.mul"] = rng.uniform(0.5, 2, Vd).astype(np.float32)
@@ -250,7 +289,7 @@ def make(seed, C, heads, mlp, n_proc, T, A, Ae, gelu, latent_skip, res_step, abs
     lin("enc.emb_dst", C, A)
     lin("dec.emb_dst", C, F)
     ln("dec.out_norm")
-    lin("dec.out_proj", Vo, C)
+    lin("dec.out_proj", T_out * Vo, C)  # channel t*Vo + v (time major)
     for b in blocks:
         for l in ["q", "k", "v", "self", "proj"]:
             lin(f"{b}.{l}", C, C)
@@ -265,13 +304,13 @@ def make(seed, C, heads, mlp, n_proc, T, A, Ae, gelu, latent_skip, res_step, abs
         "format_version": 3,
         "source": {"checkpoint": "synthetic", "uuid": None},  # filled by the caller
         "architecture": {
-            "model": {"kind": "enc_proc_dec"},
+            "model": {"kind": "enc_proc_dec" if times is None else "enc_proc_dec_interpolator"},
             "encoder": {"kind": "graph_transformer_forward_mapper"},
             "processor": {"kind": "graph_transformer_processor"},
             "decoder": {"kind": "graph_transformer_backward_mapper"}},
         "dims": {
             "num_channels": C, "num_heads": heads, "head_dim": hd, "mlp_hidden": mlp,
-            "num_processor_layers": n_proc, "n_input_steps": T, "n_output_steps": 1,
+            "num_processor_layers": n_proc, "n_input_steps": T, "n_output_steps": T_out,
             "n_data_vars": Vd, "n_input_vars": Vi, "n_output_vars": Vo,
             "n_data_nodes": G, "n_hidden_nodes": H, "node_attr_dim": A, "edge_attr_dim": Ae,
             "layer_norm_eps": 1e-5, "gelu_approximate": gelu, "latent_skip": latent_skip},
@@ -281,13 +320,26 @@ def make(seed, C, heads, mlp, n_proc, T, A, Ae, gelu, latent_skip, res_step, abs
                     "residual_input": L["res_in"], "residual_output": L["res_out"]},
         "residual": {"type": "skip", "step": res_step},
         "bounding": L["bounding"],
-        "mappers": {"enc": {"num_chunks": 4}, "dec": {"num_chunks": 4}},
+        "mappers": {"enc": {"num_chunks": chunks[0]}, "dec": {"num_chunks": chunks[1]}},
         "blocks": {b: {"kind": "graph_transformer_mapper_block" if b in ("enc.block", "dec.block")
                        else "graph_transformer_processor_block"} for b in blocks},
         "absent": absent,
         "unused": [],
     }
+    if times is not None:
+        cfg["times"] = times
+    if "forcings" in L:
+        cfg["forcings"] = L["forcings"]
     x = rng.normal(0, 1, (1, T, G, Vi)).astype(np.float32)
+    if latlon:
+        # Grid coordinates (F64 degrees, docs/format.md section 1.1) for computed forcings; node attributes
+        # [sin lat, cos lat, sin lon, cos lon] of them, rounded to F32.
+        lat = rng.uniform(-80, 80, G)
+        lon = rng.uniform(-180, 180, G)
+        t["grid.latitudes"], t["grid.longitudes"] = lat, lon
+        assert A == 4
+        la, lo = np.deg2rad(lat), np.deg2rad(lon)
+        t["nodes.data.attr"] = np.stack([np.sin(la), np.cos(la), np.sin(lo), np.cos(lo)], -1).astype(np.float32)
     return cfg, t, x
 
 
@@ -366,22 +418,25 @@ def reference(cfg, t, x):
     acts["dec.emb_dst"] = dd
     bo = block("dec.block", "dec", lat, dd, True)  # decoder src = latent, not embedded
     acts["dec.block_out"] = bo
-    y = lin("dec.out_proj", ln("dec.out_norm", bo))
+    y = lin("dec.out_proj", ln("dec.out_norm", bo))  # (G, T_out*Vo), channel t*Vo + v
     acts["dec.out"] = y.copy()
+    T_out = d["n_output_steps"]
+    Gn, Vo = y.shape[0], y.shape[1] // T_out
+    y = y.reshape(Gn, T_out, Vo).transpose(1, 0, 2).copy()  # "(time vars)" -> (T_out, G, Vo)
     step = cfg["residual"]["step"]
     for ri, ro in zip(cfg["indices"]["residual_input"], cfg["indices"]["residual_output"]):
-        y[:, ro] += xn[0, step][:, ri]
-    y_oshape = (1, 1, 1) + y.shape
+        y[..., ro] += xn[0, step][:, ri]  # the same input step for every output step
+    y_oshape = (1, T_out, 1, Gn, Vo)
     acts["out.pre_bound"] = y.copy().reshape(y_oshape)
-    for bd in cfg["bounding"]:  # config order
+    for bd in cfg["bounding"]:  # config order, every output step
         idx = bd["index"]
         if bd["type"] == "relu":
-            y[:, idx] = np.maximum(y[:, idx], 0)
+            y[..., idx] = np.maximum(y[..., idx], 0)
         else:
-            c = np.clip(y[:, idx], bd["min"], bd["max"])
+            c = np.clip(y[..., idx], bd["min"], bd["max"])
             if bd["type"] == "fraction":
-                c = c * y[:, bd["total_index"]]  # total broadcasts if it is a single index; already bounded
-            y[:, idx] = c
+                c = c * y[..., bd["total_index"]]  # same step's total, broadcast if single; already bounded
+            y[..., idx] = c
     acts["out.norm"] = y.copy().reshape(y_oshape)
     acts["out.y"] = ((y - W("norm.add")[no]) / W("norm.mul")[no]).reshape(y_oshape)
     return acts
@@ -416,7 +471,8 @@ def generate(name, out):
             "checkpoint_uuid": uuid_of(name)}
     write_st(f"{out}/{name}.golden.safetensors", gold, meta)
     absmax = max(float(np.abs(gold[k]).max()) for k in keys)
-    print(f"wrote {name}: C={c['C']} heads={c['heads']} n_proc={n_proc} T={c['T']} G={c['G']} H={c['H']} "
+    print(f"wrote {name}: C={c['C']} heads={c['heads']} n_proc={n_proc} T={c['T']} T_out={c.get('T_out', 1)} "
+          f"G={c['G']} H={c['H']} "
           f"absent={len(cfg['absent'])} keys={len(keys)} max|act|={absmax:.3g}", flush=True)
 
 

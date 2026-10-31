@@ -30,6 +30,14 @@ struct Config {
     // dims
     int num_channels = 0, num_heads = 0, head_dim = 0, mlp_hidden = 0;
     int num_processor_layers = 0, n_input_steps = 0, n_output_steps = 0;
+    // architecture.model.kind: "enc_proc_dec" (forecaster: one output step) or
+    // "enc_proc_dec_interpolator" (temporal downscaler: n_output_steps outputs per call).
+    std::string model_kind;
+    // Interpolator only (config `times`): relative time indices of the input slots and of the
+    // output steps, in units of `frequency_hours` (Varda downscaler: input [0, 6], output
+    // [1..6], 1 h). Empty for the forecaster.
+    std::vector<int> input_times, output_times;
+    int frequency_hours = 0;
     int n_data_vars = 0, n_input_vars = 0, n_output_vars = 0;
     int64_t n_data_nodes = 0, n_hidden_nodes = 0;
     int node_attr_dim = 0, edge_attr_dim = 0;
@@ -58,6 +66,10 @@ struct Config {
 
     // Encoder source features: n_input_steps * n_input_vars + node_attr_dim.
     int src_features() const { return n_input_steps * n_input_vars + node_attr_dim; }
+    bool is_interpolator() const { return model_kind == "enc_proc_dec_interpolator"; }
+    // Decoder output width: n_output_steps * n_output_vars, channel t * n_output_vars + v
+    // (anemoi's "(time vars)" layout).
+    int dec_out_features() const { return n_output_steps * n_output_vars; }
     bool is_absent(const std::string& name) const;
 };
 

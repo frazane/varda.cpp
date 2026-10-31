@@ -1,4 +1,4 @@
-"""Export the real-data I/O configuration of the Varda forecaster as one JSON file.
+"""Export the real-data I/O configuration of the Varda forecaster, or of the temporal downscaler, as one JSON file.
 
 The C++ engine must not parse YAML or read the checkpoint pickle. This tool reads, once:
   * the checkpoint metadata, from the zip (anemoi-inference's own `Checkpoint` class; nothing is
@@ -11,6 +11,8 @@ does not understand is an error, never a silent default.
 Run in the reference environment (it has anemoi-inference, yaml, eccodes):
     $VARDA_SCRATCH/ref-oper/.venv/bin/python -I python/export_io_config.py \
         [--hf $VARDA_SCRATCH/hf] [--out $VARDA_SCRATCH/realdata/assets/varda-io.json]
+    $VARDA_SCRATCH/ref-oper/.venv/bin/python -I python/export_io_config.py --model temporal_downscaler \
+        [--out $VARDA_SCRATCH/realdata/assets/varda-td-io.json]        # the hourly output (docs/downscaler.md)
 Tools only: never imported by src/, apps/ or tests/.
 """
 
@@ -34,13 +36,19 @@ VARDA_SCRATCH = os.environ.get("VARDA_SCRATCH", "")  # only for the defaults of 
 KNOWN_TOP = {
     "checkpoint", "lead_time", "constant_forcings", "input", "post_processors", "output",
     "verbosity", "allow_nans", "write_initial_state", "patch_metadata",
+    "runner", "output_frequency",  # temporal downscaler config
+}
+MODELS = {
+    "forecaster": {"dir": "varda-forecaster-det-sgm", "runner": "forecaster", "out": "varda-io.json"},
+    "temporal_downscaler": {"dir": "varda-temporal-downscaler-det-sgm", "runner": "temporal_downscaler",
+                            "out": "varda-td-io.json"},
 }
 # mars keys a model variable may carry (anything else would change the encoded keys, see
 # anemoi/inference/grib/encoding.py:grib_keys, and is not implemented in the C++).
 MARS_KEYS = {"date", "time", "step", "param", "levtype", "levelist"}
 # keys a template-index match may use (the C++ builds exactly these lookup entries).
 MATCH_KEYS = {"levtype", "param", "levelist", "name", "time_processing"}
-GRIB_OUTPUT_KEYS = {"path", "encoding", "templates", "post_processors", "modifiers"}
+GRIB_OUTPUT_KEYS = {"path", "encoding", "templates", "post_processors", "modifiers", "negative_step_mode"}
 
 
 def fail(msg: str):
@@ -85,8 +93,33 @@ def convert_post_processor(p, where: str) -> dict:
         return {"type": "accumulate_from_start_of_forecast", "accumulations": list(arg["accumulations"]),
                 "allow_negative": bool(arg.get("allow_negative", False))}
     if kind == "forward_transform_filter":
+        if isinstance(arg, dict) and len(arg) == 1 and "copy-prognostic-from-forecaster" in arg:
+            # anemoi-plugins-meteoswiss CopyPrognosticFromForecaster (docs/downscaler.md): at the output steps
+            # that are positive multiples of common_leadtime, the selected fields take the forecaster's values.
+            # The C++ takes them from the forecaster's state in memory, so the GRIB glob is checked, not kept.
+            c = arg["copy-prognostic-from-forecaster"]
+            extra = set(c) - {"forecaster_path", "common_leadtime", "params_to_keep", "params_to_copy", "namer"}
+            if extra:
+                fail(f"{where}: copy-prognostic-from-forecaster: unknown keys {sorted(extra)}")
+            if c.get("forecaster_path") != "outputs/20*.grib":
+                fail(f"{where}: copy-prognostic-from-forecaster: forecaster_path {c.get('forecaster_path')!r} is "
+                     "not the forecaster's lam output (outputs/20*.grib)")
+            from anemoi.utils.dates import as_timedelta
+            out = {"type": "copy_prognostic_from_forecaster",
+                   "common_leadtime_hours": hours(as_timedelta(c["common_leadtime"]), f"{where}: common_leadtime")}
+            if ("params_to_keep" in c) == ("params_to_copy" in c):
+                fail(f"{where}: copy-prognostic-from-forecaster: exactly one of params_to_keep / params_to_copy")
+            for k in ("params_to_keep", "params_to_copy"):
+                if k in c:
+                    if not (isinstance(c[k], list) and c[k] and all(isinstance(x, str) for x in c[k])):
+                        fail(f"{where}: copy-prognostic-from-forecaster: {k} must be a non-empty list of names")
+                    if any("[" in x for x in c[k]):
+                        fail(f"{where}: copy-prognostic-from-forecaster: glob character classes not implemented")
+                    out[k] = list(c[k])
+            return out
         if not (isinstance(arg, dict) and len(arg) == 1 and "rescale" in arg):
-            fail(f"{where}: forward_transform_filter: only `rescale` is implemented, got {arg!r}")
+            fail(f"{where}: forward_transform_filter: only `rescale` and `copy-prognostic-from-forecaster` are "
+                 f"implemented, got {arg!r}")
         r = arg["rescale"]
         if set(r) != {"scale", "offset", "param"}:
             fail(f"{where}: rescale keys must be scale, offset, param, got {sorted(r)}")
@@ -186,25 +219,47 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--hf", default=f"{VARDA_SCRATCH}/hf" if VARDA_SCRATCH else None,
                     required=not VARDA_SCRATCH)
-    ap.add_argument("--out", default=f"{VARDA_SCRATCH}/realdata/assets/varda-io.json" if VARDA_SCRATCH else None,
-                    required=not VARDA_SCRATCH)
+    ap.add_argument("--model", default="forecaster", choices=sorted(MODELS))
+    ap.add_argument("--out", default=None, help="default: $VARDA_SCRATCH/realdata/assets/<varda-io|varda-td-io>.json")
     a = ap.parse_args()
+    model = MODELS[a.model]
+    if a.out is None:
+        if not VARDA_SCRATCH:
+            fail("--out is required without VARDA_SCRATCH")
+        a.out = f"{VARDA_SCRATCH}/realdata/assets/{model['out']}"
     hf = Path(a.hf)
-    cfg_path = hf / "varda-forecaster-det-sgm/configs/inference/inference_opendata.yaml"
-    patch_path = hf / "varda-forecaster-det-sgm/metadata.yaml"
-    ckpt_path = hf / "varda-forecaster-det-sgm/model.ckpt"
+    mdir = model["dir"]
+    cfg_path = hf / mdir / "configs/inference/inference_opendata.yaml"
+    patch_path = hf / mdir / "metadata.yaml"
+    ckpt_path = hf / mdir / "model.ckpt"
     for p in (cfg_path, patch_path, ckpt_path, hf / "templates/REVISION.json"):
         if not p.is_file():
             fail(f"{p} not found")
+    downscaler = model["runner"] == "temporal_downscaler"
 
     cfg = yaml.safe_load(cfg_path.read_text())
     patch = yaml.safe_load(patch_path.read_text())
     if set(cfg) - KNOWN_TOP:
         fail(f"inference config has unknown top-level keys {sorted(set(cfg) - KNOWN_TOP)}")
-    if cfg.get("patch_metadata") != "varda-forecaster-det-sgm/metadata.yaml":
+    if cfg.get("patch_metadata") != f"{mdir}/metadata.yaml":
         fail("patch_metadata is not the expected file")
-    if cfg.get("allow_nans") is not True or cfg.get("write_initial_state") is not True:
-        fail("this exporter encodes allow_nans: true and write_initial_state: true (NaN bitmap path, step 0)")
+    if downscaler:
+        runner = cfg.get("runner")
+        if not (isinstance(runner, dict) and list(runner) == ["parallel"]
+                and runner["parallel"].get("base_runner") == "temporal_downscaler"):
+            fail(f"runner {runner!r}: expected parallel with base_runner temporal_downscaler")
+        if cfg.get("output_frequency") != "1h":
+            fail(f"output_frequency {cfg.get('output_frequency')!r} not understood (expected 1h)")
+        if "constant_forcings" in cfg:
+            fail("a constant_forcings section in the downscaler config is not implemented (the C++ takes the "
+                 "constants from the forecaster's input)")
+        if cfg.get("write_initial_state", True) is not True:
+            fail("write_initial_state must be true (default)")
+    elif "runner" in cfg or "output_frequency" in cfg:
+        fail("runner / output_frequency are only understood in the temporal downscaler config")
+    if cfg.get("allow_nans") is not True or cfg.get("write_initial_state", downscaler) is not True:
+        fail("this exporter encodes allow_nans: true and write_initial_state: true (NaN bitmap path, step 0; the "
+             "downscaler config leaves write_initial_state at its default, true)")
     lead = cfg["lead_time"]
     if lead != "1d":
         fail(f"lead_time {lead!r} not understood")
@@ -239,11 +294,17 @@ def main() -> None:
         period = None
         if process is not None:
             per = md.get("period")
-            if not (isinstance(per, list) and len(per) == 2):
-                fail(f"variable {name}: accumulation without a [start, end] period")
-            period = hours(as_timedelta(per[1]) - as_timedelta(per[0]), f"{name}.period")
-            if typed[name].period is None:
-                fail(f"variable {name}: reference sees no period")
+            if isinstance(per, list) and len(per) == 1:
+                # the downscaler's patch gives `period: [1h]`: anemoi's Variable then has period None, and the
+                # start step of the accumulation comes from the accumulate post-processor alone (0)
+                if typed[name].period is not None:
+                    fail(f"variable {name}: one-element period but the reference sees {typed[name].period}")
+            else:
+                if not (isinstance(per, list) and len(per) == 2):
+                    fail(f"variable {name}: accumulation without a [start, end] period")
+                period = hours(as_timedelta(per[1]) - as_timedelta(per[0]), f"{name}.period")
+                if typed[name].period is None:
+                    fail(f"variable {name}: reference sees no period")
         extra = set(md) - {"mars", "constant_in_time", "computed_forcing", "process", "period"}
         if extra:
             fail(f"variable {name}: metadata keys {sorted(extra)} not understood")
@@ -261,27 +322,42 @@ def main() -> None:
         if name not in vm or "mars" not in vm[name]:
             fail(f"model output {name} has no patched mars entry")
 
-    prog = m.select_variables(include=["prognostic"], exclude=["computed", "diagnostic", "forcing"],
-                              has_mars_requests=True)
-    consts = m.select_variables(include=["constant+forcing"], exclude=["computed", "diagnostic", "prognostic"],
-                                has_mars_requests=True)
-    if len(prog) != 66 or consts != ["z", "lsm", "slor", "sdor"]:
-        fail(f"unexpected initial-state variable sets: {len(prog)} prognostics, constants {consts}")
+    if downscaler:
+        # The runner's initial state (temporal_downscaler.py, forecast(): the first input slot's variables
+        # that are also outputs, in input-tensor index order): 66 prognostics, no constants, no tp.
+        in_index = m.variable_to_input_tensor_index
+        outs = set(output_names)
+        prog = [v for v, i in sorted(in_index.items(), key=lambda kv: kv[1]) if v in outs]
+        consts = []
+        if len(prog) != 66 or len(output_names) != 67:
+            fail(f"unexpected downscaler variable sets: {len(prog)} initial-state fields, {len(output_names)} outputs")
+        ts = hours(m.timestep, "timestep")
+        if ts != 1:
+            fail(f"downscaler timestep {ts} h: expected 1 h")
+    else:
+        prog = m.select_variables(include=["prognostic"], exclude=["computed", "diagnostic", "forcing"],
+                                  has_mars_requests=True)
+        consts = m.select_variables(include=["constant+forcing"], exclude=["computed", "diagnostic", "prognostic"],
+                                    has_mars_requests=True)
+        if len(prog) != 66 or consts != ["z", "lsm", "slor", "sdor"]:
+            fail(f"unexpected initial-state variable sets: {len(prog)} prognostics, constants {consts}")
     if m.grid != "N320":
         fail(f"unexpected grid {m.grid!r}")
 
-    # ---- KENDA namer (identical in constant_forcings and input) ----
+    # ---- KENDA namer (identical in constant_forcings and input); the downscaler reads the forecaster's
+    # GRIB files (source `grib`) with the same kind of namer ----
     def kenda_namer(section: str) -> dict:
         lam = [d for d in cfg[section]["cutout"] if "lam_0" in d]
         if len(lam) != 1:
             fail(f"{section}: expected exactly one lam_0 source")
         src = lam[0]["lam_0"]
-        if list(src) != ["oper_kenda_opendata"]:
-            fail(f"{section}.lam_0: expected oper_kenda_opendata, got {list(src)}")
-        return src["oper_kenda_opendata"]["namer"]
+        want = "grib" if downscaler else "oper_kenda_opendata"
+        if list(src) != [want]:
+            fail(f"{section}.lam_0: expected {want}, got {list(src)}")
+        return src[want]["namer"]
 
     ns = kenda_namer("input")
-    if kenda_namer("constant_forcings") != ns:
+    if not downscaler and kenda_namer("constant_forcings") != ns:
         fail("the two KENDA namers differ")
     if list(ns) != ["rules"]:
         fail(f"namer keys {list(ns)} not understood")
@@ -323,7 +399,7 @@ def main() -> None:
         is_lam = any(p["type"] == "extract_from_state" for p in pps)
         name = "lam" if is_lam else "global"
         names_seen.append(name)
-        outputs.append({
+        o_doc = {
             "name": name,
             "kind": "grib",
             "path": g["path"],
@@ -334,23 +410,32 @@ def main() -> None:
             "modifiers": convert_modifiers(g.get("modifiers"), f"output {k}"),
             "check_encoding": True,
             "missing_value": -9999,
-        })
-    if names_seen != ["lam", "global"]:
-        fail(f"expected outputs [lam, global], got {names_seen}")
+        }
+        if "negative_step_mode" in g:
+            if g["negative_step_mode"] not in ("error", "skip", "write"):
+                fail(f"output {k}: negative_step_mode {g['negative_step_mode']!r}")
+            o_doc["negative_step_mode"] = g["negative_step_mode"]
+        outputs.append(o_doc)
+    want_outputs = ["lam"] if downscaler else ["lam", "global"]
+    if names_seen != want_outputs:
+        fail(f"expected outputs {want_outputs}, got {names_seen}")
+    if downscaler and not any(p["type"] == "copy_prognostic_from_forecaster" for p in outputs[0]["post_processors"]):
+        fail("the downscaler output has no copy-prognostic-from-forecaster post-processor")
 
     rev = json.loads((hf / "templates/REVISION.json").read_text())
     doc = {
         "schema": SCHEMA,
         "source": {
-            "checkpoint": "varda-forecaster-det-sgm/model.ckpt",
+            "checkpoint": f"{mdir}/model.ckpt",
             "checkpoint_uuid": m._metadata.get("uuid"),
-            "inference_config": "varda-forecaster-det-sgm/configs/inference/inference_opendata.yaml",
+            "inference_config": f"{mdir}/configs/inference/inference_opendata.yaml",
             "inference_config_sha256": sha256(cfg_path),
             "patch_metadata_sha256": sha256(patch_path),
             "templates_revision": rev,
             "template_sha256": template_files,
             "anemoi_inference": __import__("importlib.metadata").metadata.version("anemoi-inference"),
         },
+        "runner": model["runner"],
         "grid": m.grid,
         "area": list(m.area),
         "number_of_grid_points": int(m.number_of_grid_points),
@@ -363,6 +448,10 @@ def main() -> None:
         "model_variables": model_vars,
         "output_variables": output_names,
         "initial_state_fields": prog + consts,
+        # The downscaler runner (temporal_downscaler.py, forecast()) shares one `fields` dict between a window's
+        # initial state and its hourly states, so a step file holds the initial-state fields first (input order)
+        # and the other outputs (tp) after them, in output order (checked on the reference files, docs/downscaler.md).
+        **({"step_field_order": prog + [v for v in output_names if v not in set(prog)]} if downscaler else {}),
         "kenda_namer_rules": rules,
         "post_processors": top_pp,
         "outputs": outputs,

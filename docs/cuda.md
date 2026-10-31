@@ -2,7 +2,9 @@
 
 `varda::make_cuda_backend` (`src/varda/cuda/`): the fast backend of varda.cpp on NVIDIA GPUs
 (A100, sm_80), fp32 and fp16 (autocast-faithful), with CUDA-graph replay and a device-level
-entry point for the autoregressive rollout. Same maths as the CPU oracle, checked against the
+entry point for the autoregressive rollout. It runs both models of Varda-single-1.0: the
+forecaster (one output step) and the temporal downscaler `varda-td` (anemoi's multi-output
+interpolator: T_out = 6 output steps per call, §11). Same maths as the CPU oracle, checked against the
 golden activations with the tolerances of `tolerances/<model>.json` (`docs/format.md` §2-4).
 
 Files:
@@ -38,10 +40,10 @@ processor (x16)    [q | k | v | self] = Linear(xn)   [H, 4C]  one GEMM
                    after the last block: latent = T(z + z_enc) and the decoder's LN_src)
 decoder, source    [k | v] = Linear(LN_src(latent))  [H, 2C]
 decoder, dest.     per chunk of data nodes: emb_dst, LN, [q | self], attention, proj, add+LN,
-                   mlp, add+LN (dec.out_norm), out_proj -> dec_out [G, V_out (padded to 8)]
-output             y = float(dec_out) + xn[step] on the prognostic outputs, boundings in config
-                   order (normalised space)
-denormalise        (y - add_out) / mul_out
+                   mlp, add+LN (dec.out_norm), out_proj -> dec_out [G, T_out V_out (padded to 8)]
+output             per output step t: y[t] = float(dec_out[:, t V_out + v]) + xn[step] on the
+                   prognostic outputs, boundings in config order (normalised space)
+denormalise        (y - add_out) / mul_out over (T_out, G, V_out)
 ```
 
 Graphs come from `build_csr_by_dst` (`src/varda/graph.h`): destination-major, stable within a
@@ -90,7 +92,7 @@ reference's `x_data` is fp32), `enc.x_dst` is the file's own buffer.
 | `add_layernorm` | `out1 = T(y + r1)`, optional `out2 = T(out1 + r2)`, then LN | residual + next LN in one pass; the latent skip uses `r2` |
 | `gelu_inplace` | exact erf (or tanh) in fp32, 8 elements per thread | bandwidth-bound |
 | `attention` | §3.2 | fp32 online softmax, folded edge projection, fused `+ x_r` |
-| `output_assemble` | fp32 cast, prognostic residual, boundings (relu, hardtanh, fraction) | optional `out.pre_bound` copy (hooked runs only) |
+| `output_assemble` | fp32 cast, prognostic residual, boundings (relu, hardtanh, fraction), per output step (grid y = step) | optional `out.pre_bound` copy (hooked runs only) |
 | `convert_2d` | dtype conversion with leading dimensions | weights at load, hook upcasts |
 
 ### 3.1 GEMMs (cuBLASLt)
@@ -137,9 +139,9 @@ All buffers are allocated at load (`act()`), none during a forward pass:
 | buffer | size |
 |---|---|
 | `x`, `xn` (fp32) | T G V_in each |
-| `yn`, `y` (fp32) | G V_out each |
+| `yn`, `y` (fp32) | T_out G V_out each |
 | `x_data` (T) | G ldF |
-| `dec_out` (T) | G ldVo |
+| `dec_out` (T) | G ldVo (ldVo = T_out V_out rounded up to a multiple of 8) |
 | hidden-node buffers (T) | 8 x [H, C] + [H, 4C] + [H, mlp]: `z_enc`, two ping-pong `z`, LN out, attention out, GEMM out, `out1`; `[q|k|v|self]` (also the decoder's `[k|v]`); MLP hidden |
 | shared region R1 (T) | max(encoder source side 3 G C, decoder chunk (7C + mlp) per row x rows) |
 
@@ -208,7 +210,7 @@ namespace varda::cuda {
 class CudaBackend : public Backend {
 public:
     virtual int64_t input_numel() const = 0;   // (1, T_in, [1,] G, V_in)
-    virtual int64_t output_numel() const = 0;  // (1, 1, 1, G, V_out)
+    virtual int64_t output_numel() const = 0;  // (1, T_out, 1, G, V_out); T_out = 1 for the forecaster
     virtual void normalise(const float* x, float* xn, cudaStream_t s) = 0;
     virtual void forward_normalised(const float* xn, float* yn, cudaStream_t s) = 0;
     virtual void denormalise(const float* yn, float* y, cudaStream_t s) = 0;
@@ -235,7 +237,7 @@ counts, shuffled stored edge order, five channel/head layouts (C 256-1024 incl. 
 1-3 edge attributes), destination sub-ranges (bitwise equal to the full launch), zero in-degree
 (output = `x_r` exactly) and `vpl` invariance (bitwise); LayerNorm and add+LN for every accepted C (sums bitwise, LN
 vs double), GELU erf/tanh, normaliser and denormaliser (bitwise), input assembly (bitwise), output
-assembly with residual and all three bounding types (bitwise). `test_cuda_gemm` checks the
+assembly with residual and all three bounding types, for one and for six output steps (bitwise). `test_cuda_gemm` checks the
 Linear wrapper in both precisions with and without bias, N = 67 in rows of 72 (padding left
 untouched), K = 8 / 168 / 4096, odd M, repeatability, with and without autotuning.
 
@@ -397,3 +399,118 @@ hook-free == hooked (bitwise): fp32 True, fp16 True; status fp32 pass, fp16 pass
   TF32 breaks the 1e-5 tables. fp16 is GEMM-bound at ~245 TFLOP/s (cuBLAS); what remains is
   bandwidth-bound elementwise work whose biggest removable item (exact-erf GELU, 48 ms) needs a
   GEMM epilogue that cuBLASLt does not offer (its GELU epilogue is the tanh form).
+
+## 11. Interpolator (temporal downscaler, `varda-td`)
+
+anemoi's `AnemoiModelEncProcDecMultiOutInterpolator` (config `architecture.model.kind` =
+`enc_proc_dec_interpolator`) is the forecaster's forward pass with T_out = `n_output_steps`
+outputs per call (Varda downscaler: inputs at +0 h and +6 h, outputs +1 h .. +6 h). Everything up to
+the decoder's output Linear is unchanged; the engine takes every size from the config (§1), so the
+differences are:
+
+| | forecaster | interpolator |
+|---|---|---|
+| `dec.out_proj` | [V_out, C], N padded to a multiple of 8 | [T_out V_out, C] (row t V_out + v: anemoi's "(time vars)"), N padded the same way (Varda: 402 -> 408) |
+| `dec_out` (T) | G x ldVo | G x ldVo, ldVo = T_out V_out rounded up to 8 |
+| `yn`, `y` (fp32) | G V_out | T_out G V_out, step t at `t G V_out` (contract `(1, T_out, 1, G, V_out)`) |
+| output stage | one `output_assemble` launch | the same launch with a second grid dimension over the steps: step t reads columns `[t V_out, (t + 1) V_out)` of `dec_out`, adds the residual from the same input step for every t (`residual_step`: 0 for the Varda downscaler), applies the boundings in config order on its own values (fraction totals from the same step) |
+| denormalise | G V_out values | T_out G V_out values (variable = index mod V_out, unchanged kernel) |
+| hook | `dec.out` (G, V_out), `out.*` (1, 1, 1, G, V_out) | `dec.out` (G, T_out V_out), `out.*` (1, T_out, 1, G, V_out) |
+
+fp16: the reference's `_assemble_output` is the forecaster's (`x_out.to(fp32)`, then residual, bounding,
+denormalisation in fp32), so the cast placement of §2 holds for every step: `dec_out` is the fp16 Linear output,
+everything after it fp32. A forecaster config with `n_output_steps` != 1 is rejected at load. The device rollout
+(`rollout_cuda`) is forecaster-only: it checks `output_numel() == G V_out` and so refuses an interpolator.
+
+Memory (Varda downscaler): `dec_out` grows by 1.1 GB (fp16) and `yn` + `y` by 4.5 GB: activations 25.6 GB in fp16
+(forecaster 20.1 GB) and 43.8 GB in fp32 (37.1 GB). The hook's `out.pre_bound` scratch is T_out G V_out fp32 (2.7 GB).
+
+### 11.1 Verification
+
+- Forecaster unchanged: `varda-run --out` of the dev model and Varda, fp32 and fp16, graph on and off, with this
+  build and with a build of the previous commit in the same job: outputs bitwise identical (8/8). `varda-parity` on
+  the dev model in the same job (A100-SXM4-80GB) gives the same per-key numbers for both binaries, worst ratios
+  0.314 (fp32), 0.656 / 0.733 (fp16), as in `docs/results.md` section 2; synthetic a-f: the numbers of
+  `docs/testing.md` section 4, identical per key for both binaries. On a PG506-232 node (A100 96 GB) the same
+  binaries give other bits in fp16 (not investigated; most likely other cuBLASLt kernel choices): dev model fp16
+  worst 0.884 (dec.out) vs `cpu-fp32-pyg` and 0.697 (proc.10.out) vs `cuda-fp16-triton`, still within the tables;
+  the published numbers are A100-SXM4-80GB numbers.
+- `test_cuda_kernels`: output assembly with T_out = 1 and 6 (V_out = 9, padded rows), residual and all three
+  bounding types, bitwise against a host reference; `test_cuda_gemm`, `test_rollout_cuda` pass.
+- Synthetic interpolators (`docs/testing.md` section 4): g (T_out 6, residual from input step 0, no latent skip,
+  relu) and h (T_out 3, residual from the last input step, latent skip, all three boundings), worst `rel_absmax`
+  over all keys (PG506-232 node):
+
+| model | CUDA fp32 | CUDA fp32 dec chunk 128 | CUDA fp16 |
+|---|---|---|---|
+| g | 3.08e-07 (0.031 of tol) | 3.08e-07 | 1.16e-03 (0.388) |
+| h | 3.19e-07 (0.032) | 3.19e-07 | 1.31e-03 (0.438) |
+
+  Hook-free == hooked bitwise, and the same numbers with `--no-cuda-graph`.
+
+- Varda downscaler against its golden data (`varda-parity`, A100-SXM4-80GB, `tolerances/varda-td.json`): every
+  key passes, 30 keys present and NaN-free; hook-free == hooked bitwise; graph on and graph off give the same
+  per-key numbers. `rel_absmax / max_abs (ratio to tolerance)`; fp32 vs cuda-fp32-triton for information (no table):
+
+| key | fp32 vs cpu-fp32-pyg (`cuda-fp32`) | fp32 vs cuda-fp32-triton | fp16 vs cpu-fp32-pyg (`cuda-fp16`) | fp16 vs cuda-fp16-triton (`cuda-fp16-vs-ref-fp16`) |
+|---|---|---|---|---|
+| in.x | 0 (bitwise) | 0 (bitwise) | 0 (bitwise) | 0 (bitwise) |
+| in.x_norm | 0 (bitwise) | 0 (bitwise) | 0 (bitwise) | 0 (bitwise) |
+| enc.x_src | 0 (bitwise) | 0 (bitwise) | 0 (bitwise) | 0 (bitwise) |
+| enc.x_dst | 0 (bitwise) | 0 (bitwise) | 0 (bitwise) | 0 (bitwise) |
+| enc.emb_src | 0 (bitwise) | 0 (bitwise) | 5.85e-04 / 0.00515 (0.53) | 4.44e-04 / 0.00391 (0.37) |
+| enc.emb_dst | 0 (bitwise) | 0 (bitwise) | 6.89e-04 / 0.00183 (0.53) | 7.35e-04 / 0.00195 (0.53) |
+| enc.out | 2.71e-06 / 0.000151 (0.27) | 1.17e-06 / 6.48e-05 | 1.40e-03 / 0.0777 (0.58) | 1.40e-03 / 0.0781 (0.52) |
+| proc.0.out | 1.50e-06 / 0.000259 (0.15) | 2.05e-06 / 0.000355 | 1.85e-03 / 0.32 (0.56) | 9.01e-04 / 0.156 (0.24) |
+| proc.1.out | 1.46e-06 / 0.000267 (0.15) | 1.89e-06 / 0.000347 | 1.64e-03 / 0.301 (0.47) | 8.51e-04 / 0.156 (0.21) |
+| proc.2.out | 1.80e-06 / 0.000282 (0.18) | 1.75e-06 / 0.000275 | 1.65e-03 / 0.258 (0.46) | 7.98e-04 / 0.125 (0.19) |
+| proc.3.out | 2.23e-06 / 0.000297 (0.22) | 1.89e-06 / 0.000252 | 2.13e-03 / 0.283 (0.51) | 9.39e-04 / 0.125 (0.20) |
+| proc.4.out | 2.05e-06 / 0.000296 (0.21) | 2.52e-06 / 0.000364 | 1.93e-03 / 0.278 (0.51) | 1.30e-03 / 0.188 (0.30) |
+| proc.5.out | 1.91e-06 / 0.000284 (0.19) | 2.43e-06 / 0.000362 | 2.05e-03 / 0.306 (0.60) | 1.31e-03 / 0.195 (0.34) |
+| proc.6.out | 1.92e-06 / 0.000274 (0.19) | 2.47e-06 / 0.000352 | 1.91e-03 / 0.273 (0.58) | 1.31e-03 / 0.188 (0.35) |
+| proc.7.out | 2.01e-06 / 0.000259 (0.20) | 2.66e-06 / 0.000342 | 1.98e-03 / 0.255 (0.64) | 1.94e-03 / 0.25 (0.54) |
+| proc.8.out | 1.95e-06 / 0.000253 (0.20) | 2.57e-06 / 0.000333 | 1.90e-03 / 0.246 (0.56) | 2.41e-03 / 0.312 (0.62) |
+| proc.9.out | 1.94e-06 / 0.000262 (0.19) | 2.45e-06 / 0.000332 | 1.92e-03 / 0.26 (0.53) | 2.77e-03 / 0.375 (0.68) |
+| proc.10.out | 2.67e-06 / 0.000366 (0.27) | 2.45e-06 / 0.000336 | 2.09e-03 / 0.287 (0.50) | 3.64e-03 / 0.5 (0.76) |
+| proc.11.out | 4.09e-06 / 0.000557 (0.41) | 2.49e-06 / 0.000339 | 2.70e-03 / 0.367 (0.34) | 3.67e-03 / 0.5 (0.40) |
+| proc.12.out | 1.18e-05 / 0.00177 (0.50) | 3.96e-06 / 0.000595 | 8.84e-03 / 1.33 (0.38) | 7.49e-03 / 1.12 (0.29) |
+| proc.13.out | 3.17e-05 / 0.00861 (0.50) | 1.05e-05 / 0.00284 | 2.40e-02 / 6.51 (0.38) | 1.68e-02 / 4.62 (0.23) |
+| proc.14.out | 3.00e-05 / 0.0239 (0.52) | 1.07e-05 / 0.00854 | 2.17e-02 / 17.3 (0.37) | 2.66e-02 / 21.5 (0.40) |
+| proc.15.out | 1.57e-05 / 0.0277 (0.51) | 8.49e-06 / 0.015 | 2.31e-02 / 40.8 (0.61) | 3.04e-02 / 54 (0.71) |
+| latent | 1.57e-05 / 0.0277 (0.51) | 8.49e-06 / 0.015 | 2.31e-02 / 40.8 (0.61) | 3.04e-02 / 54 (0.71) |
+| dec.emb_dst | 0 (bitwise) | 0 (bitwise) | 6.16e-04 / 0.00567 (0.56) | 4.24e-04 / 0.00391 (0.33) |
+| dec.block_out | 1.41e-05 / 0.00838 (0.34) | 7.67e-06 / 0.00454 | 1.04e-02 / 6.17 (0.47) | 1.19e-02 / 7.06 (0.48) |
+| dec.out | 8.39e-05 / 0.0136 (0.52) | 2.98e-05 / 0.00482 | 3.04e-02 / 4.92 (0.48) | 2.78e-02 / 4.5 (0.39) |
+| out.pre_bound | 8.39e-05 / 0.0136 (0.52) | 2.98e-05 / 0.00482 | 3.04e-02 / 4.92 (0.48) | 2.78e-02 / 4.5 (0.39) |
+| out.norm | 8.39e-05 / 0.0136 (0.52) | 2.98e-05 / 0.00482 | 3.04e-02 / 4.92 (0.48) | 2.78e-02 / 4.5 (0.39) |
+| out.y | 4.56e-07 / 0.0938 (0.05) | 3.04e-07 / 0.0625 | 3.28e-04 / 67.4 (0.60) | 3.81e-04 / 78.5 (0.61) |
+| **worst ratio** | 0.519 (proc.14.out) | | 0.637 (proc.7.out) | 0.758 (proc.10.out) |
+
+  The error grows in processor blocks 11-14 and in the output Linear in both precisions; the reference shows the
+  same growth between its own runs (cuda-fp32-triton vs cpu-fp32-pyg: 2.1e-5 at proc.13.out, 5.4e-5 at dec.out;
+  fp16 vs fp32: 3.6e-2 at proc.13.out), which the tolerance file is calibrated on: a property of the model, not of the
+  engine.
+
+### 11.2 Speed
+
+Warm, hook-free, device-resident input and output (`varda-bench` with its output buffers sized T_out G V_out: median of 10 forwards after 5 warm-up, fp32 5
+after 2; CUDA graph replay unless stated), forecaster and downscaler in the same job; input of the downscaler: random
+values whose normalised form is N(0, 1) (timing only). A100-SXM4-80GB (the GPU of §8):
+
+| model | precision | graph | median ms | first call s (eager) | host `predict_step` ms (graph on) | activations GB |
+|---|---|---|---|---|---|---|
+| Varda downscaler | fp16 | on | **732.2** | 1.25 | 1062 | 25.6 |
+| Varda downscaler | fp16 | off | 733.1 | 1.04 | 1005 (graph off) | 25.6 |
+| Varda forecaster | fp16 | on | 720.1 | 0.86 | 824 | 20.1 |
+| Varda downscaler | fp32 | on | **7524.4** | 7.84 | 7816 | 43.8 |
+| Varda forecaster | fp32 | on | 7451.0 | 7.58 | 7579 | 37.1 |
+
+On an `NVIDIA PG506-232` node (A100 SXM4, 96 GB; another node type, which runs these kernels ~10%
+faster), same job for all rows: downscaler fp16 664.6 ms (graph off 666.0), forecaster fp16 653.8 ms; fp32 6530.8 vs
+6473.9 ms.
+
+The six output steps cost 11-12 ms over the forecaster's forward in fp16 (nsys on the PG506-232, eager, per forward:
+output Linear +4.0 ms for N 408 instead of 72, output assembly 5.0 ms instead of 0.75, denormalisation 3.5 instead of
+0.65; everything else unchanged), 73 ms (1%) in fp32. The host API copies 2.7 GB of output back (pageable), hence the
+larger host number. Every run checked bitwise graph == eager, split == fused, host == device, first call == warm;
+`--determinism` (fp16, PG506-232): the 30 activations of two hooked runs and of a second instance identical.

@@ -4,10 +4,12 @@
 #   ./varda setup                       build (build/, CUDA + GRIB) and check the assets bundle (create it here)
 #   ./varda fetch DATE|latest           download the inputs of one date into the input cache
 #   ./varda forecast DATE|latest [--lead-time H] [--precision fp16|fp32] [--device cuda|cpu|metal] [--out DIR]
-#                                [-- extra varda-forecast options]
+#                                [--no-downscaler] [-- extra varda-forecast options]
 #
 # DATE is the initial time in UTC, e.g. 2026-10-22T15 (hour 00, 03, ..., 21); `latest` is the newest KENDA-CH1
-# analysis with t-6h also published. Outputs: DIR/outputs/*.grib (default DIR: ./varda-out/<YYYYmmddTHH>),
+# analysis with t-6h also published. Outputs: DIR/outputs/*.grib (default DIR: ./varda-out/<YYYYmmddTHH>):
+# the 6-hourly forecaster files and, when the bundle holds the temporal downscaler (./varda setup adds it when
+# the HF download has it), the hourly varda-single_*.grib files (--no-downscaler: forecaster only);
 # DIR/forecast.json, DIR/varda-forecast.log.
 #
 # Environment (all optional):
@@ -68,6 +70,12 @@ cmd_setup() {
             *) die "setup: unknown option $a" ;;
         esac
     done
+    # a binary older than the sources is rebuilt too (the engine, the apps, the build files)
+    if [[ $rebuild == 0 && -x "$BUILD/varda-forecast" ]] &&
+        [[ -n "$(find "$REPO/src" "$REPO/apps" "$REPO/CMakeLists.txt" -newer "$BUILD/varda-forecast" -print -quit 2>/dev/null)" ]]; then
+        say "build: $BUILD/varda-forecast is older than the sources: rebuilding"
+        rebuild=1
+    fi
     if [[ $rebuild == 1 || ! -x "$BUILD/varda-forecast" ]]; then
         command -v cmake >/dev/null || die "cmake not found"
         say "building engine and GRIB tools into $BUILD ..."
@@ -140,13 +148,14 @@ cmd_forecast() {
     [[ "$1" == -h || "$1" == --help ]] && usage 0
     local date="$1"
     shift
-    local lead="" precision=fp16 device=cuda out="" extra=()
+    local lead="" precision=fp16 device=cuda out="" extra=() no_td=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --lead-time) lead="${2:?--lead-time needs hours}"; shift 2 ;;
             --precision) precision="${2:?}"; shift 2 ;;
             --device) device="${2:?}"; shift 2 ;;
             --out) out="${2:?}"; shift 2 ;;
+            --no-downscaler) no_td=(--no-downscaler); shift ;;
             --) shift; extra=("$@"); break ;;
             -h|--help) usage 0 ;;
             *) die "forecast: unknown option $1 (varda-forecast options go after --)" ;;
@@ -206,7 +215,7 @@ cmd_forecast() {
     local args=(--assets "$ASSETS" --realdata "$indir" --out "$out" --device "$device" --precision "$precision"
                 --quiet)
     [[ -n "$lead" ]] && args+=(--lead-time-hours "$lead")
-    args+=("${extra[@]}")
+    args+=("${no_td[@]}" "${extra[@]}")
 
     [[ ${#launch[@]} -gt 0 ]] && say "running on a compute node: ${launch[*]}"
     say "forecast $tag: inputs $indir"
@@ -238,21 +247,33 @@ r = json.load(open(os.path.join(out, "forecast.json")))
 p = json.load(open(os.path.join(indir, "pins.json")))
 s = r["seconds"]
 files = sorted(r["files"])
-size = sum(os.path.getsize(f if os.path.isabs(f) else os.path.join(out, f)) for f in files)
+td = r.get("downscaler")
+hourly = sorted(td["files"]) if td else []
+size = sum(os.path.getsize(f if os.path.isabs(f) else os.path.join(out, f)) for f in files + hourly)
 steps = ", ".join(f"{x:.0f}" for x in r["step_ms"])
 c = p["constant_forcings_run"]
 dates = ", ".join(f"{k[11:13]}Z <- {v['init'][:13].replace('T', ' ')}Z+{v['step']}h" for k, v in p["input_dates"].items())
 print()
 print(f"Varda forecast from {r['date']}, {r['n_steps']} steps of 6 h, {r['device']} {r['precision']}")
-print(f"  outputs   {out}/outputs/  ({len(files)} GRIB files, {size / 1e9:.2f} GB, "
-      f"{s['grib']['messages']} messages)")
+msgs = s['grib']['messages'] + (td['seconds']['grib']['messages'] if td else 0)
+print(f"  outputs   {out}/outputs/  ({len(files) + len(hourly)} GRIB files, {size / 1e9:.2f} GB, {msgs} messages)")
 print(f"            lam (ICON-CH1 grid): {os.path.basename(min(f for f in files if 'global-' not in os.path.basename(f)))} ...")
 print(f"            global (N320):       {os.path.basename(min(f for f in files if 'global-' in os.path.basename(f)))} ...")
+if td:
+    print(f"            hourly (temporal downscaler, lam): {os.path.basename(min(hourly))} ... ({len(hourly)} files, "
+          f"hours 0-{td['n_windows'] * td['window_hours']})")
+else:
+    print("            (no temporal downscaler: the bundle has none, or --no-downscaler)")
 print(f"  inputs    {indir}")
 print(f"            IFS {dates}; constants {c['init'][:13].replace('T', ' ')}Z+0h")
 print(f"  time      {s['total']:.1f} s in all: ready after {s['ready']:.1f} s (input {s['input']:.1f} s, "
       f"weights {s['load']:.1f} s), rollout {s['rollout']:.1f} s ({steps} ms per step), "
       f"last write {s['write_after_rollout']:.1f} s")
+if td:
+    t = td['seconds']
+    print(f"            downscaler: {td['n_windows']} windows of {td['window_hours']} h, "
+          f"{', '.join(f'{x:.0f}' for x in td['window_predict_ms'])} ms each, weights {t['load']:.1f} s, "
+          f"hourly GRIB written {t['write_after_loop']:.1f} s after the last window")
 print(f"  details   {out}/forecast.json, {out}/varda-forecast.log")
 EOF
 }

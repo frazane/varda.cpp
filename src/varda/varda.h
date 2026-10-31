@@ -1,5 +1,6 @@
-// varda.cpp public API: load a converted anemoi GraphTransformer forecaster
-// (docs/format.md) and run its predict_step on CPU, CUDA or an Apple Silicon GPU.
+// varda.cpp public API: load a converted anemoi GraphTransformer forecaster or temporal
+// downscaler (interpolator) (docs/format.md) and run its predict_step on CPU, CUDA or an
+// Apple Silicon GPU.
 #pragma once
 
 #include <cstdint>
@@ -42,7 +43,9 @@ public:
     const Options& options() const { return opts_; }
 
     // x: host (1, T_in, G, V_in) fp32, physical units, model-input order (contract `in.x`).
-    // y: host (1, T_out, 1, G, V_out) fp32, physical units (contract `out.y`).
+    // y: host (1, T_out, 1, G, V_out) fp32, physical units (contract `out.y`); T_out =
+    // config().n_output_steps (1 for the forecaster, 6 for the Varda downscaler), step t at
+    // y + t * G * V_out.
     // With a hook, every contract activation is reported; the output is unchanged by it.
     void predict_step(const float* x, float* y, const ActivationHook* hook = nullptr);
 

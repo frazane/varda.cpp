@@ -1,5 +1,6 @@
 // CUDA backend: fp32 and fp16 (autocast-faithful) forward pass of the GraphTransformer
-// encoder-processor-decoder (docs/cuda.md).
+// encoder-processor-decoder: forecaster (one output step) and interpolator (T_out output steps
+// per call) (docs/cuda.md).
 #include <cuda_fp16.h>
 
 #include <algorithm>
@@ -69,7 +70,7 @@ public:
     void predict_step(const float* x, float* y, const ActivationHook* hook) override;
 
     int64_t input_numel() const override { return int64_t(T_in_) * G_ * V_in_; }
-    int64_t output_numel() const override { return G_ * V_out_; }
+    int64_t output_numel() const override { return int64_t(T_out_) * G_ * V_out_; }
     void normalise(const float* x, float* xn, cudaStream_t s) override {
         cuda::normalise(x, mul_in_.as<float>(), add_in_.as<float>(), xn, input_numel(), V_in_, s);
     }
@@ -83,6 +84,16 @@ public:
         denormalise(yn_, y, s);
     }
     void prepare() override;
+    void use_high_priority_stream() override {
+        VARDA_CUDA_CHECK(cudaSetDevice(dev_));
+        int least = 0, greatest = 0;
+        VARDA_CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+        cudaStream_t s = nullptr;
+        VARDA_CUDA_CHECK(cudaStreamCreateWithPriority(&s, cudaStreamNonBlocking, greatest));
+        VARDA_CUDA_CHECK(cudaStreamSynchronize(stream_));
+        VARDA_CUDA_CHECK(cudaStreamDestroy(stream_));
+        stream_ = s;  // the graph (if captured) is launched on whichever stream predict_step uses
+    }
     int device() const override { return dev_; }
     size_t weight_bytes() const override { return weight_bytes_; }
     size_t activation_bytes() const override { return act_bytes_; }
@@ -115,7 +126,9 @@ private:
     cudaStream_t stream_ = nullptr;
     std::unique_ptr<Gemm> gemm_;
 
-    int C_, heads_, hd_, mlp_, n_proc_, T_in_, V_in_, V_out_, A_node_, F_, ldF_, ldA_, ldVo_;
+    // V_dec_ = T_out_ * V_out_: decoder output width (step t in columns [t V_out, (t + 1) V_out)),
+    // ldVo_ = V_dec_ padded to a multiple of 8 (zero rows of the output Linear).
+    int C_, heads_, hd_, mlp_, n_proc_, T_in_, T_out_, V_in_, V_out_, V_dec_, A_node_, F_, ldF_, ldA_, ldVo_;
     int64_t G_, H_;
     float eps_;
     bool gelu_tanh_;
@@ -349,8 +362,10 @@ Engine<T>::Engine(const Config& cfg, SafeTensorsFile& file, const Options& opts)
     mlp_ = cfg.mlp_hidden;
     n_proc_ = cfg.num_processor_layers;
     T_in_ = cfg.n_input_steps;
+    T_out_ = cfg.n_output_steps;
     V_in_ = cfg.n_input_vars;
     V_out_ = cfg.n_output_vars;
+    V_dec_ = cfg.dec_out_features();
     A_node_ = cfg.node_attr_dim;
     G_ = cfg.n_data_nodes;
     H_ = cfg.n_hidden_nodes;
@@ -359,7 +374,7 @@ Engine<T>::Engine(const Config& cfg, SafeTensorsFile& file, const Options& opts)
     F_ = cfg.src_features();
     ldF_ = static_cast<int>(align_up(F_, env_int("VARDA_KPAD", 8)));
     ldA_ = static_cast<int>(align_up(A_node_, 8));
-    ldVo_ = static_cast<int>(align_up(V_out_, 8));
+    ldVo_ = static_cast<int>(align_up(V_dec_, 8));
 
     if (C_ % 256 || C_ > 2048) throw std::runtime_error("CUDA backend: num_channels must be a multiple of 256, <= 2048");
     if (hd_ % 8 || (hd_ / 8) & (hd_ / 8 - 1) || hd_ > 256)
@@ -368,7 +383,8 @@ Engine<T>::Engine(const Config& cfg, SafeTensorsFile& file, const Options& opts)
     if (cfg.edge_attr_dim < 1 || cfg.edge_attr_dim > 3)
         throw std::runtime_error("CUDA backend: edge_attr_dim must be 1..3 (packed edge records)");
     if (n_proc_ < 1) throw std::runtime_error("CUDA backend: needs at least one processor block");
-    if (cfg.n_output_steps != 1) throw std::runtime_error("CUDA backend: one output step only");
+    if (T_out_ < 1 || (T_out_ > 1 && !cfg.is_interpolator()))
+        throw std::runtime_error("CUDA backend: n_output_steps > 1 needs the interpolator model kind");
 
     gemm_ = std::make_unique<Gemm>(elt_of<T>(), size_t(32) << 20, env_int("VARDA_GEMM_AUTOTUNE", 0) != 0);
 
@@ -430,7 +446,7 @@ Engine<T>::Engine(const Config& cfg, SafeTensorsFile& file, const Options& opts)
     enc_emb_dst_ = load_linear(file, {"enc.emb_dst"}, C_, A_node_, ldA_);
     dec_emb_dst_ = load_linear(file, {"dec.emb_dst"}, C_, F_, ldF_);
     dec_out_norm_ = load_norm(file, "dec.out_norm");
-    dec_out_proj_ = load_linear(file, {"dec.out_proj"}, V_out_, C_, C_, ldVo_);  // N padded: aligned GEMM kernels
+    dec_out_proj_ = load_linear(file, {"dec.out_proj"}, V_dec_, C_, C_, ldVo_);  // N padded: aligned GEMM kernels
     enc_ = load_block(file, "enc.block", true);
     for (int i = 0; i < n_proc_; ++i) proc_.push_back(load_block(file, "proc." + std::to_string(i), false));
     dec_ = load_block(file, "dec.block", true);
@@ -613,31 +629,33 @@ void Engine<T>::forward(const float* xn, float* yn, cudaStream_t s, Hook* hk) {
         h_emb.reset();
         hk->host("dec.block_out", h_bo.get(), {G, C});
         h_bo.reset();
-        hk->dev("dec.out", dec_out_, ldVo_, G, V_out_, {G, int64_t(V_out_)});
+        hk->dev("dec.out", dec_out_, ldVo_, G, V_dec_, {G, int64_t(V_dec_)});
     }
 
-    // ---- output: dec.out -> fp32, + residual (normalised input step), bounding
+    // ---- output, per output step t: dec.out[:, t V_out + v] -> fp32, + residual (the same normalised
+    // input step for every t), bounding; yn is [T_out, G, V_out]
     OutputArgs o;
     o.dec = dec_out_;
     o.ld_dec = ldVo_;
     o.xn_step = xn + int64_t(cfg_.residual_step) * G * V_in_;
     o.V_in = V_in_;
     o.V_out = V_out_;
+    o.T_out = T_out_;
     o.G = G;
     o.res_src = res_src_.as<int>();
     o.bounds = bounds_.as<BoundingDev>();
     o.n_bounds = n_bounds_;
     o.bidx = bidx_.as<int>();
     if (hk) {
-        if (!hook_prebound_.get()) hook_prebound_.alloc(G * V_out_ * sizeof(float));
+        if (!hook_prebound_.get()) hook_prebound_.alloc(output_numel() * sizeof(float));
         o.pre_bound = hook_prebound_.as<float>();
     }
     o.y = yn;
     output_assemble<T>(o, s);
     if (hk) {
-        const std::vector<int64_t> shp = {1, 1, 1, G, V_out_};
-        hk->dev("out.pre_bound", hook_prebound_.as<float>(), V_out_, G, V_out_, shp);
-        hk->dev("out.norm", yn, V_out_, G, V_out_, shp);
+        const std::vector<int64_t> shp = {1, T_out_, 1, G, V_out_};
+        hk->dev("out.pre_bound", hook_prebound_.as<float>(), V_out_, T_out_ * G, V_out_, shp);
+        hk->dev("out.norm", yn, V_out_, T_out_ * G, V_out_, shp);
     }
 }
 
@@ -699,7 +717,7 @@ void Engine<T>::predict_step(const float* x, float* y, const ActivationHook* hoo
         denormalise(yn_, y_dev_, s);
         VARDA_CUDA_CHECK(cudaMemcpyAsync(y, y_dev_, out_n * sizeof(float), cudaMemcpyDeviceToHost, s));
         VARDA_CUDA_CHECK(cudaStreamSynchronize(s));
-        hk.host("out.y", y, {1, 1, 1, G_, V_out_});
+        hk.host("out.y", y, {1, T_out_, 1, G_, V_out_});
         ran_eager_ = true;
         return;
     }

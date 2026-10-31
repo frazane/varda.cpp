@@ -9,7 +9,8 @@
 #   SYN_DIR   where models and golden files live (default $VARDA_SCRATCH/synthetic). They are
 #             (re)generated when missing or when the SHA-256 of python/tests/synthetic.py
 #             differs from the one stored in $SYN_DIR/generator.sha256.
-#   MODELS    space-separated subset of the configs (default: all of a b c d e f).
+#   MODELS    space-separated subset of the configs (default: all of a b c d e f g h; g and h
+#             are interpolators with 6 and 3 output steps).
 #   OUT       directory for logs and per-run JSON reports (default $SYN_DIR/runs/<timestamp>).
 #   SKIP_CUDA=1 forces the CUDA part to be skipped (it is also skipped, with a note, when
 #             no GPU is visible).
@@ -26,7 +27,8 @@ PY="$REPO/.venv/bin/python"
 GEN="$REPO/python/tests/synthetic.py"
 [ -n "${SYN_DIR:-}" ] || : "${VARDA_SCRATCH:?set VARDA_SCRATCH (source tools/env.sh) or SYN_DIR}"
 SYN_DIR="${SYN_DIR:-$VARDA_SCRATCH/synthetic}"
-MODELS="${MODELS:-a b c d e f}"
+ALL_MODELS="a b c d e f g h"
+MODELS="${MODELS:-$ALL_MODELS}"
 OUT="${OUT:-$SYN_DIR/runs/$(date +%Y%m%d-%H%M%S)-$$}"
 want="${*:-cpu cuda}"
 
@@ -46,7 +48,7 @@ if [ "$need" = 1 ]; then
   echo "generating synthetic models into $SYN_DIR (generator hash ${cur_hash:0:12})"
   # Only the requested subset is regenerated, so the hash file is written only for the full set.
   "$PY" -I "$GEN" --out "$SYN_DIR" --only "$(echo $MODELS | tr ' ' ',')" || { echo "generation failed"; exit 2; }
-  if [ "$MODELS" = "a b c d e f" ]; then echo "$cur_hash" > "$SYN_DIR/generator.sha256"; fi
+  if [ "$MODELS" = "$ALL_MODELS" ]; then echo "$cur_hash" > "$SYN_DIR/generator.sha256"; fi
 fi
 "$PY" -I "$GEN" --check-tolerances "$REPO/tolerances" --only "$(echo $MODELS | tr ' ' ',')" || exit 2
 

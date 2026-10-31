@@ -1,5 +1,6 @@
 // Unit tests of the GRIB output side (src/varda/io/output.*, io_config.*). The pure-function parts need
-// the exported io config ($VARDA_IO_CONFIG, default $VARDA_SCRATCH/realdata/assets/varda-io.json); the
+// the exported io config ($VARDA_IO_CONFIG, default $VARDA_SCRATCH/realdata/assets/varda-io.json; the temporal
+// downscaler's $VARDA_TD_IO_CONFIG, default $VARDA_SCRATCH/realdata/assets/varda-td-io.json); the
 // end-to-end part also needs the HF templates ($VARDA_TEMPLATES, default $VARDA_SCRATCH/hf/templates)
 // and the COSMO definitions ($VARDA_COSMO_DEFINITIONS). Missing inputs skip, they do not fail.
 #include <sys/stat.h>
@@ -211,8 +212,135 @@ static void test_end_to_end(const std::string& cfgpath, const std::string& tdir)
     fs::remove_all(out);  // created by this test
 }
 
+// ---- the temporal downscaler's hourly output (docs/io-output.md, docs/downscaler.md §7) ------------------------
+
+// Glob matching of the copy-prognostic-from-forecaster rule (Python fnmatchcase semantics for * and ?).
+static void test_copy_rule_pure() {
+    PostProcessorDef p;
+    p.type = PostProcessorDef::CopyFromForecaster;
+    p.common_leadtime_hours = 6;
+    struct C { std::vector<std::string> keep; const char* name; bool copies; };
+    const C cases[] = {{{"tp"}, "tp", false}, {{"tp"}, "2t", true}, {{"t_*"}, "t_500", false}, {{"t_*"}, "tp", true},
+                       {{"t_*"}, "t_", false}, {{"?t"}, "2t", false}, {{"?t"}, "t", true}, {{"*"}, "", false},
+                       {{"*_*0"}, "q_1000", false}, {{"*_*0"}, "q_925", true}, {{"**p"}, "tp", false}, {{"t*p"}, "tp", false},
+                       {{"a*b*c"}, "abxbxc", false}, {{"a*b*c"}, "abxbx", true}};
+    bool ok = true;
+    for (const auto& c : cases) {
+        p.params_to_keep = c.keep;
+        ok &= p.copies(c.name) == c.copies;
+    }
+    expect(ok, "copy rule: params_to_keep globs match Python fnmatchcase (14 cases)");
+    p.params_to_keep.clear();
+    p.params_to_copy = {"t_*", "2t"};
+    expect(p.copies("t_850") && p.copies("2t") && !p.copies("tp") && !p.copies("2d"), "copy rule: params_to_copy");
+}
+
+static void test_td_config(const std::string& cfgpath) {
+    IoConfig c = IoConfig::load(cfgpath);
+    expect(c.runner == "temporal_downscaler" && c.timestep_hours == 1 && c.write_initial_state, "td config: runner, 1 h, step 0");
+    expect(c.initial_state_fields.size() == 66 && c.step_field_order.size() == 67 && c.step_field_order.back() == "tp" &&
+               c.step_field_order[0] == c.initial_state_fields[0],
+           "td config: 66 initial-state fields; step order = initial-state fields then tp");
+    expect(c.outputs.size() == 1 && c.outputs[0].name == "lam" && c.outputs[0].negative_step_mode == "skip" &&
+               c.outputs[0].path_effective == "outputs/varda-single_{dateTime}_{step}.grib",
+           "td config: one lam output, skip mode, unpadded step");
+    const auto& pps = c.outputs[0].post_processors;
+    expect(pps.size() == 2 && pps[0].type == PostProcessorDef::ExtractFromState && pps[1].type == PostProcessorDef::CopyFromForecaster &&
+               pps[1].common_leadtime_hours == 6 && pps[1].params_to_keep == std::vector<std::string>{"tp"},
+           "td config: extract_from_state then copy_prognostic_from_forecaster (6 h, keep tp)");
+    const IoVariable& tp = c.variable("tp");
+    expect(tp.process == "accumulation" && tp.period_hours == 0, "td config: tp accumulation, period null (0)");
+    bool threw = false;
+    try {
+        IoConfig::parse("{\"schema\": \"varda-io/1\"}");
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    expect(threw, "td config: an incomplete config is refused");
+}
+
+// End to end on the real templates: counts, order, tp accumulation and the forecaster copy at hour 6.
+static void test_td_end_to_end(const std::string& cfgpath, const std::string& tdir) {
+    IoConfig c = IoConfig::load(cfgpath);
+    const int64_t n0 = 1147980, n1 = 540670, N320 = 542080;
+    std::vector<GridSource> src(2);
+    src[0].name = "lam_0";
+    src[0].mask.assign(size_t(n0), 1);
+    src[1].name = "global";
+    src[1].mask.assign(size_t(N320), 1);
+    for (int64_t k = 0; k < 1410; ++k) src[1].mask[size_t(62219 + 20 * k)] = 0;
+    const int64_t G = n0 + n1;
+    namespace fs = std::filesystem;
+    const std::string out = env_or("TMPDIR", "/tmp") + "/varda-test-td-" + std::to_string(::getpid());
+    fs::create_directories(out);
+    const DateTime t{2026, 10, 22, 15, 0, 0};
+    const size_t V = c.output_variables.size();
+    size_t jtp = 0;
+    for (size_t j = 0; j < V; ++j)
+        if (c.output_variables[j] == "tp") jtp = j;
+    std::vector<float> fy(size_t(G) * V);  // the "forecaster's" state of hour 6
+    for (int64_t g = 0; g < G; ++g)
+        for (size_t j = 0; j < V; ++j) fy[size_t(g) * V + j] = 5000.0f + float(j) + 0.003f * float(g % 777);
+    bool threw = false;
+    {
+        GribOutput go(src, c.output_variables, c, tdir, out, t);
+        std::vector<std::vector<float>> init;
+        for (size_t k = 0; k < c.initial_state_fields.size(); ++k) {
+            std::vector<float> f(static_cast<size_t>(G));
+            for (int64_t g = 0; g < G; ++g) f[size_t(g)] = 100.0f + float(k) + 0.001f * float(g % 1000);
+            init.push_back(std::move(f));
+        }
+        go.write_initial(c.initial_state_fields, init);
+        std::vector<float> y(size_t(G) * V);
+        for (int s = 1; s <= 6; ++s) {
+            for (int64_t g = 0; g < G; ++g)
+                for (size_t j = 0; j < V; ++j) y[size_t(g) * V + j] = float(j) + 0.5f * float(s) + 0.01f * float(g % 100);
+            y[jtp] = -1.0f;  // clamped at g = 0
+            go.write_step(s, y.data(), s == 6 || s == 3 ? fy.data() : nullptr);  // at s = 3 the pointer is ignored
+        }
+        try {
+            go.write_step(12, y.data(), nullptr);
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        go.close();
+    }
+    expect(threw, "td: hour 12 without a forecaster state throws");
+    auto m0 = read_messages(out + "/outputs/varda-single_202610221500_0.grib");
+    auto m3 = read_messages(out + "/outputs/varda-single_202610221500_3.grib");
+    auto m6 = read_messages(out + "/outputs/varda-single_202610221500_6.grib");
+    expect(m0.size() == 66 && m3.size() == 67 && m6.size() == 67, "td: 66 messages at hour 0, 67 at hours 3 and 6");
+    if (m6.size() == 67) {
+        expect(m6.back().get_string("shortName") == "TOT_PREC" && m6.back().get_long("startStep") == 0 &&
+                   m6.back().get_long("endStep") == 6 && m6[0].get_string("shortName") == "U_10M",
+               "td: U_10M first, TOT_PREC last with startStep 0, endStep 6");
+        auto tp = m6.back().get_double_array();
+        double e = 0;
+        for (int s = 1; s <= 6; ++s) e += double(float(float(int(jtp)) + 0.5f * float(s) + 0.01f * 5));
+        expect(tp[0] == 0.0 && std::fabs(tp[5] - 1000.0 * e) / (1000.0 * e) < 1e-6, "td: tp clamped, accumulated over the hours, x1000");
+        bool ok = true;
+        for (size_t i : {size_t(0), size_t(30)}) {
+            const std::string name = c.step_field_order[i];
+            size_t j = 0;
+            for (; j < V; ++j)
+                if (c.output_variables[j] == name) break;
+            auto v6 = m6[i].get_double_array();
+            auto v3 = m3[i].get_double_array();
+            double d6 = 0, d3 = 0;
+            for (int64_t g = 0; g < n0; g += 997) {
+                d6 = std::max(d6, std::fabs(v6[size_t(g)] - fy[size_t(g) * V + j]));
+                d3 = std::max(d3, std::fabs(v3[size_t(g)] - (float(j) + 1.5f + 0.01f * float(g % 100))));
+            }
+            ok &= d6 < 1e-3 && d3 < 1e-3;
+        }
+        expect(ok, "td: hour 6 fields are the forecaster's, hour 3 fields the downscaler's own");
+    }
+    fs::remove_all(out);
+}
+
 int main() {
     test_pure();
+    test_copy_rule_pure();
     const std::string scratch = env_or("VARDA_SCRATCH", "");
     const std::string cfg = env_or("VARDA_IO_CONFIG", scratch + "/realdata/assets/varda-io.json");
     if (scratch.empty() && !std::getenv("VARDA_IO_CONFIG")) {
@@ -230,5 +358,12 @@ int main() {
         return fails ? 1 : 0;
     }
     test_end_to_end(cfg, tdir);
+    const std::string tcfg = env_or("VARDA_TD_IO_CONFIG", scratch + "/realdata/assets/varda-td-io.json");
+    if (!exists(tcfg)) {
+        std::printf("skip temporal downscaler tests (%s missing)\n", tcfg.c_str());
+        return fails ? 1 : 0;
+    }
+    test_td_config(tcfg);
+    test_td_end_to_end(tcfg, tdir);
     return fails ? 1 : 0;
 }

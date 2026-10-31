@@ -5,8 +5,9 @@
 //             [--out Y.safetensors]
 //
 // The input tensor (default key `in.x`, e.g. from a golden file) must have the contract shape
-// (1, T_in, G, V_in). predict_step runs N times (default 1) on the same input, without the
-// activation hook; each call is timed, and every output must be bitwise equal to the first.
+// (1, T_in, G, V_in). The output is (1, T_out, 1, G, V_out), T_out = n_output_steps (1 for a
+// forecaster, 6 for the Varda downscaler). predict_step runs N times (default 1) on the same input,
+// without the activation hook; each call is timed, and every output must be bitwise equal to the first.
 // Prints load time, per-step wall time, and peak RSS (VmHWM: includes the resident pages of
 // the mapped model and input files). --out writes the first output as `out.y`.
 #include <sys/resource.h>
@@ -82,8 +83,9 @@ int main(int argc, char** argv) {
         auto model = varda::Model::load(model_path, opts);
         const double load_s = app::now_s() - t0;
         const varda::Config& cfg = model->config();
-        std::printf("model %s (uuid %s), %s %s, threads %d, load %.2f s, RSS after load %.2f GB\n",
-                    model_path.c_str(), cfg.uuid.c_str(), varda::to_string(opts.device).c_str(),
+        std::printf("model %s (uuid %s, %s, T_in %d, T_out %d), %s %s, threads %d, load %.2f s, RSS after load %.2f GB\n",
+                    model_path.c_str(), cfg.uuid.c_str(), cfg.model_kind.c_str(), cfg.n_input_steps,
+                    cfg.n_output_steps, varda::to_string(opts.device).c_str(),
                     varda::to_string(opts.precision).c_str(), omp_get_max_threads(), load_s,
                     proc_status_kb("VmRSS") / 1048576.0);
 
@@ -113,6 +115,9 @@ int main(int argc, char** argv) {
         std::printf("predict_step: first %.3f s, best %.3f s, mean %.3f s over %d (threads %d)%s\n", times[0], best,
                     sum / steps, steps, omp_get_max_threads(),
                     steps > 1 ? (repeat_bitwise ? ", repeats bitwise equal" : ", REPEATS DIFFER") : "");
+        if (cfg.n_output_steps > 1)
+            std::printf("  per call: %d output steps (best %.3f s per output step)\n", cfg.n_output_steps,
+                        best / cfg.n_output_steps);
         struct rusage ru;
         getrusage(RUSAGE_SELF, &ru);
 #ifdef __APPLE__

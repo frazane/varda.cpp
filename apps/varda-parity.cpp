@@ -9,7 +9,10 @@
 // produced, against each golden file: against TABLE of the tolerance file for --check, for
 // information only (NaN still fails) for --report-only.
 // A second predict_step runs without the hook; its output must be bitwise equal to the
-// hooked run's. Exit 0 only if every key is present, NaN-free and within tolerance.
+// hooked run's. The output returned by predict_step (y, (1, T_out, 1, G, V_out), step t at
+// y + t*G*V_out) is also compared with the golden `out.y` under that key's tolerance, so the
+// layout of the returned output is checked, not only the hooked tensor.
+// Exit 0 only if every key is present, NaN-free and within tolerance.
 #include <cstdio>
 #include <map>
 #include <set>
@@ -88,7 +91,8 @@ int main(int argc, char** argv) {
         const double load_s = app::now_s() - t0;
         const varda::Config& cfg = model->config();
         const auto keys = app::contract_keys(cfg.num_processor_layers);
-        std::printf("model %s (uuid %s), %s %s, threads %d, load %.1f s\n", model_path.c_str(), cfg.uuid.c_str(),
+        std::printf("model %s (uuid %s, %s, T_in %d, T_out %d), %s %s, threads %d, load %.1f s\n", model_path.c_str(),
+                    cfg.uuid.c_str(), cfg.model_kind.c_str(), cfg.n_input_steps, cfg.n_output_steps,
                     varda::to_string(opts.device).c_str(), varda::to_string(opts.precision).c_str(),
                     omp_get_max_threads(), load_s);
 
@@ -115,7 +119,7 @@ int main(int argc, char** argv) {
         if (x.shape != x_shape) throw std::runtime_error("golden in.x has shape " + x.shape_str());
 
         const int64_t y_numel = cfg.n_output_steps * cfg.n_data_nodes * cfg.n_output_vars;
-        std::vector<float> y_hook(y_numel), y_plain(y_numel);
+        std::vector<float> y_hook(y_numel), y_plain(y_numel), y_reported;
         std::vector<std::string> order;
         std::map<std::string, int> seen;
         varda::ActivationHook hook = [&](const std::string& key, const float* data, const std::vector<int64_t>& shape) {
@@ -123,6 +127,7 @@ int main(int argc, char** argv) {
             order.push_back(key);
             int64_t n = 1;
             for (auto s : shape) n *= s;
+            if (key == "out.y") y_reported.assign(data, data + n);
             for (auto& c : checks) {
                 c.shapes[key] = shape;
                 if (!c.golden->file->has(key)) { c.errors.push_back(key + ": not in golden file"); continue; }
@@ -143,6 +148,9 @@ int main(int argc, char** argv) {
         model->predict_step(x.as<float>(), y_plain.data(), nullptr);
         const double plain_s = app::now_s() - t0;
         const bool hook_inert = std::memcmp(y_hook.data(), y_plain.data(), y_numel * sizeof(float)) == 0;
+        // Informational: the returned output equals the reported out.y bit for bit (CPU: always).
+        const bool y_is_out_y = static_cast<int64_t>(y_reported.size()) == y_numel &&
+                                std::memcmp(y_hook.data(), y_reported.data(), y_numel * sizeof(float)) == 0;
 
         // Reported keys must be exactly the contract keys, each once.
         std::vector<std::string> contract_errors;
@@ -155,6 +163,8 @@ int main(int argc, char** argv) {
 
         report["model"] = model_path;
         report["uuid"] = cfg.uuid;
+        report["model_kind"] = cfg.model_kind;
+        report["n_output_steps"] = cfg.n_output_steps;
         report["device"] = varda::to_string(opts.device);
         report["precision"] = varda::to_string(opts.precision);
         report["threads"] = omp_get_max_threads();
@@ -163,6 +173,7 @@ int main(int argc, char** argv) {
         report["predict_hook_s"] = hook_s;
         report["predict_plain_s"] = plain_s;
         report["hook_inert"] = hook_inert;
+        report["returned_y_bitwise_out_y"] = y_is_out_y;
         report["tolerances"] = used_tol;
         report["errors"] = contract_errors;
         for (const auto& e : contract_errors) std::printf("ERROR %s\n", e.c_str());
@@ -204,6 +215,26 @@ int main(int argc, char** argv) {
                 jc["keys"][k] = {{"shape", c.shapes[k]}, {"absmax", m.absmax}, {"max_abs", m.max_abs},
                                  {"rel_absmax", m.rel_absmax}, {"n_nan", m.n_nan}, {"n_ref_bad", m.n_ref_bad}, {"tol", tol}, {"ok", ok}};
             }
+            // The returned y against the golden out.y (same tolerance as the key out.y).
+            if (c.golden->file->has("out.y")) {
+                const varda::TensorView& r = c.golden->file->peek("out.y");
+                const std::vector<int64_t> y_shape = {1, cfg.n_output_steps, 1, cfg.n_data_nodes, cfg.n_output_vars};
+                if (r.dtype != varda::DType::F32 || r.shape != y_shape) {
+                    c.errors.push_back("returned y: golden out.y is " + r.shape_str() + ", expected " +
+                                       app::shape_str(y_shape));
+                } else {
+                    const app::Metric m = app::compare(y_hook.data(), r.as<float>(), y_numel);
+                    const double tol = (!c.tol.is_null() && c.tol.contains("out.y")) ? c.tol["out.y"].get<double>() : -1;
+                    const bool ok = m.n_nan == 0 && m.n_ref_bad == 0 && (tol < 0 || m.rel_absmax <= tol);
+                    if (!ok) c.errors.push_back("returned y: rel_absmax " + std::to_string(m.rel_absmax) +
+                                                " vs golden out.y exceeds the out.y tolerance or is non-finite");
+                    std::printf("  %-14s %-22s %12.4e %12.4e %12.4e %10.2e %7.3f %s\n", "(returned y)",
+                                app::shape_str(y_shape).c_str(), m.absmax, m.max_abs, m.rel_absmax, tol,
+                                tol > 0 ? m.rel_absmax / tol : 0.0, !ok ? "FAIL" : (m.max_abs == 0 ? "bitwise" : "ok"));
+                    jc["returned_y"] = {{"absmax", m.absmax}, {"max_abs", m.max_abs}, {"rel_absmax", m.rel_absmax},
+                                        {"n_nan", m.n_nan}, {"tol", tol}, {"ok", ok}};
+                }
+            }
             jc["worst_ratio"] = worst_ratio;
             jc["worst_key"] = worst_key;
             jc["errors"] = c.errors;
@@ -213,8 +244,8 @@ int main(int argc, char** argv) {
             if (!c.errors.empty()) status = 1;
             report["checks"].push_back(jc);
         }
-        std::printf("\npredict_step: %.3f s with hook, %.3f s without; hook inert: %s\n", hook_s, plain_s,
-                    hook_inert ? "yes (bitwise)" : "NO");
+        std::printf("\npredict_step: %.3f s with hook, %.3f s without; hook inert: %s; returned y == out.y: %s\n",
+                    hook_s, plain_s, hook_inert ? "yes (bitwise)" : "NO", y_is_out_y ? "bitwise" : "no");
         std::printf("%s\n", status == 0 ? "PASS" : "FAIL");
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());

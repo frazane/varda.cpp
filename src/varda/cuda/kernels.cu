@@ -409,14 +409,16 @@ __global__ void output_kernel(OutputArgs a) {
     const int lane = threadIdx.x & 31;
     const int64_t g = (int64_t)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (g >= a.G) return;
-    const T* dec = static_cast<const T*>(a.dec) + g * a.ld_dec;
-    float* y = a.y + g * a.V_out;
+    const int64_t t = blockIdx.y;  // output step
+    const T* dec = static_cast<const T*>(a.dec) + g * a.ld_dec + t * a.V_out;
+    const int64_t row = t * a.G + g;
+    float* y = a.y + row * a.V_out;
     for (int v = lane; v < a.V_out; v += 32) {
         float val = to_f<T>(dec[v]);
         const int rs = a.res_src[v];
         if (rs >= 0) val = val + a.xn_step[g * a.V_in + rs];
         y[v] = val;
-        if (a.pre_bound) a.pre_bound[g * a.V_out + v] = val;
+        if (a.pre_bound) a.pre_bound[row * a.V_out + v] = val;
     }
     __syncwarp();
     // Boundings in config order, normalised space, in place. Lane 0 applies them
@@ -573,8 +575,9 @@ void attention(const AttentionArgs& a, cudaStream_t s, int vpl) {
 
 template <class T>
 void output_assemble(const OutputArgs& a, cudaStream_t s) {
-    if (a.G <= 0) return;
-    output_kernel<T><<<blocks_for(a.G, 8), 256, 0, s>>>(a);
+    if (a.G <= 0 || a.T_out <= 0) return;
+    if (a.T_out > 65535) throw std::runtime_error("output_assemble: T_out > 65535");
+    output_kernel<T><<<dim3(blocks_for(a.G, 8), a.T_out), 256, 0, s>>>(a);
     VARDA_CUDA_LAUNCH();
 }
 

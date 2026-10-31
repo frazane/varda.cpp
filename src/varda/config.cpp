@@ -50,7 +50,9 @@ Config parse_config(const std::string& json_text) {
         std::string k = arch.at(part).at("kind").get<std::string>();
         if (k != kind) unsupported(std::string("architecture.") + part + ".kind '" + k + "'");
     };
-    want_kind("model", "enc_proc_dec");
+    c.model_kind = arch.at("model").at("kind").get<std::string>();
+    if (c.model_kind != "enc_proc_dec" && c.model_kind != "enc_proc_dec_interpolator")
+        unsupported("architecture.model.kind '" + c.model_kind + "'");
     want_kind("encoder", "graph_transformer_forward_mapper");
     want_kind("processor", "graph_transformer_processor");
     want_kind("decoder", "graph_transformer_backward_mapper");
@@ -84,7 +86,22 @@ Config parse_config(const std::string& json_text) {
     require(c.n_data_nodes > 0 && c.n_hidden_nodes > 0, "node counts");
     require(c.node_attr_dim >= 1 && c.edge_attr_dim >= 1, "node_attr_dim and edge_attr_dim must be >= 1");
     require(c.layer_norm_eps > 0.0f, "layer_norm_eps");
-    if (c.n_output_steps != 1) unsupported("n_output_steps != 1");
+    if (c.is_interpolator()) {
+        require(c.n_output_steps >= 1, "n_output_steps");
+        const json& t = j.at("times");
+        c.input_times = t.at("input").get<std::vector<int>>();
+        c.output_times = t.at("target").get<std::vector<int>>();
+        c.frequency_hours = t.at("frequency_hours").get<int>();
+        require((int)c.input_times.size() == c.n_input_steps, "times.input size != n_input_steps");
+        require((int)c.output_times.size() == c.n_output_steps, "times.target size != n_output_steps");
+        require(c.frequency_hours >= 1, "times.frequency_hours");
+        for (size_t i = 1; i < c.input_times.size(); ++i)
+            require(c.input_times[i] > c.input_times[i - 1], "times.input not increasing");
+        for (size_t i = 1; i < c.output_times.size(); ++i)
+            require(c.output_times[i] > c.output_times[i - 1], "times.target not increasing");
+    } else {
+        if (c.n_output_steps != 1) unsupported("n_output_steps != 1 for a forecaster");
+    }
 
     const json& v = j.at("variables");
     c.var_data = v.at("data").get<std::vector<std::string>>();

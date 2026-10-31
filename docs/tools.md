@@ -28,14 +28,28 @@ records its qualified name, constructor args, state and items; no foreign code r
 ## What is checked
 
 - Supported classes up front (model, encoder/processor/decoder, block, residual, bounding), one dataset
-  `data`, one output step; `qk_norm` / `update_src_nodes` rejected; Linear/LayerNorm dtype fp32; LayerNorm
+  `data`; `qk_norm` / `update_src_nodes` rejected; Linear/LayerNorm dtype fp32; LayerNorm
   weight present (a missing bias goes to `absent`).
+- Model kinds (`docs/format.md` section 1.2): `AnemoiModelEncProcDec` -> `enc_proc_dec`, which must have one output step;
+  `AnemoiModelEncProcDecMultiOutInterpolator` (the temporal downscaler) -> `enc_proc_dec_interpolator`, the only kind
+  allowed `n_step_output` > 1. For it the converter writes `dims.n_output_steps` = `n_step_output` and `times` from the
+  model's `input_times` / `output_times`, which must equal `config.training.explicit_times`, the
+  `metadata_inference` relative date indices, have lengths `n_step_input` / `n_step_output`, be strictly increasing,
+  and come with a whole-hour data frequency equal to the metadata timestep.
+- Two pickle layouts of anemoi-models are read (both in Varda-single-1.0): `model.node_attributes` a
+  NamedNodesAttributes and `model._graph_data` a HeteroData (forecaster, anemoi-core 3c5fc21), or a ModuleDict /
+  dict per dataset (downscaler, anemoi-core d9cf401, which also has no block `attn_channels`: the query projection
+  width is used). The tensors and the config they produce have the same names and meaning.
 - Strict accounting: every tensor reachable in the checkpoint (deduplicated by identity) is converted,
   exported to the config (indices, bounding), a duplicate asserted equal to a converted one (HeteroData
   copies of the graphs), or listed in `config.unused` with a reason; otherwise the conversion fails.
-- Cross-checks: dimensions vs weights shapes, graph `edge_index` range vs `edge_inc`, index lists vs the
-  IndexCollection and variable names, identical block hyperparameters, one LayerNorm eps, bounding
-  variables vs indices, normaliser buffers vs raw statistics (decides the `unused` reason text).
+- Cross-checks: dimensions vs weights shapes (`enc.emb_src` / `dec.emb_dst` in = n_input_steps * n_input_vars +
+  node attr, `dec.out_proj` = (n_output_steps * n_output_vars, C) and its bias), graph `edge_index` range vs
+  `edge_inc`, index lists vs the IndexCollection and variable names, identical block hyperparameters, one LayerNorm
+  eps, bounding variables vs indices, normaliser buffers vs raw statistics (decides the `unused` reason text).
+- Forcings (`build_forcings`, as anemoi-inference classifies them, for both runners): from the metadata categories
+  `computed_forcing` / `constant_in_time`, never from names; the metadata's input / output relative date indices must
+  number `n_input_steps` / `n_output_steps`.
 - Identity in `source`: path, size, sha256, mtime, uuid, run_id, interface id, anemoi-core commit.
 
 Container: tensors ordered 8-byte dtypes (I64) first, then by name; no gaps; header JSON space-padded so the
@@ -48,10 +62,22 @@ VARDA_CONVERTED=a.safetensors:b.safetensors VARDA_WEIGHTS_PT=a/weights.pt:b/weig
   .venv/bin/python -I python/tests/test_convert.py
 ```
 Checks container validity, the config fields `src/varda/config.cpp` reads, the exact tensor name set
-(from the contract table, driven by the config's blocks and `absent`), dtypes/shapes, bitwise equality with
+(from the contract table, driven by the config's blocks and `absent`, plus `grid.*` and the cutout masks), dtypes/shapes
+(including `dec.out_proj` = n_output_steps * n_output_vars rows), bitwise equality with
 `weights.pt` and equality of the config with the sibling `config.json` (except `source.checkpoint`/`mtime`),
-plus restricted-unpickler tests (a pickled `os.system` is stubbed, `getattr` on non-stubs and unknown
-rebuild functions are rejected). File-based tests are skipped when the env vars are unset.
+the interpolator's `times` / multi-step head and, for the Varda downscaler, its values; plus restricted-unpickler tests
+(a pickled `os.system` is stubbed, `getattr` on non-stubs and unknown rebuild functions are rejected) and
+`interpolator_times` tests (every metadata disagreement is rejected). File-based tests are skipped when the env vars
+are unset. An empty `VARDA_WEIGHTS_PT` entry skips the bitwise test for that file (the downscaler has no independent
+weight export), e.g. for the three models:
+
+```
+S=$VARDA_SCRATCH/converted; W=$REF_SCRATCH/converted   # weights.pt: the directories of the reference weight exports
+VARDA_CONVERTED=$S/varda-td/model.safetensors:$S/varda/model.safetensors:$S/dev/model.safetensors \
+VARDA_WEIGHTS_PT=:$W/<varda>/weights.pt:$W/<dev>/weights.pt \
+VARDA_CKPTS=$VARDA_SCRATCH/hf/varda-temporal-downscaler-det-sgm/model.ckpt:$VARDA_CKPT:$VARDA_DEV_CKPT \
+  srun $VARDA_SLURM_CPU .venv/bin/python -I python/tests/test_convert.py
+```
 
 ## Verification (2026-10-22; one conversion per model and one test run, CPU node)
 
@@ -74,6 +100,30 @@ The Varda file differs from the bootstrap only in the header (config `source.che
 bootstrap recorded the path and mtime of an earlier copy of the same checkpoint file; the HF download has the
 same sha256). Varda's raw `statistics` are not the ones folded into the normaliser buffers (max rel.
 difference 28.4), as in the reference; the `unused` reason says so.
+
+### Temporal downscaler (`varda-td`, 2026-10-30; CPU node)
+
+`$VARDA_SCRATCH/converted/varda-td/model.safetensors` from the Hugging Face file
+`varda-temporal-downscaler-det-sgm/model.ckpt` (sha256 452fda53...a21d0e, uuid `00e40f03-2f7e-4c1c-8e6d-91ed9062249f`).
+There is no independent weight export for it; `test_convert.py` checks container, config, names, shapes, grid and the
+downscaler's values (all 15 tests pass on the three converted files).
+
+| | Varda temporal downscaler |
+|---|---|
+| checkpoint tensors / converted / unused | 429 / 384 / 45 (388 tensors in the file with `grid.*` and the two cutout masks) |
+| tensor bytes / file bytes | 1 299 947 436 / 1 300 003 628 |
+| `dims` | 2 input steps, 6 output steps, 77 in / 67 out / 78 data variables, C 1024, 16 heads x 64, 16 layers, `latent_skip` false |
+| `times` | input [0, 6], target [1..6], 1 h; `forcings.timestep_hours` 1 |
+| head | `dec.out_proj.weight` (402, 1024) = 6 x 67 rows; `enc.emb_src.weight` (1024, 158) = 2 x 77 + 4 |
+| residual / bounding / mappers | skip step 0 / relu(tp) / encoder and decoder 16 chunks |
+| forcings | dynamic cos/sin_julian_day, cos/sin_local_time, insolation; constant cos/sin_latitude, cos/sin_longitude, lsm, z |
+| normaliser buffers vs raw statistics | max rel. difference 4.61: the raw statistics are not the normaliser's source (as for the forecaster) |
+| data section sha256 | e8fda2a13b38f2e622050fcc8c0bedb6fee083b3780a8d89af30406c2a48a45e |
+| whole-file sha256 | 9b6c6e77481daa4405f8308c2b98d942224d70ac3b81f7c6e92e7842d27073e9 |
+| time | 20 s wall clock, 2.9 GB peak RSS |
+
+Regression: with the extended converter, the forecaster and the dev model re-convert to files whose whole-file sha256
+equals the files in use (`converted/varda/`, `converted/dev/`): no change to their tensors or configs.
 
 ## User tools (real-data forecasts)
 

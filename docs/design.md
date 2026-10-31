@@ -23,19 +23,27 @@ Backend ── CPU fp32 oracle (OpenMP + OpenBLAS)                              
 Rollout ── host loop (any backend) / device loop (one CUDA graph per step)   docs/rollout-engine.md
        └─ computed forcings, bitwise equal to anemoi's                        docs/forcings.md
 
+Temporal downscaler (varda-td, the second HF model; same converter, backends and contract,   docs/downscaler.md
+   config kind enc_proc_dec_interpolator, 6 output steps per predict_step):
+   forecaster states at t, t+6h ──► Downscaler (src/varda/downscale: inputs assembled by name,
+   constants from x0, computed forcings at both dates) ──► 6 hourly states (t+1 .. t+6)
+
 Real data (varda-forecast; the engine above is unchanged):                  docs/forecast.md
 KENDA-CH1 + IFS open data (GRIB) ── vertical interpolation, MIR regrid matrix, cutout,
    │                                  merge, forcings → x0                    docs/io-input.md
    ▼  (input thread, parallel with model load + rollout set-up)
 Rollout ── y per step ──► writer thread: post-process, parallel GRIB encode,   docs/io-output.md
                           lam (ICON templates) + global (IFS templates) files
+       └─ y of every step ──► Downscaler ──► hourly writer thread: varda-single_<dateTime>_<h>.grib
+                              (tp accumulated hourly; hours 6, 12, .. copied from the forecaster)
 ```
 
 Library: `src/varda/` (`varda.h` is the public API). Apps: `varda-info` (inspect a file),
 `varda-run` (forward + timing), `varda-parity` (one-step parity against golden data),
-`varda-bench` (GPU timing), `varda-rollout` (rollout, per-step comparison and judging); with
+`varda-bench` (GPU timing), `varda-rollout` (rollout, per-step comparison and judging),
+`varda-downscale` (the downscaling loop on stored inputs, judged against reference dumps); with
 ecCodes, `apps/io/`: `varda-prepare` (GRIB -> x0), `varda-grib-write`/`varda-grib-compare` (output
-side), `varda-forecast` (GRIB in, rollout, GRIB out).
+side), `varda-forecast` (GRIB in, rollout, optional temporal downscaler, GRIB out).
 Tests: `docs/testing.md`.
 
 ## 2. Decisions
@@ -64,6 +72,14 @@ Tests: `docs/testing.md`.
 - **Rollout as a decode loop.** Preallocated device window, update kernel inside the step's
   graph, double-buffered outputs/forcings with one graph per parity, forcings for the next step
   computed on the host while the GPU runs, callback one step behind. Update overhead 0.3%.
+- **The downscaler is the same engine with T_out output steps.** The interpolator differs from the
+  forecaster only in the decoder width (6 x 67 channels, time-major), the residual slot (the window
+  start) and the per-step bounding, so it is one config kind and one code path on every backend, not a
+  second model class; the generality suite gained two interpolator configurations. The window loop is
+  host-level and assembles every input channel by name (prognostics from the forecaster's states,
+  constants from its `x0`, forcings computed), and the forecaster's raw outputs feed it from memory rather
+  than through GRIB files as anemoi-inference does; the difference (24-bit packing, ~1e-7) is measured, not
+  assumed (`docs/downscaler.md` §5, §6).
 
 ## 3. Verification (numbers: docs/results.md)
 
@@ -77,7 +93,9 @@ Tests: `docs/testing.md`.
 | real-data input, 2026-10-22T15 | anemoi-inference's dumps of every stage (sources, regrid, cutout, x0) | bitwise |
 | real-data output | anemoi-inference's GRIB files, fed with its own states (encoder only); step 0 of a forecast | byte-identical |
 | real-data rollout | the original driven by anemoi-inference, fp16 and fp32 | per-step tolerances (fp16 `fast-fp16-vs-ref-fp16`), fp32 reported |
-| internal | hook vs no hook, graph vs eager, device loop vs host loop, computed vs replayed forcings, thread counts | bitwise |
+| downscaler, one call, 30 activations | golden dumps of the original interpolator, made here (CPU fp32 pyg, CUDA fp32/fp16 triton) | calibrated tolerances, `tolerances/varda-td.json` |
+| downscaler loop, 4 windows x 6 hours | anemoi-inference's `temporal_downscaler` runner on the real forecaster run, its exact inputs and the states it wrote | judged per window and hour with `tolerances/downscale/varda-td.json` (`docs/downscaler.md` §6, §7); hourly GRIB files compared message by message (§7) |
+| internal | hook vs no hook, graph vs eager, device loop vs host loop, computed vs replayed forcings, thread counts; downscaler: assembly vs an independent by-name implementation, `run_window` vs `run` | bitwise |
 
 ## 4. Methodology
 
@@ -137,6 +155,20 @@ Generic lessons from this project. Details and measurements are in the linked do
   operation order in double precision, glibc reproduces numpy bit for bit.
 - **Double-buffer by parity and capture one graph per parity**, rather than patching graph
   parameters. Deliver results one step behind so the GPU never waits for the host.
+
+**Second model**
+- **Pin the reference code to the checkpoint's own provenance, not to the family.** The two HF models
+  pin different anemoi-core revisions, and the later revision silently changes what `latent_skip: false`
+  means (it decodes the encoder output instead of the processor's). The golden data settled it bitwise
+  (`latent == proc.15.out`); a reference venv built from the forecaster's lock would have produced the wrong
+  model. Read the revision out of the checkpoint and build the venv from it.
+- **Reproduce the reference's file order by finding its cause, not by sorting.** The hourly files put
+  `tp` last although the model emits it at index 18: the runner shares one `fields` dict between a
+  window's initial state and its hourly states, so first-seen order wins. The io config records that
+  order explicitly (`step_field_order`) with the reason, and the writer follows the config.
+- **Each new model is also a new reference run.** No golden data existed for the downscaler, so the
+  reference harness (hooks, manifests, determinism runs, calibration of tolerances) was generalised and
+  rerun; the calibration script was first checked to reproduce the forecaster's tolerance files exactly.
 
 **Real-data I/O**
 - **The reference's numerics live in its dependencies.** numpy's float32 `log` is its own SIMD routine, not glibc's

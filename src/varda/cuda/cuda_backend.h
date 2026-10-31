@@ -32,11 +32,12 @@ class CudaBackend : public Backend {
 public:
     // Element counts of the device tensors.
     virtual int64_t input_numel() const = 0;       // x, xn: (1, T_in, [1,] G, V_in)
-    virtual int64_t output_numel() const = 0;      // yn, y: (1, 1, 1, G, V_out)
+    virtual int64_t output_numel() const = 0;      // yn, y: (1, T_out, 1, G, V_out); T_out = 1 (forecaster)
 
     // x (1, T_in, G, V_in) physical -> xn (1, T_in, 1, G, V_in): x * mul, rounded, then + add.
     virtual void normalise(const float* x, float* xn, cudaStream_t s) = 0;
-    // xn normalised window -> yn (1, 1, 1, G, V_out) normalised, after the residual and bounding.
+    // xn normalised window -> yn (1, T_out, 1, G, V_out) normalised, after the residual and bounding
+    // (T_out = config n_output_steps: 1 for the forecaster, every output step of the interpolator).
     // xn and yn must not alias the backend's own buffers; xn is only read.
     virtual void forward_normalised(const float* xn, float* yn, cudaStream_t s) = 0;
     // yn normalised -> y physical: (yn - add) / mul.
@@ -47,6 +48,12 @@ public:
     // Runs one eager forward pass on internal buffers (if none ran yet), so that every cuBLASLt plan
     // exists before a caller's graph capture. Synchronises.
     virtual void prepare() = 0;
+
+    // Re-creates the backend's own stream (predict_step, prepare) with the device's highest
+    // priority, so that its kernels are scheduled ahead of those of other streams (e.g. a model
+    // running on the same GPU from another thread). Synchronises the old stream; call it between
+    // forward passes, never during a capture. Results are unchanged (same kernels, same order).
+    virtual void use_high_priority_stream() = 0;
 
     virtual int device() const = 0;               // CUDA device ordinal
     virtual size_t weight_bytes() const = 0;      // device bytes held by weights and graphs

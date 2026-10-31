@@ -85,8 +85,14 @@ public:
     // order (the input state: cfg.initial_state_fields). Top-level post-processors run first.
     void write_initial(const std::vector<std::string>& names, const std::vector<std::vector<float>>& values);
     // One step: y is (G, V_out), physical, bounded, in model output order (Config::var_output).
-    void write_step(int step_hours, const float* y);
+    // `forecaster_y`: for the temporal downscaler's output (an output with a CopyFromForecaster
+    // post-processor), the forecaster's own (G, V_out) state of this step, same variable order; it must
+    // be given at every step the post-processor applies to (a positive multiple of its
+    // common_leadtime_hours) and is ignored otherwise. nullptr when no output copies.
+    void write_step(int step_hours, const float* y, const float* forecaster_y = nullptr);
     // Closes the files (a file appears under its final name only here; written as <name>.part before).
+    // The file writes of the last state are left pending by write_initial/write_step so that they overlap
+    // the next state's encoding; close(), stats() and files() wait for them (and rethrow a write error).
     void close();
 
     // Files created so far (final names), in creation order, per output.

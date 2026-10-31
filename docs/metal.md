@@ -167,6 +167,10 @@ GPU checks when a device is exposed; a GPU-less hosted runner reports the skip.
 
 ## Limits
 
+The temporal downscaler (`varda-td`, six output steps per call, `docs/downscaler.md`) is not supported on Metal yet:
+the backend refuses a model with `n_output_steps != 1` at load (`--device cpu` or `cuda` run it). Generalising the
+output stage as the CPU and CUDA backends did (`docs/cuda.md` §11) is the pending work.
+
 No Metal graph capture or GPU-resident rollout window yet. The first call
 includes MPS kernel setup. Large-model performance
 has not been measured; synthetic timings must not be extrapolated to Varda.

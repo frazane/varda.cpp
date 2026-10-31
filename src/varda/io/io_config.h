@@ -58,7 +58,7 @@ struct TemplateIndexEntry {
 };
 
 struct PostProcessorDef {
-    enum Type { Accumulate, Rescale, ExtractFromState, ExtractMask, AssignMask } type = Accumulate;
+    enum Type { Accumulate, Rescale, ExtractFromState, ExtractMask, AssignMask, CopyFromForecaster } type = Accumulate;
     std::vector<std::string> accumulations;  // Accumulate
     bool allow_negative = false;             // Accumulate
     double scale = 1, offset = 0;            // Rescale
@@ -66,6 +66,14 @@ struct PostProcessorDef {
     std::string source;                      // ExtractFromState
     std::string mask;                        // ExtractMask / AssignMask: "<source>/cutout_mask"
     bool as_slice = false, inverse = false;  // ExtractMask
+    // CopyFromForecaster (the MeteoSwiss `copy-prognostic-from-forecaster` filter of the temporal
+    // downscaler's output, docs/downscaler.md): at an output step that is a positive multiple of
+    // `common_leadtime_hours`, every field selected by `params_to_copy` (glob patterns on the anemoi
+    // name), or not selected by `params_to_keep` when that list is given instead, takes the
+    // forecaster's value of the same step. Exactly one of the two lists is non-empty.
+    int common_leadtime_hours = 0;
+    std::vector<std::string> params_to_copy, params_to_keep;
+    bool copies(const std::string& variable_name) const;  // CopyFromForecaster: is this field replaced?
 };
 
 struct PatchRule {
@@ -90,10 +98,16 @@ struct OutputDef {
     std::vector<ModifierDef> modifiers;
     bool check_encoding = true;
     double missing_value = -9999;
+    std::string negative_step_mode = "error";  // anemoi's grib output option, recorded: "error" or "skip"; no
+                                               // negative step is ever written here ("write" is refused)
 };
 
 struct IoConfig {
     std::string schema, grid;
+    // "forecaster" (default) or "temporal_downscaler" (the hourly output of docs/downscaler.md:
+    // `timestep_hours` is then the output frequency, 1 h, and the single output's
+    // CopyFromForecaster post-processor needs the forecaster's state at the 6-hourly steps).
+    std::string runner = "forecaster";
     std::vector<double> area;
     int64_t number_of_grid_points = 0;
     int timestep_hours = 0, lead_time_hours = 0;
@@ -104,6 +118,12 @@ struct IoConfig {
     std::vector<std::string> model_variables;   // dataset variable order (80)
     std::vector<std::string> output_variables;  // model output order (67)
     std::vector<std::string> initial_state_fields;  // 66 prognostics then z lsm slor sdor
+    // Optional: the message order of a step file when it is not the model output order (the temporal
+    // downscaler runner shares one fields dict between the window's initial state and its hourly states, so
+    // the hourly files hold the initial-state fields first and tp last; docs/downscaler-reference.md §3.5,
+    // docs/io-output.md). Same set as
+    // `output_variables`; empty = output order.
+    std::vector<std::string> step_field_order;
     std::vector<NamerRule> kenda_namer_rules;
     std::vector<PostProcessorDef> post_processors;  // top level, config order
     std::vector<OutputDef> outputs;                 // lam, global
