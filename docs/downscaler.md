@@ -521,6 +521,27 @@ writing after it: the same writer), `VARDA_TD_DEVICE_LOOP=0` (host loop) 17.14 s
 gather kernel, under the default lazy module loading, waited for the rollout's work; the constructor now launches it once
 (16-22 ms since).
 
+**The combined state** (device-resident loop, concurrent hourly writer, one or two GPUs), measured in two jobs on one
+node (4 x A100-SXM4-80GB, 128 cores; `$VARDA_SCRATCH/jobs/td-final2`), fp16, CUDA graph on, `--assets`, 24 h on
+2026-10-22T15 and 120 h on 2026-10-30T15, one and two GPUs alternating after a discarded first run. Seconds, process wall
+clock / `forecast.json` total:
+
+| CPUs of the job | GPUs | 24 h | 120 h (20 windows, 163 files) |
+|---|---|---|---|
+| 32 | 1 | 17.6 / 16.6, 17.9 / 16.9 | 60.1 / 58.8 |
+| 32 | 2 | 17.7 / 16.6, 17.6 / 16.4 | 62.4 / 60.9 |
+| 64 | 1 | | 40.8 / 39.3, 39.1 / 37.8 |
+| 64 | 2 | 13.2 / 12.1 | 37.5 / 36.4, 39.8 / 38.6 |
+
+With 32 CPUs the hourly writer sets the total (the loop is blocked on it for 2.4-2.9 s at 24 h and 30.5-31 s at 120 h;
+the windows are 730 ms of GPU work throughout), and a second GPU changes nothing in fp16. With 64 CPUs the writer runs
+nearly twice as fast and the 5-day forecast takes 37.5-40.8 s instead of 59-62 s, still blocked on the writer for
+12-18 s at 120 h; a second GPU then saves the rollout 4-5 s (23.9-24.6 s instead of 28.6-28.7 s) but the writer still
+sets the total. fp32, two GPUs, 32 CPUs, on this 80 GB node: 53.3 / 51.4 s (one GPU does not fit). Every run byte-identical:
+24 h to the reference runs above (35 files each), 120 h to the 120 h run of the committed host-loop binary (163 files).
+`VARDA_TD_CHECK_INPUTS=1` with the downscaler on the second GPU (the `cudaMemcpyPeerAsync` feed): 4 of 4 windows bitwise
+equal to the host assembly, outputs byte-identical.
+
 ## 8. Open points
 
 - The fp16 critical path is now the hourly GRIB writer (§7, device-resident loop): ~140 CPU s of encoding per 24 h on
@@ -528,11 +549,13 @@ gather kernel, under the default lazy module loading, waited for the rollout's w
   window is 0.66 s of GPU work and its copies are off the critical path; the loop waits for the writer (2.5-2.9 s at 24 h,
   31 s at 120 h). Ways forward, not done: (b) cheaper hourly encoding: the keys part (~40 CPU s: template clone and
   `set_key_vals` per message) and the column gathers (~23 CPU s) are repeated identically every hour; (c) more CPUs per
-  GPU (the job uses 32 of the node's 128). ((a), the device-resident loop, is done: §2, §7.)
+  GPU: measured, 64 CPUs instead of 32 take the 5-day forecast from 59-62 s to 37.5-40.8 s (§7, the combined state), still
+  blocked on the writer for 12-18 s, so (b) is the next lever. ((a), the device-resident loop, is done: §2, §7.)
 - The device loop across two GPUs (`Options::cuda_device` of the downscaler differing from the forecaster's) is verified by
   `tests/test_downscale.cpp` §6 on the synthetic model (two A100-SXM4-80GB on NVLink, peer access enabled: `feed` =
-  `peer`, every variant bitwise; `$VARDA_SCRATCH/jobs/td-devloop-5`). The driver-staged path (no peer access) and
-  `varda-forecast` on two GPUs are not exercised here.
+  `peer`, every variant bitwise; `$VARDA_SCRATCH/jobs/td-devloop-5`) and by `varda-forecast --downscaler-device cuda:1`
+  with `VARDA_TD_CHECK_INPUTS=1` on the real model (§7, the combined state: 4 of 4 windows bitwise, files byte-identical).
+  The driver-staged path (no peer access) is not exercised.
 - The overlap is used with the device rollout only; `--host-loop`, CPU and Metal run the downscaler after the rollout.
 - Only downscalers with two input states (window start and end) are supported.
 - Two dates are verified at 24 h. On 2026-10-30T15 every judged table holds without change, 24/24 each:

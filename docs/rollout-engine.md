@@ -117,6 +117,14 @@ The host never waits for the GPU except for the copy the callback consumes, one 
 so the next step is always queued before the callback runs. `on_window` (verification only) adds a
 window copy and a stream sync per step.
 
+**Step hook** (`set_step_hook`, used by the temporal downscaler's device-resident loop, `docs/downscaler.md` §2).
+After step `s` is enqueued the hook is called on the host with `y[p]` (device pointer) and the event that marks the
+step's end; it returns an event of its own, and step `s + 2`, the next writer of `y[p]`, waits for that event on the
+GPU before its graph launch. The hook enqueues a device copy of the output (on the same device, or
+`cudaMemcpyPeerAsync` to another one) into the consumer's ring and records the event after it; the rollout's streams
+never synchronise with the host for it. Without a hook nothing changes (the rollout's numerics and tests are
+untouched).
+
 **Why bitwise equal to the host loop.** Both run the same backend kernels on the same inputs: the
 host loop calls `Model::predict_step`, which the backend guarantees bitwise equal to
 `predict_step_device` = `denormalise(forward_normalised(normalise(x)))` (`cuda_backend.h`); the update and

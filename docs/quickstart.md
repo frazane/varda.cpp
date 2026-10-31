@@ -21,6 +21,10 @@ The result is a directory of GRIB files, `./varda-out/<YYYYmmddTHH>/outputs/`, p
 | `--device cuda\|cpu` | cuda | CPU: about 60 s per step (fp32) |
 | `--no-downscaler` | | forecaster only: skip the temporal downscaler even if the bundle holds it (section 1) |
 | `--gpus 1\|2` | 1 | 2: the temporal downscaler runs on a second GPU (`varda-forecast --downscaler-device cuda:1`): `srun` gets `--gres=gpu:2` (it replaces a `--gres=gpu:N` of the srun options, else it is added); inside an allocation two GPUs must be visible (`nvidia-smi -L`). Needs `--device cuda` and a bundle with the downscaler. 1: both models share one GPU |
+
+More CPUs for the job help more than a second GPU: the hourly GRIB encoding sets the total, and 64 CPUs instead of 32
+(`-c 64` in `VARDA_SLURM_GPU` / `VARDA_SRUN_ARGS`) take a 5-day fp16 forecast from about 60 s to about 38 s and a 24 h one
+with `--gpus 2` to 13 s (`docs/results.md` section 6).
 | `--out DIR` | `./varda-out/<YYYYmmddTHH>` | |
 | `-- ...` | | any further `varda-forecast` option (`docs/forecast.md` section 2), e.g. `-- --allow-nans` |
 

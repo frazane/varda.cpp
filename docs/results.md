@@ -381,5 +381,27 @@ job on another node, alternating binaries, two runs each, fp16, same inputs:
 
 All 163 files byte-identical between the two binaries, and between the two runs of the new one. The loop no longer
 waits for the writer, but its windows get slower (the encoders' CPU load slows the loop's pageable copies, as at 24 h),
-so the loop itself is now the critical path at 2.6 s per window for a 0.73 s forward pass: the device-resident loop of
-`docs/downscaler.md` §8 is the next lever.
+so the loop itself was then the critical path at 2.6 s per window for a 0.73 s forward pass.
+
+### Device-resident loop, one or two GPUs, 32 or 64 CPUs
+
+**Setup.** The device-resident downscaler loop (`docs/downscaler.md` §2: inputs assembled on the GPU from the rollout's
+device outputs, outputs through a page-locked staging ring; windows are 730 ms of GPU work), the concurrent hourly
+writer, and the downscaler on the forecaster's GPU or on a second one (`--downscaler-device cuda:1`,
+`./varda forecast --gpus 2`). Two jobs on one node (4 x A100-SXM4-80GB, 128 cores), fp16, CUDA graph on, `--assets`,
+24 h on 2026-10-22T15 and 120 h on 2026-10-30T15, one and two GPUs alternating after a discarded first run. Seconds,
+process wall clock / `forecast.json` total:
+
+| CPUs of the job | GPUs | 24 h (35 files) | 120 h (163 files) |
+|---|---|---|---|
+| 32 | 1 | 17.6 / 16.6, 17.9 / 16.9 | 60.1 / 58.8 |
+| 32 | 2 | 17.7 / 16.6, 17.6 / 16.4 | 62.4 / 60.9 |
+| 64 | 1 | | 40.8 / 39.3, 39.1 / 37.8 |
+| 64 | 2 | **13.2 / 12.1** | **37.5 / 36.4**, 39.8 / 38.6 |
+
+The hourly GRIB writer sets the total: with 32 CPUs the loop is blocked on it for 30.5-31 s of the 120 h run, with 64
+CPUs for 12-18 s. A second GPU saves the rollout 4-5 s at 120 h and 2 s at 24 h but does not change the total in fp16;
+in fp32 (two GPUs, 32 CPUs, this 80 GB node) the run takes 53.3 / 51.4 s where one 80 GB GPU does not hold both models.
+Every run byte-identical: 24 h to the reference runs of section 6 (35 files), 120 h to the 120 h run above (163 files);
+the peer-copy feed to the second GPU checked bitwise against the host assembly (`VARDA_TD_CHECK_INPUTS=1`, 4 of 4
+windows). Next lever: the cost of the hourly encoding itself (`docs/downscaler.md` §8).
