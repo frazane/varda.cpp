@@ -89,7 +89,11 @@ jobs:
           if ! MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=0 \
             BIN="$PWD/build-ci" SYN_DIR="$RUNNER_TEMP/varda-synthetic" \
             OUT="$RUNNER_TEMP/varda-metal-parity" bash tests/run_synthetic.sh metal; then
-            cat "$RUNNER_TEMP/varda-metal-parity"/a.metal-fp*.log
+            # the logs of the runs that did not pass (the summary has one line per run)
+            awk -F'\t' '$3 != "PASS" && $3 != "SKIP" { print $1 "." $2 ".log" }' \
+              "$RUNNER_TEMP/varda-metal-parity/summary.tsv" | while read -r f; do
+              echo "== $f"; cat "$RUNNER_TEMP/varda-metal-parity/$f" || true
+            done
             exit 1
           fi
           MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=0 \

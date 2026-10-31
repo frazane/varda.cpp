@@ -10,7 +10,8 @@
 #             (re)generated when missing or when the SHA-256 of python/tests/synthetic.py
 #             differs from the one stored in $SYN_DIR/generator.sha256.
 #   MODELS    space-separated subset of the configs (default: all of a b c d e f g h; g and h
-#             are interpolators with 6 and 3 output steps).
+#             are interpolators with 6 and 3 output steps; the Metal backend is forecaster-only, so
+#             their Metal runs are reported SKIP and do not fail the suite: docs/metal.md "Limits").
 #   OUT       directory for logs and per-run JSON reports (default $SYN_DIR/runs/<timestamp>).
 #   SKIP_CUDA=1 forces the CUDA part to be skipped (it is also skipped, with a note, when
 #             no GPU is visible).
@@ -28,6 +29,7 @@ GEN="$REPO/python/tests/synthetic.py"
 [ -n "${SYN_DIR:-}" ] || : "${VARDA_SCRATCH:?set VARDA_SCRATCH (source tools/env.sh) or SYN_DIR}"
 SYN_DIR="${SYN_DIR:-$VARDA_SCRATCH/synthetic}"
 ALL_MODELS="a b c d e f g h"
+INTERP_MODELS="g h"   # n_output_steps != 1: not supported by the Metal backend
 MODELS="${MODELS:-$ALL_MODELS}"
 OUT="${OUT:-$SYN_DIR/runs/$(date +%Y%m%d-%H%M%S)-$$}"
 want="${*:-cpu cuda}"
@@ -100,6 +102,14 @@ EOF
   echo "  $line"
 }
 
+# skip MODEL LABEL REASON: a SKIP line in the summary (does not count as a failure)
+skip() {
+  local line
+  line="$(printf '%s\t%s\tSKIP\t-\t-\t-\t%s' "$1" "$2" "$3")"
+  echo "$line" >> "$SUMMARY"
+  echo "  $line"
+}
+
 echo "BIN=$BIN OUT=$OUT"
 for m in $MODELS; do
   case " $want " in *" cpu "*)
@@ -116,10 +126,15 @@ for m in $MODELS; do
   ;; esac
   case " $want " in *" metal "*)
     if [ "$have_metal" = 1 ]; then
-      run "$m" metal-fp32 synthetic-fp32 "" --device metal --precision fp32
-      run "$m" metal-fp32-chunk37 synthetic-fp32 "VARDA_METAL_CHUNK_ROWS=37" --device metal --precision fp32
-      run "$m" metal-fp16 synthetic-fp16 "" --device metal --precision fp16
-      run "$m" metal-fp16-chunk37 synthetic-fp16 "VARDA_METAL_CHUNK_ROWS=37" --device metal --precision fp16
+      case " $INTERP_MODELS " in *" $m "*)
+        skip "$m" metal-fp32 "interpolator (n_output_steps != 1): not supported by the Metal backend"
+        skip "$m" metal-fp16 "interpolator (n_output_steps != 1): not supported by the Metal backend"
+      ;; *)
+        run "$m" metal-fp32 synthetic-fp32 "" --device metal --precision fp32
+        run "$m" metal-fp32-chunk37 synthetic-fp32 "VARDA_METAL_CHUNK_ROWS=37" --device metal --precision fp32
+        run "$m" metal-fp16 synthetic-fp16 "" --device metal --precision fp16
+        run "$m" metal-fp16-chunk37 synthetic-fp16 "VARDA_METAL_CHUNK_ROWS=37" --device metal --precision fp16
+      ;; esac
     fi
   ;; esac
 done

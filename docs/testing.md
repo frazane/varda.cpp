@@ -100,10 +100,12 @@ Files:
 - `tests/run_synthetic.sh`: generates into `$VARDA_SCRATCH/synthetic/` when files are missing or the SHA-256 of
   `synthetic.py` differs from `generator.sha256`; then for every model runs `$BIN/varda-parity`:
   CPU fp32 with 1 and 8 threads, CPU fp32 with `VARDA_CPU_CHUNK_ROWS=37` (8 threads), CUDA fp32, CUDA fp32 with
-  `VARDA_DEC_CHUNK_ROWS=128`, CUDA fp16. Prints a summary with the worst `rel_absmax` and its key per run and exits
-  non-zero on any failure or error. CUDA runs are skipped with a note when no GPU is visible (the final line then
-  warns that this is not a full pass). Arguments `cpu` / `cuda` select a part; env: `BIN`, `SYN_DIR`, `MODELS`,
-  `OUT`, `SKIP_CUDA`. Logs and JSON reports: `$OUT` (default `$SYN_DIR/runs/<timestamp>`).
+  `VARDA_DEC_CHUNK_ROWS=128`, CUDA fp16; with `metal`, Metal fp32 and mixed fp16, each with default chunking and
+  `VARDA_METAL_CHUNK_ROWS=37` (`docs/metal.md`). Prints a summary with the worst `rel_absmax` and its key per run and
+  exits non-zero on any failure or error. CUDA runs are skipped with a note when no GPU is visible (the final line then
+  warns that this is not a full pass). On Metal the interpolators g and h are reported `SKIP` (the Metal backend is
+  forecaster-only, `docs/metal.md` "Limits") and do not fail the suite. Arguments `cpu` / `cuda` / `metal` select a
+  part; env: `BIN`, `SYN_DIR`, `MODELS`, `OUT`, `SKIP_CUDA`. Logs and JSON reports: `$OUT` (default `$SYN_DIR/runs/<timestamp>`).
 
 ```
 source tools/env.sh
